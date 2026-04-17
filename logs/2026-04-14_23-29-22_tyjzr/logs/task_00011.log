@@ -1,0 +1,25 @@
+2026-04-14 23:29:23.124 | INFO     | datatrove.utils.logging:add_task_logger:76 - Launching pipeline for rank=11
+2026-04-14 23:29:23.125 | INFO     | datatrove.utils.logging:log_pipeline:108 - 
+--- 🛠️ PIPELINE 🛠
+📖 - READER: 🤗 HuggingFace
+🔻 - FILTER: 🎲 Sampler
+🔢 - TOKENIZER: ✍️ Writer
+2026-04-14 23:29:23.125 | INFO     | datatrove.pipeline.tokens.tokenizer:run:431 - Tokenizing in "00011_unshuffled.ds"...
+2026-04-14 23:47:27.230 | INFO     | datatrove.pipeline.tokens.tokenizer:run:439 - Shuffling documents...
+2026-04-14 23:47:27.232 | INFO     | datatrove.pipeline.tokens.tokenizer:copy:207 - Shuffling in 00011_00000_doc_shuffled.ds...
+2026-04-14 23:47:29.754 | SUCCESS  | datatrove.executor.base:_run_for_rank:140 - Processing done for rank=11
+2026-04-14 23:47:29.759 | INFO     | datatrove.executor.base:_run_for_rank:147 - 
+
+📉📉📉 Stats: Task 11 📉📉📉
+
+Total Runtime: 1 minute and 39.86 seconds
+
+📖 - READER: 🤗 HuggingFace
+    Runtime: (3.90%) 3.89 seconds [6.44 milliseconds±16.73 milliseconds/batch]
+    Stats: {doc_len: 2867703740 [min=190, max=640136, 4743.88±8350/doc], doc_len_tokens: 625077227 [min=52, max=156268, 1034.03±1877/doc], documents: 604506}
+🔻 - FILTER: 🎲 Sampler
+    Runtime: (1.05%) 1.05 seconds [0 milliseconds±0.02 milliseconds/doc]
+    Stats: {total: 604506, dropped: 572908, forwarded: 31598, doc_len: 147192004 [min=248, max=258012, 4658.27±7135/doc], doc_len_tokens: 32101539 [min=58, max=59787, 1015.94±1611/doc]}
+🔢 - TOKENIZER: ✍️ Writer
+    Runtime: (95.05%) 1 minute and 34.92 seconds [23 seconds and 728.76 milliseconds±12 seconds and 58.52 milliseconds/batch]
+    Stats: {tokens: 31824207 [min=49, max=59854, 1007.16±1635/doc]}

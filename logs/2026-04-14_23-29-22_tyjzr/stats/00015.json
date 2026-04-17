@@ -1,0 +1,110 @@
+[
+    {
+        "name": "\ud83d\udcd6 - READER: \ud83e\udd17 HuggingFace",
+        "time_stats": {
+            "total": 3.835714844055474,
+            "n": 605,
+            "mean": 0.006340024535628884,
+            "variance": 0.00026271650487727884,
+            "std_dev": 0.016208531854467228,
+            "min": 0.0016925828531384468,
+            "max": 0.2968276250176132,
+            "unit": "batch",
+            "total_human": "3.84 seconds",
+            "mean_human": "6.34 milliseconds",
+            "std_dev_human": "16.21 milliseconds",
+            "min_human": "1.69 milliseconds",
+            "max_human": "296.83 milliseconds"
+        },
+        "stats": {
+            "doc_len": {
+                "total": 2846961223,
+                "n": 604506,
+                "mean": 4709.566527048413,
+                "variance": 68954075.69295238,
+                "std_dev": 8303.859084362666,
+                "min": 209,
+                "max": 565250
+            },
+            "doc_len_tokens": {
+                "total": 621034737,
+                "n": 604506,
+                "mean": 1027.3425524312256,
+                "variance": 3518938.868854531,
+                "std_dev": 1875.8834902132198,
+                "min": 46,
+                "max": 132308
+            },
+            "documents": 604506
+        }
+    },
+    {
+        "name": "\ud83d\udd3b - FILTER: \ud83c\udfb2 Sampler",
+        "time_stats": {
+            "total": 1.0956728251185268,
+            "n": 604506,
+            "mean": 1.8125094293828591e-06,
+            "variance": 1.3753784903867716e-09,
+            "std_dev": 3.7086095647651715e-05,
+            "min": 8.749775588512421e-07,
+            "max": 0.014542083023115993,
+            "total_human": "1.10 seconds",
+            "mean_human": "0 milliseconds",
+            "std_dev_human": "0.04 milliseconds",
+            "min_human": "0 milliseconds",
+            "max_human": "14.54 milliseconds"
+        },
+        "stats": {
+            "total": 604506,
+            "dropped": 572908,
+            "forwarded": 31598,
+            "doc_len": {
+                "total": 149179486,
+                "n": 31598,
+                "mean": 4721.1686182669655,
+                "variance": 63673642.95969901,
+                "std_dev": 7979.576615316067,
+                "min": 246,
+                "max": 355799
+            },
+            "doc_len_tokens": {
+                "total": 32539518,
+                "n": 31598,
+                "mean": 1029.796759288556,
+                "variance": 3206661.472886302,
+                "std_dev": 1790.7153522786089,
+                "min": 58,
+                "max": 74702
+            }
+        }
+    },
+    {
+        "name": "\ud83d\udd22 - TOKENIZER: \u270d\ufe0f Writer",
+        "time_stats": {
+            "total": 94.83542941580527,
+            "n": 4,
+            "mean": 23.708857353951316,
+            "variance": 144.57517355565616,
+            "std_dev": 12.023941681314666,
+            "min": 5.840658291941509,
+            "max": 31.58612766698934,
+            "unit": "batch",
+            "total_human": "1 minute and 34.84 seconds",
+            "mean_human": "23 seconds and 708.86 milliseconds",
+            "std_dev_human": "12 seconds and 23.94 milliseconds",
+            "min_human": "5 seconds and 840.66 milliseconds",
+            "max_human": "31 seconds and 586.13 milliseconds"
+        },
+        "stats": {
+            "tokens": {
+                "total": 32270498,
+                "n": 31598,
+                "mean": 1021.28292929933,
+                "variance": 3327464.5124097946,
+                "std_dev": 1824.1339074776815,
+                "min": 56,
+                "max": 76422
+            }
+        }
+    }
+]
