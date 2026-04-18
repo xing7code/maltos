@@ -148,7 +148,7 @@ class RowParallelLinear(nn.Module):
                 self._scatter_buf_1d = torch.empty(new_cap, dtype=output.dtype, device=output.device)
                 self._scatter_meta = (output.dtype, output.device)
             output = output.transpose(0,1).reshape(-1)
-            dist.reduce_scatter_into_tensor(self._scatter_buf_1d[:scatter_numel], output, op=dist.ReduceOp.SUM, group=self.tp_group)
+            dist.reduce_scatter_tensor(self._scatter_buf_1d[:scatter_numel].detach(), output, op=dist.ReduceOp.SUM, group=self.tp_group)
             output = self._scatter_buf_1d[:scatter_numel].reshape(scatter_dim//self.world_size, orig_shape[0], *orig_shape[2:]).transpose(0,1)
         if self.collective in (RowParallelCollective.REDUCE, RowParallelCollective.SCATTER_DIM1) and self.bias is not None:
             output = output + self.bias

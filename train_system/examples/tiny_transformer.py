@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from absl import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from train_system.parallel.spec import OpShardRule, ModelParallelSpec
 
@@ -18,6 +20,8 @@ class CausalSelfAttention(nn.Module):
         self.o_proj = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x, cos=None, sin=None):
+        if dist.get_rank()==0:
+            logging.vlog(3, f"layer: {self._get_name()} input shape={x.size()}")
         b, s, d = x.size()
         # use -1 for n_heads, n_kv_heads, this dim can be sharded for TP.
         q = self.q_proj(x).view(b, s, -1, self.head_dim).transpose(1, 2)
@@ -33,7 +37,10 @@ class CausalSelfAttention(nn.Module):
         scores = F.softmax(logits, dim=-1)
         # use -1 for last dim, it can be different than d for TP.
         out = (scores @ v).transpose(1, 2).contiguous().view(b, s, -1)
-        return self.o_proj(out)
+        output = self.o_proj(out)
+        if dist.get_rank()==0:
+            logging.vlog(3, f"layer: {self._get_name()}, output shape={output.size()}")
+        return output
 
 
 class MLP(nn.Module):
@@ -44,7 +51,12 @@ class MLP(nn.Module):
         self.down = nn.Linear(hidden_size, dim, bias=False)
     
     def forward(self, x):
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        if dist.get_rank()==0:
+            logging.vlog(3, f"layer: {self._get_name()}, input shape={x.size()}")
+        output = self.down(F.silu(self.gate(x)) * self.up(x))
+        if dist.get_rank()==0:
+            logging.vlog(3, f"layer: {self._get_name()}, output shape={output.size()}")
+        return output
 
 
 class RmsNorm(nn.Module):
@@ -54,7 +66,12 @@ class RmsNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return self.weight * x * torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        if dist.get_rank()==0:
+            logging.vlog(3, f"layer: {self._get_name()}, input shape={x.size()}")
+        output = self.weight * x * torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        if dist.get_rank()==0:
+            logging.vlog(3, f"layer: {self._get_name()}, output shape={output.size()}")
+        return output
 
 
 class TransformerBlock(nn.Module):
@@ -142,16 +159,23 @@ class TinyTransformerTp(TinyTransformer):
 class TinyTransformerTpSp(TinyTransformer):
     
     def parallelize_spec(self):
-        rules = []
+        rules = [
+            OpShardRule(f"embed", shard_style="seq", post_comm="scatter", comm_dim=1),
+        ]
         for i in range(len(self.layers)):
             rules += [
-                OpShardRule(f"layers.{i}.attn.q_proj", shard_style="col", shard_axis="out", pre_comm="all_gather"),
-                OpShardRule(f"layers.{i}.attn.kv_proj", shard_style="col", shard_axis="out", pre_comm="all_gather"),
+                OpShardRule(f"layers.{i}.attn", shard_style="seq", pre_comm="all_gather", comm_dim=1),
+                OpShardRule(f"layers.{i}.attn.q_proj", shard_style="col", shard_axis="out"),
+                OpShardRule(f"layers.{i}.attn.kv_proj", shard_style="col", shard_axis="out"),
                 OpShardRule(f"layers.{i}.attn.o_proj", shard_style="row", shard_axis="in", post_comm="reduce_scatter"),
+                OpShardRule(f"layers.{i}.mlp", shard_style="seq", pre_comm="all_gather", comm_dim=1),
                 OpShardRule(f"layers.{i}.mlp.gate", shard_style="col", shard_axis="out"),
                 OpShardRule(f"layers.{i}.mlp.up", shard_style="col", shard_axis="out"),
                 OpShardRule(f"layers.{i}.mlp.down", shard_style="row", shard_axis="in", post_comm="reduce_scatter"),
             ]
+        rules += [
+            OpShardRule(f"lm_head", shard_style="seq", pre_comm="all_gather", comm_dim=1),
+        ]
         return ModelParallelSpec(
             rules=rules,
             tie_rules=[]

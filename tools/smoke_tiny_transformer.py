@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from absl import logging
 
 import torch
 import torch.distributed as dist
@@ -21,6 +22,7 @@ from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransf
 from train_system.parallel import ParallelConfig, ParallelPlan, ProcessMesh
 from train_system.runtime import RuntimeContext
 from train_system.runtime.plugins.tp import TpPlugin
+from train_system.runtime.plugins.sp import SpPlugin
 
 
 _REGISTRY_MODLE_CLASS = {
@@ -37,11 +39,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master-port", type=int, default=29501, help="Master port for c10d init")
     parser.add_argument("--backend", type=str, default="gloo", help="Process group backend")
     parser.add_argument("--tp-size", type=int, default=1, help="Tensor Parallel size to test.")
+    parser.add_argument("--use-sp", type=bool, default=False, help="Whether to use sp along with tp.")
     parser.add_argument("--model-class", type=str, default="tiny", help="The model class to test on.")
     parser.add_argument("--steps", type=int, default=3, help="Number of training steps")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument("--seq-len", type=int, default=32, help="Sequence length")
     parser.add_argument("--vocab-size", type=int, default=256, help="Vocabulary size")
+    parser.add_argument("-v", "--v", type=int, default=0, help="Verbosity level for VLOG")
     return parser.parse_args()
 
 
@@ -52,6 +56,8 @@ def _data_iter(vocab_size: int, batch_size: int, seq_len: int):
 
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
+    logging.set_verbosity(args.v)
+    logging.use_absl_handler()
     world_size = args.world_size
     use_dist = world_size > 1
     use_tp = args.tp_size > 1
@@ -63,12 +69,14 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     )
     plan = ParallelPlan(
         mesh=ProcessMesh(dp=world_size, tp=args.tp_size, pp=1, cp=1, ep=1),
-        config=ParallelConfig(use_ddp=use_dist, use_tp=use_tp, use_pp=False, zero_stage=0),
+        config=ParallelConfig(use_ddp=use_dist, use_tp=use_tp, use_sp=args.use_sp, use_pp=False, zero_stage=0),
     )
+    plugins = []
     if use_tp:
-        plugins = [TpPlugin(group)]
-    else:
-        plugins = []
+        plugins += [TpPlugin(group)]
+    if use_tp and args.use_sp:
+        plugins += [SpPlugin(group)]
+        
     ctx = RuntimeContext(plan=plan, plugins=plugins)
 
     model = _REGISTRY_MODLE_CLASS[args.model_class](
@@ -89,7 +97,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         _data_iter(vocab_size=args.vocab_size, batch_size=args.batch_size, seq_len=args.seq_len),
         steps=args.steps,
     )
-    print(f"[rank={rank}] tiny transformer smoke ok")
+    logging.info(f"[rank={rank}] tiny transformer smoke ok")
 
     if use_dist:
         dist.destroy_process_group()
