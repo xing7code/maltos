@@ -10,7 +10,10 @@ TP:
   PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2 --tp-size 2 --model-class tiny_tp --v 3
 
 TP+SP:
-  PYTHONPATH=. .venv/bin/python tools/smoke_tiny_transformer.py --world-size 2 --tp-size 2 --model-class tiny_tp_sp --use-sp true --v 3
+  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2 --tp-size 2 --model-class tiny_tp_sp --use-sp true --v 3
+
+DDP:
+  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2 --ddp-size 2 --ddp-type naive --model-class tiny --v 3
 """
 
 from __future__ import annotations
@@ -29,12 +32,18 @@ from train_system.parallel import ParallelConfig, ParallelPlan, ProcessMesh
 from train_system.runtime import RuntimeContext
 from train_system.runtime.plugins.tp import TpPlugin
 from train_system.runtime.plugins.sp import SpPlugin
+from train_system.runtime.plugins.ddp import NaiveDdpPlugin, NaiveAsyncDdpPlugin
 
 
 _REGISTRY_MODLE_CLASS = {
     "tiny": TinyTransformer,
     "tiny_tp": TinyTransformerTp,
     "tiny_tp_sp": TinyTransformerTpSp,
+}
+
+_REGISTRY_DDP_PLUGIN = {
+    "naive": NaiveDdpPlugin,
+    "naive_async": NaiveAsyncDdpPlugin
 }
 
 
@@ -46,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", type=str, default="gloo", help="Process group backend")
     parser.add_argument("--tp-size", type=int, default=1, help="Tensor Parallel size to test.")
     parser.add_argument("--use-sp", type=bool, default=False, help="Whether to use sp along with tp.")
+    parser.add_argument("--ddp-size", type=int, default=1, help="Distributed Data Parallel size to test.")
+    parser.add_argument("--ddp-type", type=str, default="naive", help="The type of DDP plugin.")
     parser.add_argument("--model-class", type=str, default="tiny", help="The model class to test on.")
     parser.add_argument("--steps", type=int, default=3, help="Number of training steps")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
@@ -64,25 +75,29 @@ def _data_iter(vocab_size: int, batch_size: int, seq_len: int):
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
     logging.set_verbosity(args.v)
     logging.use_absl_handler()
-    world_size = args.world_size
-    use_dist = world_size > 1
-    use_tp = args.tp_size > 1
     group = dist.init_process_group(
         backend=args.backend,
         init_method=f"tcp://{args.master_addr}:{args.master_port}",
         rank=rank,
-        world_size=world_size,
+        world_size=args.world_size,
     )
     plan = ParallelPlan(
-        mesh=ProcessMesh(dp=world_size, tp=args.tp_size, pp=1, cp=1, ep=1),
-        config=ParallelConfig(use_ddp=use_dist, use_tp=use_tp, use_sp=args.use_sp, use_pp=False, zero_stage=0),
+        mesh=ProcessMesh(dp=args.ddp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
+        config=ParallelConfig(
+            use_ddp=args.ddp_size>1,
+            use_tp=args.tp_size>1,
+            use_sp=args.tp_size>1 and args.use_sp,
+            use_pp=False,
+            zero_stage=0),
     )
     plugins = []
-    if use_tp:
+    if args.tp_size > 1:
         plugins += [TpPlugin(group)]
-    if use_tp and args.use_sp:
-        plugins += [SpPlugin(group)]
-        
+        if args.use_sp:
+            plugins += [SpPlugin(group)]
+    if args.ddp_size > 1:
+        plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](group)]
+
     ctx = RuntimeContext(plan=plan, plugins=plugins)
 
     model = _REGISTRY_MODLE_CLASS[args.model_class](
@@ -99,23 +114,23 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     trainer.setup()
     trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=1e-3)
 
+    if args.ddp_size > 1:
+        assert args.batch_size % args.ddp_size==0, f"batch size {args.batch_size} must be divisible by ddp_size {args.ddp_size}!"
+        local_batch_size = args.batch_size // args.ddp_size
+    else:
+        local_batch_size = args.batch_size
     trainer.train_steps(
-        _data_iter(vocab_size=args.vocab_size, batch_size=args.batch_size, seq_len=args.seq_len),
+        _data_iter(vocab_size=args.vocab_size, batch_size=local_batch_size, seq_len=args.seq_len),
         steps=args.steps,
     )
     logging.info(f"[rank={rank}] tiny transformer smoke ok")
-
-    if use_dist:
-        dist.destroy_process_group()
+    dist.destroy_process_group(group)
 
 
 def main() -> None:
     args = parse_args()
-    assert args.tp_size <= args.world_size, "TP maximally can only up to world_size."
+    assert args.world_size >= 1 and args.tp_size >= 1 and args.ddp_size >= 1 and args.tp_size * args.ddp_size <= args.world_size, f"Invalid args config on tp_size, ddp_size, world_size. {args}"
     assert args.model_class in _REGISTRY_MODLE_CLASS, f"invalid model_class {args.model_class}"
-    if args.world_size == 1:
-        _run_worker(rank=0, args=args)
-        return
 
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     mp.spawn(_run_worker, args=(args,), nprocs=args.world_size, join=True)

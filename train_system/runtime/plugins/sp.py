@@ -1,9 +1,10 @@
+from absl import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from train_system.runtime.plugin import BaseParallelPlugin
+from train_system.runtime.plugin import BaseParallelPlugin, ParallelizableModule
 
 
 class SpPlugin(BaseParallelPlugin):
@@ -30,6 +31,9 @@ class SpPlugin(BaseParallelPlugin):
         return hook
     
     def setup_model(self, model: nn.Module) -> nn.Module:
+        if not isinstance(model, ParallelizableModule):
+            logging.warn(f"model {model._get_name()} did not impl parallelize_spec, ignoring SpPlugin!")
+            return model
         spec = model.parallelize_spec()
         for r in spec.rules:
             if r.shard_style != "seq":

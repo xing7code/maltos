@@ -1,4 +1,5 @@
 import math
+from absl import logging
 
 import torch
 import torch.nn as nn
@@ -6,7 +7,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from enum import Enum
 
-from train_system.runtime.plugin import BaseParallelPlugin
+from train_system.runtime.plugin import BaseParallelPlugin, ParallelizableModule
 
 
 _COMM_BUFFER_CAP_RATIO = 1.5
@@ -170,6 +171,9 @@ class TpPlugin(BaseParallelPlugin):
         self.tp_group = tp_group
 
     def setup_model(self, model: nn.Module) -> nn.Module:
+        if not isinstance(model, ParallelizableModule):
+            logging.warn(f"model {model._get_name()} did not impl parallelize_spec, ignoring TpPlugin!")
+            return model
         spec = model.parallelize_spec()
         for r in spec.rules:
             mod = model.get_submodule(r.module_path)

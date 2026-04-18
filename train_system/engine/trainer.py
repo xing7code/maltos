@@ -27,16 +27,16 @@ class Trainer:
         for _ in range(steps):
             batch = next(iterator)
             for plugin in self.context.plugins:
-                plugin.before_forward()
+                plugin.before_forward(self.model)
 
             loss = self.model(batch)
             loss.backward()
 
             for plugin in self.context.plugins:
-                plugin.after_backward()
+                plugin.after_backward(self.model)
 
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
 
             for plugin in self.context.plugins:
-                plugin.step()
+                plugin.step(self.model)
