@@ -1,10 +1,16 @@
 """Smoke test for TinyTransformer with the Trainer loop via mp.spawn.
 
 Single process:
-  PYTHONPATH=. .venv/bin/python tools/smoke_tiny_transformer.py --world-size 1
+  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 1
 
 Multi-process (CPU/gloo):
-  PYTHONPATH=. .venv/bin/python tools/smoke_tiny_transformer.py --world-size 2
+  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2
+
+TP:
+  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2 --tp-size 2 --model-class tiny_tp --v 3
+
+TP+SP:
+  PYTHONPATH=. .venv/bin/python tools/smoke_tiny_transformer.py --world-size 2 --tp-size 2 --model-class tiny_tp_sp --use-sp true --v 3
 """
 
 from __future__ import annotations

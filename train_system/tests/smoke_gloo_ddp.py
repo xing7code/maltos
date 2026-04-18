@@ -1,7 +1,7 @@
 """Local smoke test for distributed init on Mac/Linux CPU.
 
 Run:
-  torchrun --standalone --nproc_per_node=2 tools/smoke_gloo_ddp.py
+  torchrun --standalone --nproc_per_node=2 train_system/tests/smoke_gloo_ddp.py
 """
 
 from __future__ import annotations

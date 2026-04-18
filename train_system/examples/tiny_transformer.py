@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from train_system.parallel.spec import OpShardRule, ModelParallelSpec
+from train_system.utils.logging import debug_log
 
 
 class CausalSelfAttention(nn.Module):
@@ -20,8 +21,7 @@ class CausalSelfAttention(nn.Module):
         self.o_proj = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x, cos=None, sin=None):
-        if dist.get_rank()==0:
-            logging.vlog(3, f"layer: {self._get_name()} input shape={x.size()}")
+        debug_log(3, f"layer: {self._get_name()} input shape={x.size()}")
         b, s, d = x.size()
         # use -1 for n_heads, n_kv_heads, this dim can be sharded for TP.
         q = self.q_proj(x).view(b, s, -1, self.head_dim).transpose(1, 2)
@@ -38,8 +38,7 @@ class CausalSelfAttention(nn.Module):
         # use -1 for last dim, it can be different than d for TP.
         out = (scores @ v).transpose(1, 2).contiguous().view(b, s, -1)
         output = self.o_proj(out)
-        if dist.get_rank()==0:
-            logging.vlog(3, f"layer: {self._get_name()}, output shape={output.size()}")
+        debug_log(3, f"layer: {self._get_name()}, output shape={output.size()}")
         return output
 
 
@@ -51,11 +50,9 @@ class MLP(nn.Module):
         self.down = nn.Linear(hidden_size, dim, bias=False)
     
     def forward(self, x):
-        if dist.get_rank()==0:
-            logging.vlog(3, f"layer: {self._get_name()}, input shape={x.size()}")
+        debug_log(3, f"layer: {self._get_name()}, input shape={x.size()}")
         output = self.down(F.silu(self.gate(x)) * self.up(x))
-        if dist.get_rank()==0:
-            logging.vlog(3, f"layer: {self._get_name()}, output shape={output.size()}")
+        debug_log(3, f"layer: {self._get_name()}, output shape={output.size()}")
         return output
 
 
@@ -66,11 +63,9 @@ class RmsNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        if dist.get_rank()==0:
-            logging.vlog(3, f"layer: {self._get_name()}, input shape={x.size()}")
+        debug_log(3, f"layer: {self._get_name()}, input shape={x.size()}")
         output = self.weight * x * torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
-        if dist.get_rank()==0:
-            logging.vlog(3, f"layer: {self._get_name()}, output shape={output.size()}")
+        debug_log(3, f"layer: {self._get_name()}, output shape={output.size()}")
         return output
 
 
