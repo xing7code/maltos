@@ -4,7 +4,6 @@ Single process:
   PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 1
 
 Multi-process (CPU/gloo):
-  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2
 
 TP:
   PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2 --tp-size 2 --model-class tiny_tp --v 3
@@ -14,6 +13,9 @@ TP+SP:
 
 DDP:
   PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2 --ddp-size 2 --ddp-type naive --model-class tiny --v 3
+
+DDP + TP + SP:
+  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 4 --ddp-size 2 --ddp-type naive --tp-size 2 --use-sp true --model-class tiny_tp_sp --v 3
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ import torch.multiprocessing as mp
 
 from train_system.engine import Trainer
 from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
-from train_system.parallel import ParallelConfig, ParallelPlan, ProcessMesh
+from train_system.parallel import ParallelPlan, ProcessMesh, MeshAxis
 from train_system.runtime import RuntimeContext
 from train_system.runtime.plugins.tp import TpPlugin
 from train_system.runtime.plugins.sp import SpPlugin
@@ -75,28 +77,22 @@ def _data_iter(vocab_size: int, batch_size: int, seq_len: int):
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
     logging.set_verbosity(args.v)
     logging.use_absl_handler()
-    group = dist.init_process_group(
-        backend=args.backend,
-        init_method=f"tcp://{args.master_addr}:{args.master_port}",
-        rank=rank,
-        world_size=args.world_size,
-    )
-    plan = ParallelPlan(
-        mesh=ProcessMesh(dp=args.ddp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
-        config=ParallelConfig(
-            use_ddp=args.ddp_size>1,
-            use_tp=args.tp_size>1,
-            use_sp=args.tp_size>1 and args.use_sp,
-            use_pp=False,
-            zero_stage=0),
-    )
+    if args.world_size > 1:
+        dist.init_process_group(
+            backend=args.backend,
+            init_method=f"tcp://{args.master_addr}:{args.master_port}",
+            rank=rank,
+            world_size=args.world_size,
+        )
+    mesh=ProcessMesh(dp=args.ddp_size, tp=args.tp_size, pp=1, cp=1, ep=1)
+    plan = ParallelPlan(mesh=mesh)
     plugins = []
     if args.tp_size > 1:
-        plugins += [TpPlugin(group)]
+        plugins += [TpPlugin(mesh.get_group(MeshAxis.TP))]
         if args.use_sp:
-            plugins += [SpPlugin(group)]
+            plugins += [SpPlugin(mesh.get_group(MeshAxis.TP))]
     if args.ddp_size > 1:
-        plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](group)]
+        plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP))]
 
     ctx = RuntimeContext(plan=plan, plugins=plugins)
 
@@ -124,7 +120,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         steps=args.steps,
     )
     logging.info(f"[rank={rank}] tiny transformer smoke ok")
-    dist.destroy_process_group(group)
+    if args.world_size > 1:
+        dist.destroy_process_group()
 
 
 def main() -> None:

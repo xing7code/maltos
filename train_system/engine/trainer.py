@@ -16,7 +16,6 @@ class Trainer:
     optimizer: torch.optim.Optimizer
 
     def setup(self) -> None:
-        self.context.validate()
         for plugin in self.context.plugins:
             self.model = plugin.setup_model(self.model)
 

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from train_system.runtime.plugin import BaseParallelPlugin, ParallelizableModule
+from train_system.runtime.functional import all_gather
 
 
 class SpPlugin(BaseParallelPlugin):
@@ -17,9 +18,7 @@ class SpPlugin(BaseParallelPlugin):
     def _make_all_gather_hook(self, comm_dim):
         def hook(module, input):
             input, *args = input
-            buffers = [torch.empty_like(input) for _ in range(self.world_size)]
-            dist.all_gather(buffers, input, group=self.sp_group)
-            input = torch.cat(buffers, dim=comm_dim)
+            input = all_gather(input, self.sp_group, comm_dim)
             return (input, *args)
         return hook
 

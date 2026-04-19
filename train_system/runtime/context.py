@@ -10,8 +10,5 @@ class RuntimeContext:
     plan: ParallelPlan
     plugins: list = field(default_factory=list)
 
-    def validate(self) -> None:
-        self.plan.validate()
-
     def register_plugin(self, plugin) -> None:
         self.plugins.append(plugin)

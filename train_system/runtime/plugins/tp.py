@@ -8,9 +8,8 @@ import torch.distributed as dist
 from enum import Enum
 
 from train_system.runtime.plugin import BaseParallelPlugin, ParallelizableModule
+from train_system.runtime.functional import all_gather, reduce_scatter
 
-
-_COMM_BUFFER_CAP_RATIO = 1.5
 
 class ColumnParallelLinear(nn.Module):
 
@@ -23,9 +22,6 @@ class ColumnParallelLinear(nn.Module):
         self.tp_group = tp_group
         self.rank = dist.get_rank(tp_group)
         self.world_size = dist.get_world_size(tp_group)
-
-        self.register_buffer("_gather_buf_1d", torch.empty(0), persistent=False)
-        self._buf_meta = (None, None) # dtype, device
 
         assert self.out_features % self.world_size == 0, "Out features must be divisible by world size"
         self.out_features_per_shard = self.out_features // self.world_size
@@ -67,37 +63,22 @@ class ColumnParallelLinear(nn.Module):
     def forward(self, input):
         output = F.linear(input, self.weight, self.bias)
         if self.gather_output and self.world_size>1:
-            gathered_numel = output.numel() * self.world_size
-            if output.dtype != self._buf_meta[0] or output.device != self._buf_meta[1] or gathered_numel > self._gather_buf_1d.numel():
-                new_cap = max(gathered_numel, int(self._gather_buf_1d.numel() * _COMM_BUFFER_CAP_RATIO))
-                self._gather_buf_1d = torch.empty(new_cap, dtype=output.dtype, device=output.device)
-                self._buf_meta = (output.dtype, output.device)
-            shard_shape = output.size()
-            dist.all_gather_into_tensor(self._gather_buf_1d[:gathered_numel], output.reshape(-1), self.tp_group)
-            output = torch.cat([x.view(shard_shape) for x in self._gather_buf_1d[:gathered_numel].chunk(self.world_size)], dim=-1)
+            output = all_gather(output, self.tp_group, -1)
         return output
-
-
-class RowParallelCollective(str, Enum):
-    REDUCE = "all_reduce"
-    SCATTER_DIM1 = "reduce_scatter_dim1"
-    NONE = "none"
 
 
 class RowParallelLinear(nn.Module):
 
-    def __init__(self, in_features, out_features, tp_group, collective=RowParallelCollective.NONE, bias=True, init=True):
+    def __init__(self, in_features, out_features, tp_group, comm="none", comm_dim=0, bias=True, init=True):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
 
         self.tp_group = tp_group
-        self.collective = collective
+        self.comm = comm
+        self.comm_dim = comm_dim
         self.rank = dist.get_rank(tp_group)
         self.world_size = dist.get_world_size(tp_group)
-
-        self.register_buffer("_scatter_buf_1d", torch.empty(0), persistent=False)
-        self._scatter_meta = (None, None)
 
         assert self.in_features % self.world_size == 0, "In features must be divisible by world size"
         self.in_features_per_shard = self.in_features // self.world_size
@@ -116,12 +97,13 @@ class RowParallelLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     @classmethod
-    def from_linear(cls, linear_module, tp_group, collective):
+    def from_linear(cls, linear_module, tp_group, comm, comm_dim=0):
         row_linear = cls(
             linear_module.in_features,
             linear_module.out_features,
             tp_group,
-            collective,
+            comm,
+            comm_dim,
             bias=linear_module.bias is not None,
             init=False
         ).to(linear_module.weight.device, dtype=linear_module.weight.dtype)
@@ -137,34 +119,19 @@ class RowParallelLinear(nn.Module):
 
     def forward(self, input):
         output = F.linear(input, self.weight, None)
-        if self.collective == RowParallelCollective.REDUCE:
+        if self.comm == "all_reduce":
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
-        elif self.collective == RowParallelCollective.SCATTER_DIM1:
-            scatter_numel = output.numel() // self.world_size
-            scatter_dim = output.size(1)
-            assert scatter_dim % self.world_size == 0, f"For SCATTER_DIM1 mode in RowParallelLinear, output dim1 {scatter_dim} must be divisible by world_size {self.world_size}"
-            orig_shape = output.size()
-            if output.dtype != self._scatter_meta[0] or output.device != self._scatter_meta[1] or scatter_numel > self._scatter_buf_1d.numel():
-                new_cap = max(scatter_numel, int(self._scatter_buf_1d.numel() * _COMM_BUFFER_CAP_RATIO))
-                self._scatter_buf_1d = torch.empty(new_cap, dtype=output.dtype, device=output.device)
-                self._scatter_meta = (output.dtype, output.device)
-            output = output.transpose(0,1).reshape(-1)
-            dist.reduce_scatter_tensor(self._scatter_buf_1d[:scatter_numel].detach(), output, op=dist.ReduceOp.SUM, group=self.tp_group)
-            output = self._scatter_buf_1d[:scatter_numel].reshape(scatter_dim//self.world_size, orig_shape[0], *orig_shape[2:]).transpose(0,1)
-        if self.collective in (RowParallelCollective.REDUCE, RowParallelCollective.SCATTER_DIM1) and self.bias is not None:
+        elif self.comm == "reduce_scatter":
+            output = reduce_scatter(output, self.tp_group, 1)
+        if self.bias is not None:
             output = output + self.bias
         return output
 
 
 class TpPlugin(BaseParallelPlugin):
 
-    _ROW_COLLECTIVE_MAP = {
-        "all_reduce": RowParallelCollective.REDUCE,
-        "reduce_scatter": RowParallelCollective.SCATTER_DIM1,
-        "none": RowParallelCollective.NONE,
-    }
     _COL_POST_COMM = {"all_gather", "none"}
-    _ROW_POST_COMM = set(_ROW_COLLECTIVE_MAP.keys())
+    _ROW_POST_COMM = {"all_reduce", "reduce_scatter", "none"}
     _SUPPORTED_PRE_COMM = {"none"}
 
     def __init__(self, tp_group: dist.ProcessGroup):
@@ -204,6 +171,6 @@ class TpPlugin(BaseParallelPlugin):
                     )
                 model.set_submodule(
                     r.module_path,
-                    RowParallelLinear.from_linear(mod, self.tp_group, self._ROW_COLLECTIVE_MAP[r.post_comm])
+                    RowParallelLinear.from_linear(mod, self.tp_group, r.post_comm, r.comm_dim)
                 )
         return model
