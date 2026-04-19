@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--world-size", type=int, default=2, help="Number of local processes")
     parser.add_argument("--master-addr", type=str, default="127.0.0.1", help="Master address for c10d init")
     parser.add_argument("--master-port", type=int, default=29501, help="Master port for c10d init")
-    parser.add_argument("--backend", type=str, default="gloo", help="Process group backend")
+    parser.add_argument("--backend", type=str, default="auto", help="Process group backend")
     parser.add_argument("--tp-size", type=int, default=1, help="Tensor Parallel size to test.")
     parser.add_argument("--use-sp", type=bool, default=False, help="Whether to use sp along with tp.")
     parser.add_argument("--ddp-size", type=int, default=1, help="Distributed Data Parallel size to test.")
@@ -70,22 +70,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _data_iter(vocab_size: int, batch_size: int, seq_len: int):
+def _get_device(rank: int) -> torch.device:
+    if torch.cuda.is_available():
+        n_gpus = torch.cuda.device_count()
+        assert rank < n_gpus, f"rank={rank} >= n_gpus={n_gpus}"
+        torch.cuda.set_device(rank)
+        return torch.device("cuda", rank)
+    return torch.device("cpu")
+
+
+def _data_iter(vocab_size: int, batch_size: int, seq_len: int, device: torch.device):
     while True:
-        tokens = torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.long)
+        tokens = torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
         yield (tokens, tokens.clone())
 
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
     logging.set_verbosity(args.v)
     logging.use_absl_handler()
+    backend = args.backend
+    if backend == "auto":
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
     if args.world_size > 1:
         dist.init_process_group(
-            backend=args.backend,
+            backend=backend,
             init_method=f"tcp://{args.master_addr}:{args.master_port}",
             rank=rank,
             world_size=args.world_size,
         )
+    device = _get_device(rank)
     mesh=ProcessMesh(dp=args.ddp_size, tp=args.tp_size, pp=1, cp=1, ep=1)
     plan = ParallelPlan(mesh=mesh)
     plugins = []
@@ -110,7 +123,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         n_layers=2,
         vocab_size=256,
         max_seq_len=64,
-    )
+    ).to(device)
     trainer = Trainer(context=ctx, model=model, optimizer=None)
     trainer.setup()
     trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=1e-3)
@@ -121,7 +134,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     else:
         local_batch_size = args.batch_size
     trainer.train_steps(
-        _data_iter(vocab_size=args.vocab_size, batch_size=local_batch_size, seq_len=args.seq_len),
+        _data_iter(vocab_size=args.vocab_size, batch_size=local_batch_size, seq_len=args.seq_len, device=device),
         steps=args.steps,
     )
     logging.info(f"[rank={rank}] tiny transformer smoke ok")
