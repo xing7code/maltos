@@ -22,7 +22,7 @@ import torch.multiprocessing as mp
 
 from train_system.engine import Trainer
 from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
-from train_system.parallel import ParallelConfig, ParallelPlan, ProcessMesh
+from train_system.parallel import ParallelPlan, ProcessMesh
 from train_system.runtime import RuntimeContext
 from train_system.runtime.plugins.tp import TpPlugin
 from train_system.runtime.plugins.sp import SpPlugin
@@ -82,15 +82,13 @@ def _run_worker(rank: int, args: argparse.Namespace, shared_state: dict) -> None
     # Load the same weights as baseline
     sharded_model.load_state_dict(shared_state["state_dict"])
 
-    plan = ParallelPlan(
-        mesh=ProcessMesh(dp=1, tp=args.tp_size, pp=1, cp=1, ep=1),
-        config=ParallelConfig(use_ddp=False, use_tp=True, use_sp=args.use_sp, use_pp=False, zero_stage=0),
-    )
+    mesh = ProcessMesh(dp=1, tp=args.tp_size, pp=1, cp=1, ep=1)
+    plan = ParallelPlan(mesh=mesh)
     plugins = [TpPlugin(group)]
     if args.use_sp:
         plugins += [SpPlugin(group)]
     ctx = RuntimeContext(plan=plan, plugins=plugins)
-
+    
     trainer = Trainer(context=ctx, model=sharded_model, optimizer=None)
     trainer.setup()
 
