@@ -34,7 +34,7 @@ from train_system.parallel import ParallelPlan, ProcessMesh, MeshAxis
 from train_system.runtime import RuntimeContext
 from train_system.runtime.plugins.tp import TpPlugin
 from train_system.runtime.plugins.sp import SpPlugin
-from train_system.runtime.plugins.ddp import NaiveDdpPlugin, NaiveAsyncDdpPlugin
+from train_system.runtime.plugins.ddp import DdpWithBucketPlugin, NaiveDdpPlugin, NaiveAsyncDdpPlugin
 
 
 _REGISTRY_MODLE_CLASS = {
@@ -45,7 +45,8 @@ _REGISTRY_MODLE_CLASS = {
 
 _REGISTRY_DDP_PLUGIN = {
     "naive": NaiveDdpPlugin,
-    "naive_async": NaiveAsyncDdpPlugin
+    "naive_async": NaiveAsyncDdpPlugin,
+    "bucket_async": DdpWithBucketPlugin,
 }
 
 
@@ -59,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-sp", type=bool, default=False, help="Whether to use sp along with tp.")
     parser.add_argument("--ddp-size", type=int, default=1, help="Distributed Data Parallel size to test.")
     parser.add_argument("--ddp-type", type=str, default="naive", help="The type of DDP plugin.")
+    parser.add_argument("--ddp-bucket-mb-size", type=int, default=25, help="The bucket size in MB for DDP plugin.")
     parser.add_argument("--model-class", type=str, default="tiny", help="The model class to test on.")
     parser.add_argument("--steps", type=int, default=3, help="Number of training steps")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
@@ -92,7 +94,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         if args.use_sp:
             plugins += [SpPlugin(mesh.get_group(MeshAxis.TP))]
     if args.ddp_size > 1:
-        plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP))]
+        if "bucket" in args.ddp_type:
+            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), args.ddp_bucket_mb_size)]
+        else:
+            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP))]
 
     ctx = RuntimeContext(plan=plan, plugins=plugins)
 
