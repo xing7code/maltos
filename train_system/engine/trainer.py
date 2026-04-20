@@ -13,7 +13,7 @@ from train_system.runtime.context import RuntimeContext
 class Trainer:
     context: RuntimeContext
     model: nn.Module
-    optimizer: torch.optim.Optimizer
+    optimizer: torch.optim.Optimizer | None
 
     def setup(self) -> None:
         for plugin in self.context.plugins:
@@ -22,6 +22,8 @@ class Trainer:
     def train_steps(self, data: Iterable, steps: int, profiler: torch.profiler.profile | None = None) -> None:
         self.model.train()
         iterator = iter(data)
+
+        plugin_owns_optimizer = any(getattr(p, "owns_optimizer", False) for p in self.context.plugins)
 
         for _ in range(steps):
             batch = next(iterator)
@@ -34,8 +36,9 @@ class Trainer:
             for plugin in self.context.plugins:
                 plugin.after_backward(self.model)
 
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
+            if not plugin_owns_optimizer:
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
 
             for plugin in self.context.plugins:
                 plugin.step(self.model)

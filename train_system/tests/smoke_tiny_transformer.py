@@ -9,13 +9,13 @@ TP:
   PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2 --tp-size 2 --model-class tiny_tp --v 3
 
 TP+SP:
-  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2 --tp-size 2 --model-class tiny_tp_sp --use-sp true --v 3
+  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2 --tp-size 2 --model-class tiny_tp_sp --use-sp --v 3
 
 DDP:
   PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 2 --ddp-size 2 --ddp-type naive --model-class tiny --v 3
 
 DDP + TP + SP:
-  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 4 --ddp-size 2 --ddp-type naive --tp-size 2 --use-sp true --model-class tiny_tp_sp --v 3
+  PYTHONPATH=. .venv/bin/python train_system/tests/smoke_tiny_transformer.py --world-size 4 --ddp-size 2 --ddp-type naive --tp-size 2 --use-sp --model-class tiny_tp_sp --v 3
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from train_system.runtime import RuntimeContext
 from train_system.runtime.plugins.tp import TpPlugin
 from train_system.runtime.plugins.sp import SpPlugin
 from train_system.runtime.plugins.ddp import DdpWithBucketPlugin, NaiveDdpPlugin, NaiveAsyncDdpPlugin
+from train_system.runtime.plugins.zero1 import Zero1Plugin
 
 
 _REGISTRY_MODLE_CLASS = {
@@ -47,6 +48,7 @@ _REGISTRY_DDP_PLUGIN = {
     "naive": NaiveDdpPlugin,
     "naive_async": NaiveAsyncDdpPlugin,
     "bucket_async": DdpWithBucketPlugin,
+    "zero1": Zero1Plugin,
 }
 
 
@@ -111,6 +113,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if args.ddp_size > 1:
         if "bucket" in args.ddp_type:
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), args.ddp_bucket_mb_size)]
+        elif args.ddp_type == "zero1":
+            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), torch.optim.AdamW, lr=1e-3)]
         else:
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP))]
 
@@ -128,7 +132,9 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     ).to(device)
     trainer = Trainer(context=ctx, model=model, optimizer=None)
     trainer.setup()
-    trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=1e-3)
+    plugin_owns_optimizer = any(getattr(p, "owns_optimizer", False) for p in ctx.plugins)
+    if not plugin_owns_optimizer:
+        trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=1e-3)
 
     if args.ddp_size > 1:
         assert args.batch_size % args.ddp_size==0, f"batch size {args.batch_size} must be divisible by ddp_size {args.ddp_size}!"
