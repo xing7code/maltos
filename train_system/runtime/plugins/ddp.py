@@ -44,14 +44,13 @@ class NaiveAsyncDdpPlugin(BaseParallelPlugin):
 class Bucket:
     group: dist.ProcessGroup
     params: list[nn.Parameter] = field(default_factory=list)
+    param_views: list[torch.Tensor] = field(default_factory=list)
     flat_buffer: torch.Tensor | None = None
     total_bytes: int = 0
-    finalized: bool = False
     pending: int = 0
-    handle = None
+    handle: dist.Work | None = None
 
     def add_param(self, p):
-        assert not self.finalized, "Cannot add params after finalized!"
         self.params.append(p)
         self.total_bytes += p.numel() * p.element_size()
 
@@ -59,38 +58,30 @@ class Bucket:
         total_numel = sum(p.numel() for p in self.params)
         dtype, device = self.params[0].dtype, self.params[0].device
         self.flat_buffer = torch.zeros(total_numel, dtype=dtype, device=device)
+        offset = 0
+        for p in self.params:
+            p_view = self.flat_buffer[offset : offset+p.numel()].view_as(p)
+            self.param_views.append(p_view)
+            offset += p.numel()
         self.reset()
-        self.finalized = True
 
     def reset(self):
         self.pending = len(self.params)
         self.handle = None
-
-    def ready(self):
-        return self.pending == 0
+        # This is needed every round of backward, incase zero_grad called to set p.grad to None.
+        self.flat_buffer.zero_()
+        for p, view in zip(self.params, self.param_views):
+            p.grad = view
 
     def _sync_grad(self):
-        offset = 0
-        for p in self.params:
-            assert p.grad is not None, f"param shape={p.shape} has requires_grad=True but grad is None"
-            self.flat_buffer[offset:offset+p.numel()].copy_(p.grad.view(-1))
-            p.grad = None
-            offset += p.numel()
         self.handle = dist.all_reduce(self.flat_buffer, op=dist.ReduceOp.AVG, group=self.group, async_op=True)
 
     def make_hook(self):
-        assert self.finalized, "bucket has to be finalized before hooking."
         def hook(p):
             self.pending -= 1
-            if self.ready():
+            if self.pending==0:
                 self._sync_grad()
         return hook
-
-    def update_grad(self):
-        offset = 0
-        for p in self.params:
-            p.grad = self.flat_buffer[offset:offset+p.numel()].view_as(p).clone()
-            offset += p.numel()
     
 
 class DdpWithBucketPlugin(BaseParallelPlugin):
@@ -122,12 +113,13 @@ class DdpWithBucketPlugin(BaseParallelPlugin):
                 p.register_post_accumulate_grad_hook(bkt.make_hook())
         return model
 
+    def before_forward(self, model: nn.Module):
+        for bkt in self.buckets:
+            bkt.reset()
+
     def after_backward(self, model: nn.Module):
         for bkt in self.buckets:
             assert bkt.handle is not None, f"bucket with {len(bkt.params)} params was never synced, likely some params have no grad"
             bkt.handle.wait()
-        for bkt in self.buckets:
-            bkt.update_grad()
-            bkt.reset()
 
     
