@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master-port", type=int, default=29501, help="Master port for c10d init")
     parser.add_argument("--backend", type=str, default="auto", help="Process group backend")
     parser.add_argument("--tp-size", type=int, default=1, help="Tensor Parallel size to test.")
-    parser.add_argument("--use-sp", type=bool, default=False, help="Whether to use sp along with tp.")
+    parser.add_argument("--use-sp", action="store_true", default=False, help="Whether to use sp along with tp.")
     parser.add_argument("--ddp-size", type=int, default=1, help="Distributed Data Parallel size to test.")
     parser.add_argument("--ddp-type", type=str, default="naive", help="The type of DDP plugin.")
     parser.add_argument("--ddp-bucket-mb-size", type=int, default=25, help="The bucket size in MB for DDP plugin.")
@@ -67,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=32, help="Sequence length")
     parser.add_argument("--vocab-size", type=int, default=256, help="Vocabulary size")
     parser.add_argument("-v", "--v", type=int, default=0, help="Verbosity level for VLOG")
+    parser.add_argument("--profile", action="store_true", default=False, help="whether to do profile.")
+    parser.add_argument("--profile-dir", type=str, default="./profile_logs", help="where to save the profile logs.")
     return parser.parse_args()
 
 
@@ -133,10 +135,32 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         local_batch_size = args.batch_size // args.ddp_size
     else:
         local_batch_size = args.batch_size
+
+    if args.profile and rank==0:
+        from torch.profiler import profile, ProfilerActivity, schedule
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+        prof = profile(
+            activities=activities,
+            schedule=schedule(wait=0, warmup=0, active=3),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.profile_dir),
+            record_shapes=True,
+            with_flops=True,
+        )
+        prof.start()
+    else:
+        prof = None
     trainer.train_steps(
         _data_iter(vocab_size=args.vocab_size, batch_size=local_batch_size, seq_len=args.seq_len, device=device),
         steps=args.steps,
+        profiler=prof,
     )
+    if prof is not None:
+        prof.stop()
+        print(f"[rank={rank}] profiler stopped, check {args.profile_dir}", flush=True)
+        import os
+        print(f"[rank={rank}] profile_logs contents: {os.listdir(args.profile_dir)}", flush=True)
     logging.info(f"[rank={rank}] tiny transformer smoke ok")
     if args.world_size > 1:
         dist.destroy_process_group()

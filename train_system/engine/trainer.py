@@ -19,7 +19,7 @@ class Trainer:
         for plugin in self.context.plugins:
             self.model = plugin.setup_model(self.model)
 
-    def train_steps(self, data: Iterable, steps: int) -> None:
+    def train_steps(self, data: Iterable, steps: int, profiler: torch.profiler.profile | None = None) -> None:
         self.model.train()
         iterator = iter(data)
 
@@ -39,3 +39,6 @@ class Trainer:
 
             for plugin in self.context.plugins:
                 plugin.step(self.model)
+
+            if profiler is not None:
+                profiler.step()
