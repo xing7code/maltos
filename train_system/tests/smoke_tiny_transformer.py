@@ -114,7 +114,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         if "bucket" in args.ddp_type:
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), args.ddp_bucket_mb_size)]
         elif args.ddp_type == "zero1":
-            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), torch.optim.AdamW, lr=1e-3)]
+            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), args.ddp_bucket_mb_size, torch.optim.AdamW, lr=1e-3)]
         else:
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP))]
 

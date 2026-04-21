@@ -41,7 +41,7 @@ class NaiveAsyncDdpPlugin(BaseParallelPlugin):
 
 
 @dataclass
-class Bucket:
+class _Bucket:
     group: dist.ProcessGroup
     params: list[nn.Parameter] = field(default_factory=list)
     param_views: list[torch.Tensor] = field(default_factory=list)
@@ -102,7 +102,7 @@ class DdpWithBucketPlugin(BaseParallelPlugin):
             if not self.buckets or self.buckets[-1].total_bytes >= self.bucket_byte_size:
                 if self.buckets:
                     self.buckets[-1].finalize()
-                self.buckets.append(Bucket(self.ddp_group))
+                self.buckets.append(_Bucket(self.ddp_group))
             self.buckets[-1].add_param(p)
         self.buckets[-1].finalize()
 
