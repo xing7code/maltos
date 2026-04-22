@@ -36,6 +36,7 @@ from train_system.runtime.plugins.tp import TpPlugin
 from train_system.runtime.plugins.sp import SpPlugin
 from train_system.runtime.plugins.ddp import DdpWithBucketPlugin, NaiveDdpPlugin, NaiveAsyncDdpPlugin
 from train_system.runtime.plugins.zero1 import Zero1Plugin
+from train_system.runtime.plugins.zero2 import Zero2Plugin
 
 
 _REGISTRY_MODLE_CLASS = {
@@ -49,6 +50,7 @@ _REGISTRY_DDP_PLUGIN = {
     "naive_async": NaiveAsyncDdpPlugin,
     "bucket_async": DdpWithBucketPlugin,
     "zero1": Zero1Plugin,
+    "zero2": Zero2Plugin,
 }
 
 
@@ -113,7 +115,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if args.ddp_size > 1:
         if "bucket" in args.ddp_type:
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), args.ddp_bucket_mb_size)]
-        elif args.ddp_type == "zero1":
+        elif args.ddp_type in ("zero1", "zero2"):
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), args.ddp_bucket_mb_size, torch.optim.AdamW, lr=1e-3)]
         else:
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP))]
