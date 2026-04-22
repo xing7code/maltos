@@ -29,7 +29,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from train_system.engine import Trainer
-from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
+from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp, CausalSelfAttention, MLP
 from train_system.parallel import ParallelPlan, ProcessMesh, MeshAxis
 from train_system.runtime import RuntimeContext
 from train_system.runtime.plugins.tp import TpPlugin
@@ -37,6 +37,7 @@ from train_system.runtime.plugins.sp import SpPlugin
 from train_system.runtime.plugins.ddp import DdpWithBucketPlugin, NaiveDdpPlugin, NaiveAsyncDdpPlugin
 from train_system.runtime.plugins.zero1 import Zero1Plugin
 from train_system.runtime.plugins.zero2 import Zero2Plugin
+from train_system.runtime.plugins.zero3 import Zero3Plugin
 
 
 _REGISTRY_MODLE_CLASS = {
@@ -51,6 +52,7 @@ _REGISTRY_DDP_PLUGIN = {
     "bucket_async": DdpWithBucketPlugin,
     "zero1": Zero1Plugin,
     "zero2": Zero2Plugin,
+    "zero3": Zero3Plugin,
 }
 
 
@@ -117,6 +119,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), args.ddp_bucket_mb_size)]
         elif args.ddp_type in ("zero1", "zero2"):
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), args.ddp_bucket_mb_size, torch.optim.AdamW, lr=1e-3)]
+        elif args.ddp_type == "zero3":
+            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), {CausalSelfAttention, MLP}, torch.optim.AdamW, lr=1e-3)]
         else:
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP))]
 
