@@ -41,7 +41,12 @@ class _Bucket:
     local_param: nn.Parameter
     data_buffer: torch.Tensor
     grad_buffer: torch.Tensor
+    index: int
     pending: int
+    prev_bucket: "_Bucket | None" = None
+    next_bucket: "_Bucket | None" = None
+    fwd_handle: dist.Work | None = None
+    bwd_handle: dist.Work | None = None
     attached: bool = False
     grad_handle: dist.Work | _AllReduceShardWork | None = None
 
@@ -52,17 +57,21 @@ class Zero3PluginV2(RuntimePlugin):
     def __init__(
         self,
         wrap_cls: set[type[nn.Module]] | None = None,
+        enable_prefetch: bool = True,
         optimizer_cls: type[torch.optim.Optimizer] = torch.optim.AdamW,
         **optimizer_kwargs,
     ):
         super().__init__(id=PluginId.ZERO3, name="zero3", owns_optimizer=True)
         self.wrap_cls = wrap_cls or {nn.Linear}
+        self.enable_prefetch = enable_prefetch
         self.optimizer_cls = optimizer_cls
         self.optimizer_kwargs = optimizer_kwargs
         self.dp_group: dist.ProcessGroup | None = None
         self.world_size = 1
         self.rank = 0
         self.buckets: list[_Bucket] = []
+        self.data_buffers: list[torch.Tensor] = []
+        self._materialized_buffers: list[torch.Tensor] = []
         self.optimizer: torch.optim.Optimizer | None = None
 
     def transform_model(self, model: nn.Module) -> nn.Module:
@@ -79,6 +88,8 @@ class Zero3PluginV2(RuntimePlugin):
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
             self._reset_buckets()
+            if self.enable_prefetch and self.buckets:
+                self._prefetch_bucket(self.buckets[0], direction="forward")
         elif phase == RuntimePhase.POST_BACKWARD:
             self._wait_all_grad_sync()
         elif phase == RuntimePhase.PRE_STEP:
@@ -86,6 +97,7 @@ class Zero3PluginV2(RuntimePlugin):
 
     def _prepare_buckets(self, model: nn.Module) -> None:
         visited: set[str] = set()
+        bucket_specs: list[tuple[nn.Module, list[nn.Parameter]]] = []
         for module_name, module in model.named_modules():
             if not isinstance(module, tuple(self.wrap_cls)):
                 continue
@@ -95,15 +107,34 @@ class Zero3PluginV2(RuntimePlugin):
             if not params:
                 continue
             visited.add(module_name)
-            bucket = self._make_bucket(module, params)
+            bucket_specs.append((module, params))
+
+        if not bucket_specs:
+            return
+
+        dtype, device = bucket_specs[0][1][0].dtype, bucket_specs[0][1][0].device
+        max_buffer_size = max(self._padded_len(sum(param.numel() for param in params)) for _, params in bucket_specs)
+        self.data_buffers = [
+            torch.empty(max_buffer_size, dtype=dtype, device=device),
+            torch.empty(max_buffer_size, dtype=dtype, device=device),
+        ]
+
+        for index, (module, params) in enumerate(bucket_specs):
+            bucket = self._make_bucket(index, module, params)
             self.buckets.append(bucket)
+
+        for index, bucket in enumerate(self.buckets):
+            if index > 0:
+                bucket.prev_bucket = self.buckets[index - 1]
+            if index + 1 < len(self.buckets):
+                bucket.next_bucket = self.buckets[index + 1]
 
         self._reset_buckets()
         self._add_hooks()
         for bucket in self.buckets:
             self._free_full_params(bucket)
 
-    def _make_bucket(self, module: nn.Module, params: list[nn.Parameter]) -> _Bucket:
+    def _make_bucket(self, index: int, module: nn.Module, params: list[nn.Parameter]) -> _Bucket:
         dtype, device = params[0].dtype, params[0].device
         param_shapes = [param.shape for param in params]
         param_numels = [param.numel() for param in params]
@@ -118,7 +149,7 @@ class Zero3PluginV2(RuntimePlugin):
         shard_start = self.rank * shard_len
         shard_end = (self.rank + 1) * shard_len
         local_param = nn.Parameter(full_param[shard_start:shard_end].clone())
-        data_buffer = torch.empty(buffer_size, dtype=dtype, device=device)
+        data_buffer = self.data_buffers[index % len(self.data_buffers)][:buffer_size]
         grad_buffer = torch.empty(buffer_size, dtype=dtype, device=device)
         return _Bucket(
             module=module,
@@ -129,6 +160,7 @@ class Zero3PluginV2(RuntimePlugin):
             local_param=local_param,
             data_buffer=data_buffer,
             grad_buffer=grad_buffer,
+            index=index,
             pending=len(params),
         )
 
@@ -144,7 +176,9 @@ class Zero3PluginV2(RuntimePlugin):
 
     def _make_materialize_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs) -> None:
-            self._materialize_full_params(bucket)
+            self._materialize_full_params(bucket, direction="forward")
+            if self.enable_prefetch and bucket.next_bucket is not None:
+                self._prefetch_bucket(bucket.next_bucket, direction="forward")
 
         return hook
 
@@ -156,7 +190,9 @@ class Zero3PluginV2(RuntimePlugin):
 
     def _make_materialize_backward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _grad_outputs) -> None:
-            self._materialize_full_params(bucket)
+            self._materialize_full_params(bucket, direction="backward")
+            if self.enable_prefetch and bucket.prev_bucket is not None:
+                self._prefetch_bucket(bucket.prev_bucket, direction="backward")
 
         return hook
 
@@ -189,16 +225,60 @@ class Zero3PluginV2(RuntimePlugin):
 
         return hook
 
-    def _materialize_full_params(self, bucket: _Bucket) -> None:
+    def _prefetch_bucket(self, bucket: _Bucket, direction: str) -> None:
         assert self.dp_group is not None
+        if direction == "forward":
+            if bucket.fwd_handle is not None:
+                return
+            bucket.fwd_handle = dist.all_gather_into_tensor(
+                bucket.data_buffer,
+                bucket.local_param.detach().contiguous(),
+                group=self.dp_group,
+                async_op=True,
+            )
+            return
+        if direction == "backward":
+            if bucket.bwd_handle is not None:
+                return
+            bucket.bwd_handle = dist.all_gather_into_tensor(
+                bucket.data_buffer,
+                bucket.local_param.detach().contiguous(),
+                group=self.dp_group,
+                async_op=True,
+            )
+            return
+        raise ValueError(f"unknown ZeRO3 prefetch direction={direction}")
+
+    def _materialize_full_params(self, bucket: _Bucket, direction: str) -> None:
+        if direction == "forward":
+            if bucket.fwd_handle is None:
+                self._prefetch_bucket(bucket, direction="forward")
+            assert bucket.fwd_handle is not None
+            bucket.fwd_handle.wait()
+        elif direction == "backward":
+            if bucket.bwd_handle is None:
+                self._prefetch_bucket(bucket, direction="backward")
+            assert bucket.bwd_handle is not None
+            bucket.bwd_handle.wait()
+        else:
+            raise ValueError(f"unknown ZeRO3 materialize direction={direction}")
+        self._bind_full_params(bucket, bucket.data_buffer)
+
+    def _materialize_full_params_sync(self, bucket: _Bucket) -> None:
+        assert self.dp_group is not None
+        buffer = torch.empty(bucket.buffer_size, dtype=bucket.local_param.dtype, device=bucket.local_param.device)
         dist.all_gather_into_tensor(
-            bucket.data_buffer,
+            buffer,
             bucket.local_param.detach().contiguous(),
             group=self.dp_group,
         )
+        self._materialized_buffers.append(buffer)
+        self._bind_full_params(bucket, buffer)
+
+    def _bind_full_params(self, bucket: _Bucket, buffer: torch.Tensor) -> None:
         offset = 0
         for param, numel, shape in zip(bucket.params, bucket.param_numels, bucket.param_shapes):
-            param.data = bucket.data_buffer[offset : offset + numel].view(shape)
+            param.data = buffer[offset : offset + numel].view(shape)
             offset += numel
 
     def _free_full_params(self, bucket: _Bucket) -> None:
@@ -228,12 +308,14 @@ class Zero3PluginV2(RuntimePlugin):
         self.optimizer.zero_grad(set_to_none=True)
 
     def materialize_model(self) -> None:
+        self._materialized_buffers.clear()
         for bucket in self.buckets:
-            self._materialize_full_params(bucket)
+            self._materialize_full_params_sync(bucket)
 
     def reshard_model(self) -> None:
         for bucket in self.buckets:
             self._free_full_params(bucket)
+        self._materialized_buffers.clear()
 
     def _wait_all_grad_sync(self) -> None:
         for bucket in self.buckets:
@@ -243,10 +325,13 @@ class Zero3PluginV2(RuntimePlugin):
             self._free_full_params(bucket)
 
     def _reset_buckets(self) -> None:
+        self._materialized_buffers.clear()
         for bucket in self.buckets:
             bucket.pending = len(bucket.params)
             bucket.attached = False
             bucket.grad_handle = None
+            bucket.fwd_handle = None
+            bucket.bwd_handle = None
 
     def _padded_len(self, numel: int) -> int:
         return (numel + self.world_size - 1) // self.world_size * self.world_size
