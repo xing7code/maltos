@@ -23,6 +23,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
+from train_system.parallel.specs import TpSpShardAxis
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshConfig, RuntimeCore
 from train_system.runtime.plugins.sp import SequenceParallelPlugin
@@ -88,9 +89,9 @@ def _rule_by_param_name(model: TinyTransformer) -> dict[str, str]:
         return {}
     rules = {}
     for rule in model.parallelize_spec().rules:
-        if rule.shard_style in ("col", "row"):
-            rules[f"{rule.module_path}.weight"] = rule.shard_style
-            rules[f"{rule.module_path}.bias"] = rule.shard_style
+        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
+            rules[f"{rule.module_path}.weight"] = rule.shard_axis
+            rules[f"{rule.module_path}.bias"] = rule.shard_axis
     return rules
 
 
@@ -101,10 +102,10 @@ def _all_gather_tensor(tensor: torch.Tensor) -> list[torch.Tensor]:
 
 
 def _logical_tensor(name: str, tensor: torch.Tensor, shard_rules: dict[str, str]) -> torch.Tensor:
-    shard_style = shard_rules.get(name)
-    if shard_style == "col":
+    shard_axis = shard_rules.get(name)
+    if shard_axis == TpSpShardAxis.PARAM_OUT:
         return torch.cat(_all_gather_tensor(tensor), dim=0)
-    if shard_style == "row":
+    if shard_axis == TpSpShardAxis.PARAM_IN:
         return torch.cat(_all_gather_tensor(tensor), dim=1)
     return tensor.detach().clone()
 

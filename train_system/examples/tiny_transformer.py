@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from train_system.parallel.spec import OpShardRule, ModelParallelSpec
+from train_system.parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from train_system.utils.logging import debug_log
 
 
@@ -139,14 +139,14 @@ class TinyTransformerTp(TinyTransformer):
         rules = []
         for i in range(len(self.layers)):
             rules += [
-                OpShardRule(f"layers.{i}.attn.q_proj", shard_style="col", shard_axis="out"),
-                OpShardRule(f"layers.{i}.attn.kv_proj", shard_style="col", shard_axis="out"),
-                OpShardRule(f"layers.{i}.attn.o_proj", shard_style="row", shard_axis="in", post_comm="all_reduce"),
-                OpShardRule(f"layers.{i}.mlp.gate", shard_style="col", shard_axis="out"),
-                OpShardRule(f"layers.{i}.mlp.up", shard_style="col", shard_axis="out"),
-                OpShardRule(f"layers.{i}.mlp.down", shard_style="row", shard_axis="in", post_comm="all_reduce"),
+                TpSpShardRule(f"layers.{i}.attn.q_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.kv_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.o_proj", shard_axis=TpSpShardAxis.PARAM_IN, post_comm="all_reduce"),
+                TpSpShardRule(f"layers.{i}.mlp.gate", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.mlp.up", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.mlp.down", shard_axis=TpSpShardAxis.PARAM_IN, post_comm="all_reduce"),
             ]
-        return ModelParallelSpec(
+        return TpSpParallelSpec(
             rules=rules,
             tie_rules=[]
         )
@@ -155,23 +155,23 @@ class TinyTransformerTpSp(TinyTransformer):
     
     def parallelize_spec(self):
         rules = [
-            OpShardRule(f"embed", shard_style="seq", post_comm="scatter", comm_dim=1),
+            TpSpShardRule(f"embed", shard_axis=TpSpShardAxis.SEQUENCE, post_comm="scatter", comm_dim=1),
         ]
         for i in range(len(self.layers)):
             rules += [
-                OpShardRule(f"layers.{i}.attn", shard_style="seq", pre_comm="all_gather", comm_dim=1),
-                OpShardRule(f"layers.{i}.attn.q_proj", shard_style="col", shard_axis="out"),
-                OpShardRule(f"layers.{i}.attn.kv_proj", shard_style="col", shard_axis="out"),
-                OpShardRule(f"layers.{i}.attn.o_proj", shard_style="row", shard_axis="in", post_comm="reduce_scatter"),
-                OpShardRule(f"layers.{i}.mlp", shard_style="seq", pre_comm="all_gather", comm_dim=1),
-                OpShardRule(f"layers.{i}.mlp.gate", shard_style="col", shard_axis="out"),
-                OpShardRule(f"layers.{i}.mlp.up", shard_style="col", shard_axis="out"),
-                OpShardRule(f"layers.{i}.mlp.down", shard_style="row", shard_axis="in", post_comm="reduce_scatter"),
+                TpSpShardRule(f"layers.{i}.attn", shard_axis=TpSpShardAxis.SEQUENCE, pre_comm="all_gather", comm_dim=1),
+                TpSpShardRule(f"layers.{i}.attn.q_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.kv_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.o_proj", shard_axis=TpSpShardAxis.PARAM_IN, post_comm="reduce_scatter"),
+                TpSpShardRule(f"layers.{i}.mlp", shard_axis=TpSpShardAxis.SEQUENCE, pre_comm="all_gather", comm_dim=1),
+                TpSpShardRule(f"layers.{i}.mlp.gate", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.mlp.up", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.mlp.down", shard_axis=TpSpShardAxis.PARAM_IN, post_comm="reduce_scatter"),
             ]
         rules += [
-            OpShardRule(f"lm_head", shard_style="seq", pre_comm="all_gather", comm_dim=1),
+            TpSpShardRule(f"lm_head", shard_axis=TpSpShardAxis.SEQUENCE, pre_comm="all_gather", comm_dim=1),
         ]
-        return ModelParallelSpec(
+        return TpSpParallelSpec(
             rules=rules,
             tie_rules=[]
         )

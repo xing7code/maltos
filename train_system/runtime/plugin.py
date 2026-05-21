@@ -5,7 +5,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import torch.nn as nn
 
-from train_system.parallel.spec import ModelParallelSpec
+from train_system.parallel.specs import TpSpParallelSpec
 
 if TYPE_CHECKING:
     from train_system.runtime.core import RuntimeCore, RuntimePhase
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class ParallelizableModule(Protocol):
-    def parallelize_spec(self) -> ModelParallelSpec: ...
+    def parallelize_spec(self) -> TpSpParallelSpec: ...
 
 
 class PluginId(str, Enum):

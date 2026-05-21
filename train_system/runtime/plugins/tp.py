@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch.nn as nn
 
+from train_system.parallel.specs import TpSpShardAxis
 from train_system.runtime.core import RuntimePhase
 from train_system.runtime.mesh import MeshAxis
 from train_system.runtime.plugin import ParallelizableModule, PluginId, RuntimePlugin
@@ -27,7 +28,7 @@ class TensorParallelPlugin(RuntimePlugin):
             module = model.get_submodule(rule.module_path)
             if not isinstance(module, nn.Linear):
                 continue
-            if rule.shard_style == "col":
+            if rule.shard_axis == TpSpShardAxis.PARAM_OUT:
                 model.set_submodule(
                     rule.module_path,
                     ColumnParallelLinear.from_linear(
@@ -36,7 +37,7 @@ class TensorParallelPlugin(RuntimePlugin):
                         gather_output=(rule.post_comm == "all_gather"),
                     ),
                 )
-            elif rule.shard_style == "row":
+            elif rule.shard_axis == TpSpShardAxis.PARAM_IN:
                 model.set_submodule(
                     rule.module_path,
                     RowParallelLinear.from_linear(

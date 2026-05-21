@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-from train_system.parallel.spec import OpShardRule
+from train_system.parallel.specs import TpSpComm, TpSpShardAxis, TpSpShardRule
 from train_system.runtime.core import RuntimePhase
 from train_system.runtime.layers.functional import all_gather
 from train_system.runtime.mesh import MeshAxis
@@ -16,7 +16,7 @@ class SequenceParallelPlugin(RuntimePlugin):
 
     SP composes with TP in this minimal runtime: TP rewrites the transformer
     linears first, then SP registers activation layout hooks around modules
-    annotated with ``shard_style="seq"``.
+    annotated with ``shard_axis=SEQUENCE``.
     """
 
     def __init__(self) -> None:
@@ -48,7 +48,7 @@ class SequenceParallelPlugin(RuntimePlugin):
             return model
 
         for rule in model.parallelize_spec().rules:
-            if rule.shard_style != "seq":
+            if rule.shard_axis != TpSpShardAxis.SEQUENCE:
                 continue
             module = model.get_submodule(rule.module_path)
             self._register_sequence_hook(module, rule)
@@ -64,14 +64,14 @@ class SequenceParallelPlugin(RuntimePlugin):
             extra["sp_world_size"] = self.world_size
             handle.runtime.extra = extra
 
-    def _register_sequence_hook(self, module: nn.Module, rule: OpShardRule) -> None:
-        if rule.pre_comm == "all_gather":
+    def _register_sequence_hook(self, module: nn.Module, rule: TpSpShardRule) -> None:
+        if rule.pre_comm == TpSpComm.ALL_GATHER:
             module.register_forward_pre_hook(self._make_all_gather_hook(rule.comm_dim))
-        elif rule.post_comm == "scatter":
+        elif rule.post_comm == TpSpComm.SCATTER:
             module.register_forward_hook(self._make_scatter_hook(rule.comm_dim))
         else:
             raise NotImplementedError(
-                "SequenceParallelPlugin supports seq rules with "
+                "SequenceParallelPlugin supports sequence rules with "
                 f"pre_comm='all_gather' or post_comm='scatter', got "
                 f"pre_comm={rule.pre_comm!r}, post_comm={rule.post_comm!r}"
             )

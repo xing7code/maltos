@@ -23,6 +23,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from train_system.examples import TinyTransformer, TinyTransformerTpSp
+from train_system.parallel.specs import TpSpShardAxis
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshAxis, MeshConfig, RuntimeCore
 from train_system.runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
@@ -91,9 +92,9 @@ def _mesh_indices(rank: int, tp_size: int) -> tuple[int, int]:
 def _rule_by_param_name(model: TinyTransformerTpSp) -> dict[str, str]:
     rules = {}
     for rule in model.parallelize_spec().rules:
-        if rule.shard_style in ("col", "row"):
-            rules[f"{rule.module_path}.weight"] = rule.shard_style
-            rules[f"{rule.module_path}.bias"] = rule.shard_style
+        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
+            rules[f"{rule.module_path}.weight"] = rule.shard_axis
+            rules[f"{rule.module_path}.bias"] = rule.shard_axis
     return rules
 
 
@@ -109,11 +110,11 @@ def _logical_tensor(
     shard_rules: dict[str, str],
     tp_group: dist.ProcessGroup | None,
 ) -> torch.Tensor:
-    shard_style = shard_rules.get(name)
-    if shard_style == "col":
+    shard_axis = shard_rules.get(name)
+    if shard_axis == TpSpShardAxis.PARAM_OUT:
         assert tp_group is not None
         return torch.cat(_all_gather_tensor(tensor, tp_group), dim=0)
-    if shard_style == "row":
+    if shard_axis == TpSpShardAxis.PARAM_IN:
         assert tp_group is not None
         return torch.cat(_all_gather_tensor(tensor, tp_group), dim=1)
     return tensor.detach().clone()
