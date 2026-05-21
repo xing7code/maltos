@@ -9,8 +9,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from train_system.parallel import ParallelPlan, ProcessMesh
-from train_system.runtime import RuntimeCore, RuntimePhase
+from train_system.parallel import ParallelPlan
+from train_system.runtime import MeshConfig, RuntimeCore, RuntimePhase
 from train_system.runtime.plugin import RuntimePlugin
 
 
@@ -56,7 +56,8 @@ def test_plugin_ordering() -> None:
         RecordingPlugin("checkpoint", events, runs_before={"profiler"}),
     ]
     core = RuntimeCore(
-        plan=ParallelPlan(mesh=ProcessMesh()),
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
         model=LossModel(),
         plugins=plugins,
     )
@@ -67,7 +68,8 @@ def test_plugin_ordering() -> None:
 def test_missing_required_plugin_fails() -> None:
     try:
         RuntimeCore(
-            plan=ParallelPlan(mesh=ProcessMesh()),
+            mesh=MeshConfig(),
+            plan=ParallelPlan(),
             model=LossModel(),
             plugins=[RecordingPlugin("sp", [], requires={"tp"})],
         )
@@ -82,7 +84,8 @@ def test_train_step_phases_and_state_registry() -> None:
     model = LossModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     core = RuntimeCore(
-        plan=ParallelPlan(mesh=ProcessMesh()),
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
         model=model,
         optimizer=optimizer,
         plugins=[RecordingPlugin("recorder", events)],

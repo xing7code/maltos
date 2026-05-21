@@ -30,8 +30,8 @@ import torch.multiprocessing as mp
 
 from train_system.engine import Trainer
 from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp, CausalSelfAttention, MLP
-from train_system.parallel import ParallelPlan, ProcessMesh, MeshAxis
-from train_system.runtime import MeshRuntime, RuntimeContext
+from train_system.parallel import ParallelPlan
+from train_system.runtime import MeshAxis, MeshConfig, ProcessGroupManager, RuntimeContext
 from train_system.runtime.plugins.tp import TpPlugin
 from train_system.runtime.plugins.sp import SpPlugin
 from train_system.runtime.plugins.ddp import DdpWithBucketPlugin, NaiveDdpPlugin, NaiveAsyncDdpPlugin
@@ -107,17 +107,17 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
             world_size=args.world_size,
         )
     device = _get_device(rank)
-    mesh=ProcessMesh(dp=args.ddp_size, tp=args.tp_size, pp=1, cp=1, ep=1)
-    plan = ParallelPlan(mesh=mesh)
-    mesh_runtime = MeshRuntime.from_plan(plan)
+    mesh=MeshConfig(dp=args.ddp_size, tp=args.tp_size, pp=1, cp=1, ep=1)
+    plan = ParallelPlan()
+    group_manager = ProcessGroupManager.from_mesh(mesh)
     plugins = []
     if args.tp_size > 1:
-        tp_group = mesh_runtime.get_group(MeshAxis.TP)
+        tp_group = group_manager.get_group(MeshAxis.TP)
         plugins += [TpPlugin(tp_group)]
         if args.use_sp:
             plugins += [SpPlugin(tp_group)]
     if args.ddp_size > 1:
-        dp_group = mesh_runtime.get_group(MeshAxis.DP)
+        dp_group = group_manager.get_group(MeshAxis.DP)
         if "bucket" in args.ddp_type:
             plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](dp_group, args.ddp_bucket_mb_size)]
         elif args.ddp_type in ("zero1", "zero2"):

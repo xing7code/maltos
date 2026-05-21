@@ -1,9 +1,7 @@
-from .plan import MeshAxis, ProcessMesh, ParallelPlan
+from .plan import ParallelPlan
 from .schedule import PipelineScheduleConfig
 
 __all__ = [
-    "MeshAxis",
-    "ProcessMesh",
     "ParallelPlan",
     "PipelineScheduleConfig",
 ]

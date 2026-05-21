@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch.nn as nn
 
-from train_system.parallel.plan import MeshAxis
 from train_system.runtime.core import RuntimePhase
+from train_system.runtime.mesh import MeshAxis
 from train_system.runtime.plugin import ParallelizableModule, RuntimePlugin
 from train_system.runtime.plugins.tp import ColumnParallelLinear, RowParallelLinear
 
@@ -17,7 +17,8 @@ class TensorParallelPluginV2(RuntimePlugin):
     @property
     def tp_group(self):
         assert self.runtime is not None
-        return self.runtime.mesh_runtime.get_group(MeshAxis.TP)
+        assert self.runtime.group_manager is not None
+        return self.runtime.group_manager.get_group(MeshAxis.TP)
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         if not isinstance(model, ParallelizableModule):
@@ -52,11 +53,12 @@ class TensorParallelPluginV2(RuntimePlugin):
         if phase != RuntimePhase.TRANSFORM_MODEL:
             return
         assert self.runtime is not None
+        assert self.runtime.group_manager is not None
         for fq_name, handle in self.runtime.state_registry.items():
             handle.runtime.logical_shape = tuple(handle.param.shape)
             handle.runtime.local_shape = tuple(handle.param.shape)
             handle.runtime.extra = {
                 "parallelism": "tp",
-                "tp_world_size": 1 if self.tp_group is None else self.runtime.mesh_runtime.mesh.tp,
+                "tp_world_size": 1 if self.tp_group is None else self.runtime.group_manager.mesh.tp,
                 "note": "After module replacement, this metadata can be refined per shard rule.",
             }

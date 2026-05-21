@@ -1,13 +1,17 @@
 from .core import RuntimeCore, RuntimePhase, RuntimeState
 from .context import RuntimeContext
-from .mesh_runtime import MeshRuntime
-from .plugin import BaseParallelPlugin
+from .mesh import MeshAxis, MeshConfig, ProcessGroupManager
+from .plugin import BaseParallelPlugin, ParallelizableModule, RuntimePlugin
 
 __all__ = [
     "BaseParallelPlugin",
-    "MeshRuntime",
+    "MeshAxis",
+    "MeshConfig",
+    "ParallelizableModule",
+    "ProcessGroupManager",
     "RuntimeContext",
     "RuntimeCore",
+    "RuntimePlugin",
     "RuntimePhase",
     "RuntimeState",
 ]

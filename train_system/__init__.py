@@ -1,7 +1,8 @@
 """Training system skeleton with composable parallel runtime."""
 
-from .parallel.plan import ParallelPlan, ProcessMesh, MeshAxis
+from .parallel.plan import ParallelPlan
+from .runtime.mesh import MeshAxis, MeshConfig
 from .runtime.context import RuntimeContext
 from .engine.trainer import Trainer
 
-__all__ = ["ParallelPlan", "ProcessMesh", "MeshAxis", "RuntimeContext", "Trainer"]
+__all__ = ["ParallelPlan", "MeshConfig", "MeshAxis", "RuntimeContext", "Trainer"]

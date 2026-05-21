@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from train_system.parallel.plan import ParallelPlan
-from train_system.runtime.mesh_runtime import MeshRuntime
+from train_system.runtime.mesh import MeshConfig, ProcessGroupManager
 from train_system.runtime.plugin import RuntimePlugin
 from train_system.state.registry import StateRegistry
 
@@ -48,17 +48,19 @@ class RuntimeState:
 
 @dataclass
 class RuntimeCore:
-    plan: ParallelPlan
     model: nn.Module
+    mesh: MeshConfig = field(default_factory=MeshConfig)
+    plan: ParallelPlan = field(default_factory=ParallelPlan)
     optimizer: torch.optim.Optimizer | None = None
     plugins: list[RuntimePlugin] = field(default_factory=list)
-    mesh_runtime: MeshRuntime | None = None
+    group_manager: ProcessGroupManager | None = None
     state_registry: StateRegistry = field(default_factory=StateRegistry)
     state: RuntimeState = field(default_factory=RuntimeState)
 
     def __post_init__(self) -> None:
-        if self.mesh_runtime is None:
-            self.mesh_runtime = MeshRuntime.from_plan(self.plan)
+        self._validate_mesh_and_plan()
+        if self.group_manager is None:
+            self.group_manager = ProcessGroupManager.from_mesh(self.mesh)
         self.plugins = self._resolve_plugin_order(self.plugins)
 
     def setup(self) -> None:
@@ -94,6 +96,12 @@ class RuntimeCore:
     def _run_phase(self, phase: RuntimePhase) -> None:
         for plugin in self.plugins:
             plugin.on_phase(phase)
+
+    def _validate_mesh_and_plan(self) -> None:
+        if self.plan.zero_stage > 0 and self.mesh.dp <= 1:
+            raise ValueError(f"zero_stage={self.plan.zero_stage} requires mesh.dp > 1")
+        if self.mesh.pp <= 1 and self.plan.pp_schedule.virtual_stages > 1:
+            raise ValueError("virtual pipeline stages require mesh.pp > 1")
 
     def _resolve_plugin_order(self, plugins: list[RuntimePlugin]) -> list[RuntimePlugin]:
         if not plugins:
