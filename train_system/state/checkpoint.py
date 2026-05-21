@@ -46,6 +46,47 @@ class CheckpointManifest:
     ranks: list[RankCheckpointMetadata]
 
 
+@dataclass(frozen=True)
+class RngCheckpointState:
+    cpu: torch.Tensor
+    cuda: list[torch.Tensor] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        state: dict[str, Any] = {"cpu": self.cpu}
+        if self.cuda is not None:
+            state["cuda"] = self.cuda
+        return state
+
+    @classmethod
+    def from_dict(cls, state: dict[str, Any]) -> "RngCheckpointState":
+        return cls(cpu=state["cpu"], cuda=state.get("cuda"))
+
+
+@dataclass(frozen=True)
+class TrainerCheckpointState:
+    step: int
+    rng: RngCheckpointState
+    consumed_tokens: int | None = None
+    dataloader: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step": self.step,
+            "consumed_tokens": self.consumed_tokens,
+            "dataloader": self.dataloader,
+            "rng": self.rng.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, state: dict[str, Any]) -> "TrainerCheckpointState":
+        return cls(
+            step=int(state.get("step", 0)),
+            consumed_tokens=state.get("consumed_tokens"),
+            dataloader=state.get("dataloader"),
+            rng=RngCheckpointState.from_dict(state["rng"]),
+        )
+
+
 def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
     checkpoint_dir = Path(path)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -56,6 +97,7 @@ def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
     torch.save(model_state, checkpoint_dir / f"model_rank_{rank}.pt")
     if optim_state is not None and runtime.should_save_optimizer(rank):
         torch.save(optim_state, checkpoint_dir / f"optim_rank_{rank}.pt")
+    torch.save(_local_trainer_state(runtime).to_dict(), checkpoint_dir / f"trainer_rank_{rank}.pt")
 
     gathered_metadata: list[list[dict] | None] = [None for _ in range(world_size)]
     if dist.is_initialized():
@@ -88,7 +130,9 @@ def load_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
     optim_rank = runtime.optimizer_state_source_rank(rank)
     optim_path = checkpoint_dir / f"optim_rank_{optim_rank}.pt"
     optim_state = torch.load(optim_path, map_location="cpu") if optim_path.exists() else None
-    _load_local_checkpoint_state(runtime, model_state, optim_state)
+    trainer_path = checkpoint_dir / f"trainer_rank_{rank}.pt"
+    trainer_state = torch.load(trainer_path, map_location="cpu") if trainer_path.exists() else None
+    _load_local_checkpoint_state(runtime, model_state, optim_state, trainer_state)
     if dist.is_initialized():
         dist.barrier()
 
@@ -132,6 +176,7 @@ def _load_local_checkpoint_state(
     runtime: "RuntimeCore",
     model_state: dict[str, torch.Tensor],
     optim_state: dict[str, Any] | None,
+    trainer_state: dict[str, Any] | None,
 ) -> None:
     for plugin in runtime.plugins:
         load_local_state_dict = getattr(plugin, "load_local_state_dict", None)
@@ -147,6 +192,8 @@ def _load_local_checkpoint_state(
 
     if optim_state is not None:
         _load_optimizer_states(runtime, optim_state)
+    if trainer_state is not None:
+        _load_trainer_state(runtime, TrainerCheckpointState.from_dict(trainer_state))
     runtime._run_phase(RuntimePhase.POST_LOAD)
 
 
@@ -193,3 +240,26 @@ def _load_optimizer_states(runtime: "RuntimeCore", state: dict[str, Any]) -> Non
                 scheduler.load_state_dict(scheduler_state)
             return
     raise ValueError("no optimizer state found")
+
+
+def _local_trainer_state(runtime: "RuntimeCore") -> TrainerCheckpointState:
+    rng_state = RngCheckpointState(
+        cpu=torch.get_rng_state(),
+        cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    )
+    return TrainerCheckpointState(
+        step=runtime.state.step,
+        consumed_tokens=runtime.state.metadata.get("consumed_tokens"),
+        dataloader=runtime.state.metadata.get("dataloader"),
+        rng=rng_state,
+    )
+
+
+def _load_trainer_state(runtime: "RuntimeCore", state: TrainerCheckpointState) -> None:
+    runtime.state.step = state.step
+    runtime.state.metadata["consumed_tokens"] = state.consumed_tokens
+    runtime.state.metadata["dataloader"] = state.dataloader
+
+    torch.set_rng_state(state.rng.cpu)
+    if state.rng.cuda is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state.rng.cuda)

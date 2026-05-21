@@ -56,31 +56,44 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     first_batch = torch.randn(args.batch_size, args.hidden_size)
-    second_batch = torch.randn(args.batch_size, args.hidden_size)
 
     continuous_model = _build_model(args.seed, args.hidden_size)
     continuous_core = _build_core(continuous_model)
     continuous_core.run_train_step(first_batch)
+    continuous_core.state.metadata["consumed_tokens"] = args.batch_size * args.hidden_size
+    continuous_core.state.metadata["dataloader"] = {"cursor": args.batch_size}
     save_sharded_checkpoint(continuous_core, checkpoint_dir)
+    second_batch = torch.randn(args.batch_size, args.hidden_size)
     continuous_core.run_train_step(second_batch)
 
     restored_model = _build_model(args.seed, args.hidden_size)
     restored_core = _build_core(restored_model)
     load_sharded_checkpoint(restored_core, checkpoint_dir)
-    restored_core.run_train_step(second_batch)
+    restored_second_batch = torch.randn(args.batch_size, args.hidden_size)
+    restored_core.run_train_step(restored_second_batch)
 
     param_name, param_diff = _max_param_diff(continuous_core.model, restored_core.model)
     assert continuous_core.scheduler is not None
     assert restored_core.scheduler is not None
     scheduler_match = continuous_core.scheduler.state_dict() == restored_core.scheduler.state_dict()
     lr_diff = abs(continuous_core.optimizer.param_groups[0]["lr"] - restored_core.optimizer.param_groups[0]["lr"])
+    batch_diff = (second_batch - restored_second_batch).abs().max().item()
     print(f"Checkpoint dir    : {checkpoint_dir}")
     print(f"Resume diff       : {param_diff:.2e}  ({param_name}, atol={_ATOL:.2e})")
+    print(f"RNG batch diff    : {batch_diff:.2e}")
     print(f"LR diff           : {lr_diff:.2e}")
     if param_diff > _ATOL:
         raise AssertionError(f"Runtime optimizer checkpoint resume failed: param={param_name}, diff={param_diff:.2e}")
     if not scheduler_match or lr_diff > 0.0:
         raise AssertionError("Runtime scheduler checkpoint resume failed")
+    if batch_diff > 0.0:
+        raise AssertionError("Runtime RNG checkpoint resume failed")
+    if restored_core.state.step != 2:
+        raise AssertionError(f"Runtime step restore failed: step={restored_core.state.step}")
+    if restored_core.state.metadata.get("consumed_tokens") != args.batch_size * args.hidden_size:
+        raise AssertionError("Runtime consumed_tokens restore failed")
+    if restored_core.state.metadata.get("dataloader") != {"cursor": args.batch_size}:
+        raise AssertionError("Runtime dataloader metadata restore failed")
     print("PASS")
 
 
