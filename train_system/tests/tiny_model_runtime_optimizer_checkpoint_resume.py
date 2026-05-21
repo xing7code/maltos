@@ -32,7 +32,8 @@ def _build_model(seed: int, hidden_size: int) -> TinyModel:
 
 def _build_core(model: TinyModel) -> RuntimeCore:
     optimizer = torch.optim.AdamW(model.parameters(), lr=_LR, weight_decay=0.0)
-    core = RuntimeCore(model=model, optimizer=optimizer)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+    core = RuntimeCore(model=model, optimizer=optimizer, scheduler=scheduler)
     core.setup()
     return core
 
@@ -69,10 +70,17 @@ def main() -> None:
     restored_core.run_train_step(second_batch)
 
     param_name, param_diff = _max_param_diff(continuous_core.model, restored_core.model)
+    assert continuous_core.scheduler is not None
+    assert restored_core.scheduler is not None
+    scheduler_match = continuous_core.scheduler.state_dict() == restored_core.scheduler.state_dict()
+    lr_diff = abs(continuous_core.optimizer.param_groups[0]["lr"] - restored_core.optimizer.param_groups[0]["lr"])
     print(f"Checkpoint dir    : {checkpoint_dir}")
     print(f"Resume diff       : {param_diff:.2e}  ({param_name}, atol={_ATOL:.2e})")
+    print(f"LR diff           : {lr_diff:.2e}")
     if param_diff > _ATOL:
         raise AssertionError(f"Runtime optimizer checkpoint resume failed: param={param_name}, diff={param_diff:.2e}")
+    if not scheduler_match or lr_diff > 0.0:
+        raise AssertionError("Runtime scheduler checkpoint resume failed")
     print("PASS")
 
 

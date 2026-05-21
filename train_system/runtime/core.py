@@ -53,6 +53,7 @@ class RuntimeCore:
     mesh: MeshConfig = field(default_factory=MeshConfig)
     plan: ParallelPlan = field(default_factory=ParallelPlan)
     optimizer: torch.optim.Optimizer | None = None
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
     plugins: list[RuntimePlugin] = field(default_factory=list)
     group_manager: ProcessGroupManager | None = None
     state_registry: StateRegistry = field(default_factory=StateRegistry)
@@ -90,6 +91,8 @@ class RuntimeCore:
         self._run_phase(RuntimePhase.PRE_STEP)
         if self.optimizer is not None and not self._plugin_owns_optimizer():
             self.optimizer.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
         self._run_phase(RuntimePhase.POST_STEP)
         self.state.step += 1

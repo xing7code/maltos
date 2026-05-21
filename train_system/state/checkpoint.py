@@ -95,6 +95,8 @@ def load_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
 
 _OPTIMIZER_STATE_PREFIX = "__optimizer_state__."
 _RUNTIME_OPTIMIZER_STATE_KEY = f"{_OPTIMIZER_STATE_PREFIX}runtime"
+_SCHEDULER_STATE_PREFIX = "__scheduler_state__."
+_RUNTIME_SCHEDULER_STATE_KEY = f"{_SCHEDULER_STATE_PREFIX}runtime"
 
 
 def _local_checkpoint_state(runtime: "RuntimeCore") -> tuple[dict[str, torch.Tensor], dict[str, Any] | None, list[CheckpointEntry]]:
@@ -150,13 +152,20 @@ def _load_local_checkpoint_state(
 
 def _local_optimizer_state(runtime: "RuntimeCore") -> dict[str, Any] | None:
     if runtime.optimizer is not None:
-        return {_RUNTIME_OPTIMIZER_STATE_KEY: runtime.optimizer.state_dict()}
+        state: dict[str, Any] = {_RUNTIME_OPTIMIZER_STATE_KEY: runtime.optimizer.state_dict()}
+        if runtime.scheduler is not None:
+            state[_RUNTIME_SCHEDULER_STATE_KEY] = runtime.scheduler.state_dict()
+        return state
     for plugin in runtime.plugins:
         if not plugin.owns_optimizer:
             continue
         optimizer = getattr(plugin, "optimizer", None)
         if optimizer is not None:
-            return {f"{_OPTIMIZER_STATE_PREFIX}{plugin.id.value}": optimizer.state_dict()}
+            state = {f"{_OPTIMIZER_STATE_PREFIX}{plugin.id.value}": optimizer.state_dict()}
+            scheduler = getattr(plugin, "scheduler", None)
+            if scheduler is not None:
+                state[f"{_SCHEDULER_STATE_PREFIX}{plugin.id.value}"] = scheduler.state_dict()
+            return state
     return None
 
 
@@ -165,6 +174,9 @@ def _load_optimizer_states(runtime: "RuntimeCore", state: dict[str, Any]) -> Non
         optimizer_state = state.get(_RUNTIME_OPTIMIZER_STATE_KEY)
         if optimizer_state is not None:
             runtime.optimizer.load_state_dict(optimizer_state)
+        scheduler_state = state.get(_RUNTIME_SCHEDULER_STATE_KEY)
+        if scheduler_state is not None and runtime.scheduler is not None:
+            runtime.scheduler.load_state_dict(scheduler_state)
         return
     for plugin in runtime.plugins:
         if not plugin.owns_optimizer:
@@ -175,5 +187,9 @@ def _load_optimizer_states(runtime: "RuntimeCore", state: dict[str, Any]) -> Non
         optimizer_state = state.get(f"{_OPTIMIZER_STATE_PREFIX}{plugin.id.value}")
         if optimizer_state is not None:
             optimizer.load_state_dict(optimizer_state)
+            scheduler = getattr(plugin, "scheduler", None)
+            scheduler_state = state.get(f"{_SCHEDULER_STATE_PREFIX}{plugin.id.value}")
+            if scheduler is not None and scheduler_state is not None:
+                scheduler.load_state_dict(scheduler_state)
             return
     raise ValueError("no optimizer state found")
