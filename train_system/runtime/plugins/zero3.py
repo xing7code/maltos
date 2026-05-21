@@ -9,6 +9,7 @@ import torch.nn as nn
 from train_system.runtime.core import RuntimePhase
 from train_system.runtime.mesh import MeshAxis
 from train_system.runtime.plugin import PluginId, RuntimePlugin
+from train_system.state.checkpoint import CheckpointEntry
 
 
 class _AllReduceShardWork:
@@ -42,6 +43,7 @@ class _Bucket:
     data_buffer: torch.Tensor
     grad_buffer: torch.Tensor
     index: int
+    logical_names: list[str]
     pending: int
     prev_bucket: "_Bucket | None" = None
     next_bucket: "_Bucket | None" = None
@@ -97,7 +99,8 @@ class Zero3Plugin(RuntimePlugin):
 
     def _prepare_buckets(self, model: nn.Module) -> None:
         visited: set[str] = set()
-        bucket_specs: list[tuple[nn.Module, list[nn.Parameter]]] = []
+        param_to_name = {id(param): name for name, param in model.named_parameters()}
+        bucket_specs: list[tuple[nn.Module, list[nn.Parameter], list[str]]] = []
         for module_name, module in model.named_modules():
             if not isinstance(module, tuple(self.wrap_cls)):
                 continue
@@ -107,20 +110,21 @@ class Zero3Plugin(RuntimePlugin):
             if not params:
                 continue
             visited.add(module_name)
-            bucket_specs.append((module, params))
+            logical_names = [param_to_name[id(param)] for param in params]
+            bucket_specs.append((module, params, logical_names))
 
         if not bucket_specs:
             return
 
         dtype, device = bucket_specs[0][1][0].dtype, bucket_specs[0][1][0].device
-        max_buffer_size = max(self._padded_len(sum(param.numel() for param in params)) for _, params in bucket_specs)
+        max_buffer_size = max(self._padded_len(sum(param.numel() for param in params)) for _, params, _ in bucket_specs)
         self.data_buffers = [
             torch.empty(max_buffer_size, dtype=dtype, device=device),
             torch.empty(max_buffer_size, dtype=dtype, device=device),
         ]
 
-        for index, (module, params) in enumerate(bucket_specs):
-            bucket = self._make_bucket(index, module, params)
+        for index, (module, params, logical_names) in enumerate(bucket_specs):
+            bucket = self._make_bucket(index, module, params, logical_names)
             self.buckets.append(bucket)
 
         for index, bucket in enumerate(self.buckets):
@@ -134,7 +138,7 @@ class Zero3Plugin(RuntimePlugin):
         for bucket in self.buckets:
             self._free_full_params(bucket)
 
-    def _make_bucket(self, index: int, module: nn.Module, params: list[nn.Parameter]) -> _Bucket:
+    def _make_bucket(self, index: int, module: nn.Module, params: list[nn.Parameter], logical_names: list[str]) -> _Bucket:
         dtype, device = params[0].dtype, params[0].device
         param_shapes = [param.shape for param in params]
         param_numels = [param.numel() for param in params]
@@ -161,6 +165,7 @@ class Zero3Plugin(RuntimePlugin):
             data_buffer=data_buffer,
             grad_buffer=grad_buffer,
             index=index,
+            logical_names=logical_names,
             pending=len(params),
         )
 
@@ -316,6 +321,48 @@ class Zero3Plugin(RuntimePlugin):
         for bucket in self.buckets:
             self._free_full_params(bucket)
         self._materialized_buffers.clear()
+
+    def local_state_dict(self) -> tuple[dict[str, torch.Tensor], list[CheckpointEntry]]:
+        state = {}
+        metadata = []
+        for bucket in self.buckets:
+            state_key = f"zero3_bucket_{bucket.index}"
+            state[state_key] = bucket.local_param.detach().cpu().clone()
+            metadata.append(
+                CheckpointEntry(
+                    state_key=state_key,
+                    logical_names=bucket.logical_names,
+                    logical_shapes=[tuple(shape) for shape in bucket.param_shapes],
+                    physical_shape=tuple(bucket.local_param.shape),
+                    dtype=str(bucket.local_param.dtype),
+                )
+            )
+        return state, metadata
+
+    def annotate_checkpoint_entry(self, entry: CheckpointEntry) -> None:
+        bucket_by_key = {f"zero3_bucket_{bucket.index}": bucket for bucket in self.buckets}
+        bucket = bucket_by_key.get(entry.state_key)
+        if bucket is None:
+            return
+        shard_len = bucket.local_param.numel()
+        entry.set_plugin_annotation(
+            self,
+            {
+                "bucket_index": bucket.index,
+                "rank": self.rank,
+                "world_size": self.world_size,
+                "shard_offset": self.rank * shard_len,
+                "shard_numel": shard_len,
+                "numel": bucket.buffer_size,
+            },
+        )
+
+    def load_local_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        for bucket in self.buckets:
+            state_key = f"zero3_bucket_{bucket.index}"
+            tensor = state[state_key].to(device=bucket.local_param.device, dtype=bucket.local_param.dtype)
+            bucket.local_param.data.copy_(tensor)
+            self._free_full_params(bucket)
 
     def _wait_all_grad_sync(self) -> None:
         for bucket in self.buckets:
