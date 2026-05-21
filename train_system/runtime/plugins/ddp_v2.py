@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+
+from train_system.runtime.core import RuntimePhase
+from train_system.runtime.mesh import MeshAxis
+from train_system.runtime.plugin import PluginId, RuntimePlugin
+
+
+class DataParallelPluginV2(RuntimePlugin):
+    """RuntimeCore data parallel gradient synchronization."""
+
+    def __init__(self, async_op: bool = False) -> None:
+        name = "data_parallel_async" if async_op else "data_parallel"
+        super().__init__(id=PluginId.DP, name=name)
+        self.async_op = async_op
+
+    def on_phase(self, phase: RuntimePhase) -> None:
+        if phase != RuntimePhase.POST_BACKWARD:
+            return
+        assert self.runtime is not None
+        dp_group = self.runtime.get_group(MeshAxis.DP)
+        if dp_group is None:
+            return
+        handles = []
+        for name, param in self.runtime.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.grad is None:
+                raise RuntimeError(f"param={name} requires grad but has no gradient")
+            handle = dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=dp_group, async_op=self.async_op)
+            if self.async_op:
+                handles.append(handle)
+        for handle in handles:
+            handle.wait()
+
+
+@dataclass
+class _Bucket:
+    group: dist.ProcessGroup
+    params: list[nn.Parameter] = field(default_factory=list)
+    param_views: list[torch.Tensor] = field(default_factory=list)
+    flat_buffer: torch.Tensor | None = None
+    total_bytes: int = 0
+    pending: int = 0
+    handle: dist.Work | None = None
+
+    def add_param(self, param: nn.Parameter) -> None:
+        self.params.append(param)
+        self.total_bytes += param.numel() * param.element_size()
+
+    def finalize(self) -> None:
+        total_numel = sum(param.numel() for param in self.params)
+        dtype, device = self.params[0].dtype, self.params[0].device
+        self.flat_buffer = torch.zeros(total_numel, dtype=dtype, device=device)
+        offset = 0
+        for param in self.params:
+            view = self.flat_buffer[offset : offset + param.numel()].view_as(param)
+            self.param_views.append(view)
+            offset += param.numel()
+        self.reset()
+
+    def reset(self) -> None:
+        assert self.flat_buffer is not None
+        self.pending = len(self.params)
+        self.handle = None
+        self.flat_buffer.zero_()
+        for param, view in zip(self.params, self.param_views):
+            param.grad = view
+
+    def make_hook(self):
+        def hook(param):
+            self.pending -= 1
+            if self.pending == 0:
+                assert self.flat_buffer is not None
+                self.handle = dist.all_reduce(
+                    self.flat_buffer,
+                    op=dist.ReduceOp.AVG,
+                    group=self.group,
+                    async_op=True,
+                )
+
+        return hook
+
+
+class BucketDataParallelPluginV2(RuntimePlugin):
+    """Bucketized DDP that starts async grad sync during backward."""
+
+    def __init__(self, bucket_mb_size: int = 25) -> None:
+        super().__init__(id=PluginId.DP, name="bucket_data_parallel")
+        self.bucket_byte_size = bucket_mb_size * 1024 * 1024
+        self.buckets: list[_Bucket] = []
+
+    def transform_model(self, model: nn.Module) -> nn.Module:
+        assert self.runtime is not None
+        dp_group = self.runtime.get_group(MeshAxis.DP)
+        if dp_group is None:
+            return model
+        self._build_buckets(model, dp_group)
+        for bucket in self.buckets:
+            for param in bucket.params:
+                param.register_post_accumulate_grad_hook(bucket.make_hook())
+        return model
+
+    def on_phase(self, phase: RuntimePhase) -> None:
+        if phase == RuntimePhase.PRE_FORWARD:
+            for bucket in self.buckets:
+                bucket.reset()
+        elif phase == RuntimePhase.POST_BACKWARD:
+            for bucket in self.buckets:
+                if bucket.handle is None:
+                    raise RuntimeError(f"bucket with {len(bucket.params)} params was never synchronized")
+                bucket.handle.wait()
+
+    def _build_buckets(self, model: nn.Module, dp_group: dist.ProcessGroup) -> None:
+        self.buckets = []
+        current_bucket: _Bucket | None = None
+        for param in reversed([p for p in model.parameters() if p.requires_grad]):
+            if current_bucket is None or current_bucket.total_bytes >= self.bucket_byte_size:
+                if current_bucket is not None:
+                    current_bucket.finalize()
+                current_bucket = _Bucket(dp_group)
+                self.buckets.append(current_bucket)
+            current_bucket.add_param(param)
+        if current_bucket is not None:
+            current_bucket.finalize()
