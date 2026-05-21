@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from graphlib import TopologicalSorter
+from typing import Any
+
+import torch
+import torch.nn as nn
+
+from train_system.parallel.plan import ParallelPlan
+from train_system.runtime.mesh_runtime import MeshRuntime
+from train_system.runtime.plugin import RuntimePlugin
+from train_system.state.registry import StateRegistry
+
+
+class RuntimePhase(str, Enum):
+    SETUP = "setup"
+    TRANSFORM_MODEL = "transform_model"
+    PRE_MICROBATCH = "pre_microbatch"
+    PRE_FORWARD = "pre_forward"
+    POST_FORWARD = "post_forward"
+    PRE_BACKWARD = "pre_backward"
+    POST_BACKWARD = "post_backward"
+    PRE_STEP = "pre_step"
+    POST_STEP = "post_step"
+    PRE_SAVE = "pre_save"
+    POST_LOAD = "post_load"
+
+
+@dataclass
+class RuntimeState:
+    """Transient execution context for the current step.
+
+    This is intentionally not a checkpoint manifest. Plugins use it as a
+    shared scratchpad for phase-local data such as the current batch, loss,
+    microbatch index, profiler annotations, or temporary scheduling metadata.
+    Durable training state should be declared through checkpoint/state APIs.
+    """
+
+    step: int = 0
+    microbatch_idx: int = 0
+    loss: torch.Tensor | None = None
+    batch: Any = None
+    outputs: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RuntimeCore:
+    plan: ParallelPlan
+    model: nn.Module
+    optimizer: torch.optim.Optimizer | None = None
+    plugins: list[RuntimePlugin] = field(default_factory=list)
+    mesh_runtime: MeshRuntime | None = None
+    state_registry: StateRegistry = field(default_factory=StateRegistry)
+    state: RuntimeState = field(default_factory=RuntimeState)
+
+    def __post_init__(self) -> None:
+        if self.mesh_runtime is None:
+            self.mesh_runtime = MeshRuntime.from_plan(self.plan)
+        self.plugins = self._resolve_plugin_order(self.plugins)
+
+    def setup(self) -> None:
+        for plugin in self.plugins:
+            plugin.bind(self)
+        self._run_phase(RuntimePhase.SETUP)
+        for plugin in self.plugins:
+            self.model = plugin.transform_model(self.model)
+        self.state_registry.register_module(self.model)
+        self._run_phase(RuntimePhase.TRANSFORM_MODEL)
+
+    def run_train_step(self, batch: Any) -> torch.Tensor:
+        self.state.batch = batch
+        self._run_phase(RuntimePhase.PRE_MICROBATCH)
+        self._run_phase(RuntimePhase.PRE_FORWARD)
+        outputs = self.model(batch)
+        self.state.outputs = outputs
+        self.state.loss = outputs if torch.is_tensor(outputs) else None
+        self._run_phase(RuntimePhase.POST_FORWARD)
+        self._run_phase(RuntimePhase.PRE_BACKWARD)
+        if self.state.loss is None:
+            raise TypeError("RuntimeCore expects model(batch) to return a Tensor loss during training.")
+        self.state.loss.backward()
+        self._run_phase(RuntimePhase.POST_BACKWARD)
+        self._run_phase(RuntimePhase.PRE_STEP)
+        if self.optimizer is not None:
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+        self._run_phase(RuntimePhase.POST_STEP)
+        self.state.step += 1
+        return self.state.loss
+
+    def _run_phase(self, phase: RuntimePhase) -> None:
+        for plugin in self.plugins:
+            plugin.on_phase(phase)
+
+    def _resolve_plugin_order(self, plugins: list[RuntimePlugin]) -> list[RuntimePlugin]:
+        if not plugins:
+            return []
+        plugin_by_name = {plugin.name: plugin for plugin in plugins}
+        sorter = TopologicalSorter()
+        for plugin in plugins:
+            missing = set(plugin.requires) - set(plugin_by_name)
+            if missing:
+                raise ValueError(f"plugin={plugin.name} requires missing plugins={sorted(missing)}")
+            deps = set(plugin.requires) | (set(plugin.runs_after) & set(plugin_by_name))
+            sorter.add(plugin.name, *deps)
+        for plugin in plugins:
+            for before_name in plugin.runs_before:
+                if before_name in plugin_by_name:
+                    sorter.add(before_name, plugin.name)
+        order = [name for name in sorter.static_order() if name in plugin_by_name]
+        return [plugin_by_name[name] for name in order]

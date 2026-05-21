@@ -31,7 +31,7 @@ import torch.multiprocessing as mp
 from train_system.engine import Trainer
 from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp, CausalSelfAttention, MLP
 from train_system.parallel import ParallelPlan, ProcessMesh, MeshAxis
-from train_system.runtime import RuntimeContext
+from train_system.runtime import MeshRuntime, RuntimeContext
 from train_system.runtime.plugins.tp import TpPlugin
 from train_system.runtime.plugins.sp import SpPlugin
 from train_system.runtime.plugins.ddp import DdpWithBucketPlugin, NaiveDdpPlugin, NaiveAsyncDdpPlugin
@@ -109,20 +109,23 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     device = _get_device(rank)
     mesh=ProcessMesh(dp=args.ddp_size, tp=args.tp_size, pp=1, cp=1, ep=1)
     plan = ParallelPlan(mesh=mesh)
+    mesh_runtime = MeshRuntime.from_plan(plan)
     plugins = []
     if args.tp_size > 1:
-        plugins += [TpPlugin(mesh.get_group(MeshAxis.TP))]
+        tp_group = mesh_runtime.get_group(MeshAxis.TP)
+        plugins += [TpPlugin(tp_group)]
         if args.use_sp:
-            plugins += [SpPlugin(mesh.get_group(MeshAxis.TP))]
+            plugins += [SpPlugin(tp_group)]
     if args.ddp_size > 1:
+        dp_group = mesh_runtime.get_group(MeshAxis.DP)
         if "bucket" in args.ddp_type:
-            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), args.ddp_bucket_mb_size)]
+            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](dp_group, args.ddp_bucket_mb_size)]
         elif args.ddp_type in ("zero1", "zero2"):
-            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), args.ddp_bucket_mb_size, torch.optim.AdamW, lr=1e-3)]
+            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](dp_group, args.ddp_bucket_mb_size, torch.optim.AdamW, lr=1e-3)]
         elif args.ddp_type == "zero3":
-            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP), {CausalSelfAttention, MLP}, torch.optim.AdamW, lr=1e-3)]
+            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](dp_group, {CausalSelfAttention, MLP}, torch.optim.AdamW, lr=1e-3)]
         else:
-            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](mesh.get_group(MeshAxis.DP))]
+            plugins += [_REGISTRY_DDP_PLUGIN[args.ddp_type](dp_group)]
 
     ctx = RuntimeContext(plan=plan, plugins=plugins)
 
@@ -180,7 +183,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    assert args.world_size >= 1 and args.tp_size >= 1 and args.ddp_size >= 1 and args.tp_size * args.ddp_size <= args.world_size, f"Invalid args config on tp_size, ddp_size, world_size. {args}"
+    assert args.world_size >= 1 and args.tp_size >= 1 and args.ddp_size >= 1 and args.tp_size * args.ddp_size == args.world_size, f"Invalid args config on tp_size, ddp_size, world_size. {args}"
     assert args.model_class in _REGISTRY_MODLE_CLASS, f"invalid model_class {args.model_class}"
 
     os.environ.setdefault("OMP_NUM_THREADS", "1")
