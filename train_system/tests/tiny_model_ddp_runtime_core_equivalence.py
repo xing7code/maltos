@@ -28,6 +28,19 @@ _ATOL = 1e-6
 _LR = 1e-2
 
 
+class _NoOpOptimizer(torch.optim.Optimizer):
+    def __init__(self, params):
+        super().__init__(params, {})
+
+    def step(self, closure=None):
+        if closure is not None:
+            return closure()
+        return None
+
+    def zero_grad(self, set_to_none: bool = True):
+        return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--world-size", type=int, default=2)
@@ -114,7 +127,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         mesh=MeshConfig(dp=args.world_size, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(),
         model=ddp_model,
-        optimizer=None,
+        optimizer=_NoOpOptimizer(ddp_model.parameters()),
         plugins=plugins,
     )
     core.setup()

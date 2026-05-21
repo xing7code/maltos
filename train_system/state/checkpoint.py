@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -52,8 +52,10 @@ def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    local_state, rank_entries = _local_checkpoint_state(runtime)
-    torch.save(local_state, checkpoint_dir / f"rank_{rank}.pt")
+    model_state, optim_state, rank_entries = _local_checkpoint_state(runtime)
+    torch.save(model_state, checkpoint_dir / f"model_rank_{rank}.pt")
+    if optim_state is not None and runtime.should_save_optimizer(rank):
+        torch.save(optim_state, checkpoint_dir / f"optim_rank_{rank}.pt")
 
     gathered_metadata: list[list[dict] | None] = [None for _ in range(world_size)]
     if dist.is_initialized():
@@ -82,13 +84,20 @@ def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
 def load_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
     checkpoint_dir = Path(path)
     rank = dist.get_rank() if dist.is_initialized() else 0
-    state = torch.load(checkpoint_dir / f"rank_{rank}.pt", map_location="cpu")
-    _load_local_checkpoint_state(runtime, state)
+    model_state = torch.load(checkpoint_dir / f"model_rank_{rank}.pt", map_location="cpu")
+    optim_rank = runtime.optimizer_state_source_rank(rank)
+    optim_path = checkpoint_dir / f"optim_rank_{optim_rank}.pt"
+    optim_state = torch.load(optim_path, map_location="cpu") if optim_path.exists() else None
+    _load_local_checkpoint_state(runtime, model_state, optim_state)
     if dist.is_initialized():
         dist.barrier()
 
 
-def _local_checkpoint_state(runtime: "RuntimeCore") -> tuple[dict[str, torch.Tensor], list[CheckpointEntry]]:
+_OPTIMIZER_STATE_PREFIX = "__optimizer_state__."
+_RUNTIME_OPTIMIZER_STATE_KEY = f"{_OPTIMIZER_STATE_PREFIX}runtime"
+
+
+def _local_checkpoint_state(runtime: "RuntimeCore") -> tuple[dict[str, torch.Tensor], dict[str, Any] | None, list[CheckpointEntry]]:
     for plugin in runtime.plugins:
         local_state_dict = getattr(plugin, "local_state_dict", None)
         if local_state_dict is not None:
@@ -113,16 +122,58 @@ def _local_checkpoint_state(runtime: "RuntimeCore") -> tuple[dict[str, torch.Ten
     for entry in entries:
         for plugin in runtime.plugins:
             entry.add_annotation(plugin)
-    return state, entries
+    optim_state = _local_optimizer_state(runtime)
+    return state, optim_state, entries
 
 
-def _load_local_checkpoint_state(runtime: "RuntimeCore", state: dict[str, torch.Tensor]) -> None:
+def _load_local_checkpoint_state(
+    runtime: "RuntimeCore",
+    model_state: dict[str, torch.Tensor],
+    optim_state: dict[str, Any] | None,
+) -> None:
     for plugin in runtime.plugins:
         load_local_state_dict = getattr(plugin, "load_local_state_dict", None)
         if load_local_state_dict is not None:
-            load_local_state_dict(state)
-            return
+            load_local_state_dict(model_state)
+            break
+    else:
+        params = dict(runtime.model.named_parameters())
+        for name, tensor in model_state.items():
+            params[name].data.copy_(tensor.to(device=params[name].device, dtype=params[name].dtype))
 
-    params = dict(runtime.model.named_parameters())
-    for name, tensor in state.items():
-        params[name].data.copy_(tensor.to(device=params[name].device, dtype=params[name].dtype))
+    from train_system.runtime.core import RuntimePhase
+
+    if optim_state is not None:
+        _load_optimizer_states(runtime, optim_state)
+    runtime._run_phase(RuntimePhase.POST_LOAD)
+
+
+def _local_optimizer_state(runtime: "RuntimeCore") -> dict[str, Any] | None:
+    if runtime.optimizer is not None:
+        return {_RUNTIME_OPTIMIZER_STATE_KEY: runtime.optimizer.state_dict()}
+    for plugin in runtime.plugins:
+        if not plugin.owns_optimizer:
+            continue
+        optimizer = getattr(plugin, "optimizer", None)
+        if optimizer is not None:
+            return {f"{_OPTIMIZER_STATE_PREFIX}{plugin.id.value}": optimizer.state_dict()}
+    return None
+
+
+def _load_optimizer_states(runtime: "RuntimeCore", state: dict[str, Any]) -> None:
+    if runtime.optimizer is not None:
+        optimizer_state = state.get(_RUNTIME_OPTIMIZER_STATE_KEY)
+        if optimizer_state is not None:
+            runtime.optimizer.load_state_dict(optimizer_state)
+        return
+    for plugin in runtime.plugins:
+        if not plugin.owns_optimizer:
+            continue
+        optimizer = getattr(plugin, "optimizer", None)
+        if optimizer is None:
+            continue
+        optimizer_state = state.get(f"{_OPTIMIZER_STATE_PREFIX}{plugin.id.value}")
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+            return
+    raise ValueError("no optimizer state found")

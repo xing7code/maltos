@@ -34,6 +34,23 @@ class MeshConfig:
     def world_size(self) -> int:
         return self.dp * self.tp * self.pp * self.cp
 
+    def rank_coordinates(self, rank_id: int) -> tuple[int, int, int, int]:
+        if rank_id < 0 or rank_id >= self.world_size:
+            raise ValueError(f"rank_id must be in [0, {self.world_size}), got {rank_id}")
+        tp_idx = rank_id % self.tp
+        rank_id //= self.tp
+        cp_idx = rank_id % self.cp
+        rank_id //= self.cp
+        pp_idx = rank_id % self.pp
+        rank_id //= self.pp
+        dp_idx = rank_id
+        return dp_idx, pp_idx, cp_idx, tp_idx
+
+    def rank_id(self, *, dp: int, pp: int, cp: int, tp: int) -> int:
+        if not (0 <= dp < self.dp and 0 <= pp < self.pp and 0 <= cp < self.cp and 0 <= tp < self.tp):
+            raise ValueError(f"invalid mesh coordinates: dp={dp}, pp={pp}, cp={cp}, tp={tp}")
+        return (((dp * self.pp) + pp) * self.cp + cp) * self.tp + tp
+
     def _validate(self) -> None:
         for axis, size in {
             MeshAxis.DP: self.dp,

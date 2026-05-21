@@ -82,6 +82,8 @@ class Zero1Plugin(RuntimePlugin):
             self._wait_grad_sync()
         elif phase == RuntimePhase.PRE_STEP:
             self._step_and_gather()
+        elif phase == RuntimePhase.POST_LOAD:
+            self._sync_local_params_from_data_buffer()
 
     def _prepare_buffers_and_buckets(self, model: nn.Module) -> None:
         params = [param for param in model.parameters() if param.requires_grad][::-1]
@@ -203,6 +205,12 @@ class Zero1Plugin(RuntimePlugin):
         for bucket in self.buckets:
             bucket.pending = len(bucket.params)
             bucket.handle = None
+
+    def _sync_local_params_from_data_buffer(self) -> None:
+        assert self.data_buffer is not None
+        with torch.no_grad():
+            for bucket in self.buckets:
+                bucket.local_param.data.copy_(self.data_buffer[bucket.shard_start : bucket.shard_end])
 
     def _padded_len(self, numel: int) -> int:
         return (numel + self.world_size - 1) // self.world_size * self.world_size

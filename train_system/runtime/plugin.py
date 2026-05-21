@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import torch.nn as nn
 
 from train_system.parallel.specs import TpSpParallelSpec
+from train_system.runtime.mesh import MeshAxis
 
 if TYPE_CHECKING:
     from train_system.runtime.core import RuntimeCore, RuntimePhase
@@ -56,3 +57,12 @@ class RuntimePlugin:
 
     def on_phase(self, phase: "RuntimePhase") -> None:
         pass
+
+    def runtime_optimizer_replicated_axes(self) -> set[MeshAxis]:
+        return set()
+
+    def runtime_optimizer_sharded_axes(self) -> set[MeshAxis]:
+        return set()
+
+    def optimizer_state_source_rank(self, rank_id: int) -> int:
+        return rank_id

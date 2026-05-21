@@ -54,7 +54,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         mesh=MeshConfig(dp=1, tp=args.world_size, pp=1, cp=1, ep=1),
         plan=ParallelPlan(),
         model=model,
-        optimizer=None,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
         plugins=[TensorParallelPlugin()],
     )
     core.setup()

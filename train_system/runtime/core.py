@@ -63,6 +63,7 @@ class RuntimeCore:
         if self.group_manager is None:
             self.group_manager = ProcessGroupManager.from_mesh(self.mesh)
         self.plugins = self._resolve_plugin_order(self.plugins)
+        self._validate_optimizer_owner()
 
     def setup(self) -> None:
         for plugin in self.plugins:
@@ -98,12 +99,61 @@ class RuntimeCore:
         assert self.group_manager is not None
         return self.group_manager.get_group(axis)
 
+    def should_save_optimizer(self, rank_id: int) -> bool:
+        return self.optimizer_state_source_rank(rank_id) == rank_id
+
+    def optimizer_state_source_rank(self, rank_id: int) -> int:
+        if self.optimizer is None:
+            for plugin in self.plugins:
+                if plugin.owns_optimizer:
+                    return plugin.optimizer_state_source_rank(rank_id)
+            return rank_id
+
+        replicated_axes, sharded_axes = self._runtime_optimizer_mesh_axes()
+        dp_idx, pp_idx, cp_idx, tp_idx = self.mesh.rank_coordinates(rank_id)
+        coords = {
+            MeshAxis.DP: dp_idx,
+            MeshAxis.PP: pp_idx,
+            MeshAxis.CP: cp_idx,
+            MeshAxis.TP: tp_idx,
+        }
+        for axis in replicated_axes - sharded_axes:
+            coords[axis] = 0
+        return self.mesh.rank_id(
+            dp=coords[MeshAxis.DP],
+            pp=coords[MeshAxis.PP],
+            cp=coords[MeshAxis.CP],
+            tp=coords[MeshAxis.TP],
+        )
+
     def _run_phase(self, phase: RuntimePhase) -> None:
         for plugin in self.plugins:
             plugin.on_phase(phase)
 
     def _plugin_owns_optimizer(self) -> bool:
         return any(plugin.owns_optimizer for plugin in self.plugins)
+
+    def _runtime_optimizer_mesh_axes(self) -> tuple[set[MeshAxis], set[MeshAxis]]:
+        replicated_axes: set[MeshAxis] = set()
+        sharded_axes: set[MeshAxis] = set()
+        for plugin in self.plugins:
+            replicated_axes.update(plugin.runtime_optimizer_replicated_axes())
+            sharded_axes.update(plugin.runtime_optimizer_sharded_axes())
+        return replicated_axes, sharded_axes
+
+    def _validate_optimizer_owner(self) -> None:
+        owners = ["runtime"] if self.optimizer is not None else []
+        plugin_owners = [plugin.id.value for plugin in self.plugins if plugin.owns_optimizer]
+        if len(plugin_owners) > 1:
+            raise ValueError(f"RuntimeCore allows only one optimizer-owning plugin, got {plugin_owners}")
+        if self.optimizer is not None and plugin_owners:
+            raise ValueError(
+                "RuntimeCore.optimizer is mutually exclusive with optimizer-owning plugins, "
+                f"got {['runtime', *plugin_owners]}"
+            )
+        owners.extend(plugin_owners)
+        if len(owners) != 1:
+            raise ValueError(f"RuntimeCore training requires exactly one optimizer owner, got {owners}")
 
     def _validate_mesh_and_plan(self) -> None:
         if self.plan.zero_stage > 0 and self.mesh.dp <= 1:

@@ -54,6 +54,9 @@ class TensorParallelPlugin(RuntimePlugin):
                 )
         return model
 
+    def runtime_optimizer_sharded_axes(self) -> set[MeshAxis]:
+        return {MeshAxis.TP} if self.runtime is not None and self.runtime.mesh.tp > 1 else set()
+
     def annotate_checkpoint_entry(self, entry: CheckpointEntry) -> None:
         group = self.tp_group
         if group is None:
