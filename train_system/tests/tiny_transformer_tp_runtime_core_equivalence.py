@@ -42,6 +42,9 @@ _MODEL_KWARGS = dict(
 )
 
 _ATOL = 1e-3
+_GRAD_ATOL = 2e-2
+_STEP_ATOL = 5e-4
+_LR = 1e-2
 
 
 def _str_to_bool(value: str) -> bool:
@@ -81,6 +84,60 @@ def _baseline_loss(model: TinyTransformer, tokens: torch.Tensor) -> float:
     return loss.item()
 
 
+def _rule_by_param_name(model: TinyTransformer) -> dict[str, str]:
+    if not hasattr(model, "parallelize_spec"):
+        return {}
+    rules = {}
+    for rule in model.parallelize_spec().rules:
+        if rule.shard_style in ("col", "row"):
+            rules[f"{rule.module_path}.weight"] = rule.shard_style
+            rules[f"{rule.module_path}.bias"] = rule.shard_style
+    return rules
+
+
+def _all_gather_tensor(tensor: torch.Tensor) -> list[torch.Tensor]:
+    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, tensor.contiguous())
+    return gathered
+
+
+def _logical_tensor(name: str, tensor: torch.Tensor, shard_rules: dict[str, str]) -> torch.Tensor:
+    shard_style = shard_rules.get(name)
+    if shard_style == "col":
+        return torch.cat(_all_gather_tensor(tensor), dim=0)
+    if shard_style == "row":
+        return torch.cat(_all_gather_tensor(tensor), dim=1)
+    return tensor.detach().clone()
+
+
+def _logical_named_tensors(model: torch.nn.Module, shard_rules: dict[str, str]) -> dict[str, torch.Tensor]:
+    return {
+        name: _logical_tensor(name, param.detach(), shard_rules)
+        for name, param in model.named_parameters()
+    }
+
+
+def _logical_named_grads(model: torch.nn.Module, shard_rules: dict[str, str]) -> dict[str, torch.Tensor]:
+    grads = {}
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        grads[name] = _logical_tensor(name, param.grad.detach(), shard_rules)
+    return grads
+
+
+def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tuple[str, float]:
+    worst_name = ""
+    worst_diff = 0.0
+    for name, lhs_tensor in lhs.items():
+        rhs_tensor = rhs[name]
+        diff = (lhs_tensor - rhs_tensor).abs().max().item()
+        if diff > worst_diff:
+            worst_name = name
+            worst_diff = diff
+    return worst_name, worst_diff
+
+
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
     dist.init_process_group(
         backend=args.backend,
@@ -108,25 +165,57 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         plugins=plugins,
     )
     core.setup()
-    core.model.eval()
+    baseline_model.train()
+    core.model.train()
 
-    with torch.no_grad():
-        sharded_loss = core.model((tokens, tokens.clone()))
+    baseline_optimizer = torch.optim.SGD(baseline_model.parameters(), lr=_LR)
+    sharded_optimizer = torch.optim.SGD(core.model.parameters(), lr=_LR)
+
+    baseline_optimizer.zero_grad(set_to_none=True)
+    sharded_optimizer.zero_grad(set_to_none=True)
+
+    baseline_train_loss = baseline_model((tokens, tokens.clone()))
+    sharded_train_loss = core.model((tokens, tokens.clone()))
+    baseline_train_loss.backward()
+    sharded_train_loss.backward()
+
+    shard_rules = _rule_by_param_name(sharded_model)
+    baseline_grads = _logical_named_grads(baseline_model, {})
+    sharded_grads = _logical_named_grads(core.model, shard_rules)
+    grad_name, grad_diff = _max_diff(baseline_grads, sharded_grads)
+
+    baseline_optimizer.step()
+    sharded_optimizer.step()
+
+    baseline_params = _logical_named_tensors(baseline_model, {})
+    sharded_params = _logical_named_tensors(core.model, shard_rules)
+    step_name, step_diff = _max_diff(baseline_params, sharded_params)
 
     if rank == 0:
-        sharded_loss = sharded_loss.item()
+        sharded_loss = sharded_train_loss.item()
         diff = abs(baseline_loss - sharded_loss)
         runtime_label = "RuntimeCore TP+SP" if args.use_sp else "RuntimeCore TP"
         print(f"Baseline loss : {baseline_loss:.6f}")
         print(f"{runtime_label}: {sharded_loss:.6f}")
         print(f"Diff          : {diff:.2e}  (atol={_ATOL:.2e})")
-        if diff <= _ATOL:
-            print("PASS")
-        else:
+        print(f"Grad diff     : {grad_diff:.2e}  ({grad_name}, atol={_GRAD_ATOL:.2e})")
+        print(f"Step diff     : {step_diff:.2e}  ({step_name}, atol={_STEP_ATOL:.2e})")
+        if diff > _ATOL:
             raise AssertionError(
                 f"RuntimeCore TP equivalence failed: baseline_loss={baseline_loss:.6f}, "
                 f"sharded_loss={sharded_loss:.6f}, diff={diff:.2e}, atol={_ATOL:.2e}"
             )
+        if grad_diff > _GRAD_ATOL:
+            raise AssertionError(
+                f"RuntimeCore gradient equivalence failed: param={grad_name}, "
+                f"diff={grad_diff:.2e}, atol={_GRAD_ATOL:.2e}"
+            )
+        if step_diff > _STEP_ATOL:
+            raise AssertionError(
+                f"RuntimeCore one-step equivalence failed: param={step_name}, "
+                f"diff={step_diff:.2e}, atol={_STEP_ATOL:.2e}"
+            )
+        print("PASS")
 
     dist.destroy_process_group()
 

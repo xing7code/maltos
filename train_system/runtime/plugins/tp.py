@@ -8,7 +8,7 @@ import torch.distributed as dist
 from enum import Enum
 
 from train_system.runtime.plugin import BaseParallelPlugin, ParallelizableModule
-from train_system.runtime.functional import all_gather, reduce_scatter
+from train_system.runtime.functional import all_gather, all_reduce, reduce_scatter
 
 
 class ColumnParallelLinear(nn.Module):
@@ -120,7 +120,7 @@ class RowParallelLinear(nn.Module):
     def forward(self, input):
         output = F.linear(input, self.weight, None)
         if self.comm == "all_reduce":
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
+            output = all_reduce(output, self.tp_group, dist.ReduceOp.SUM)
         elif self.comm == "reduce_scatter":
             output = reduce_scatter(output, self.tp_group, 1)
         if self.bias is not None:
