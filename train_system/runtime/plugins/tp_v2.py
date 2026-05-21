@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from train_system.runtime.core import RuntimePhase
 from train_system.runtime.mesh import MeshAxis
-from train_system.runtime.plugin import ParallelizableModule, RuntimePlugin
+from train_system.runtime.plugin import ParallelizableModule, PluginId, RuntimePlugin
 from train_system.runtime.plugins.tp import ColumnParallelLinear, RowParallelLinear
 
 
@@ -12,13 +12,12 @@ class TensorParallelPluginV2(RuntimePlugin):
     """Draft TP plugin that cooperates with RuntimeCore instead of driving execution."""
 
     def __init__(self):
-        super().__init__(name="tp")
+        super().__init__(id=PluginId.TP, name="tensor_parallel")
 
     @property
     def tp_group(self):
         assert self.runtime is not None
-        assert self.runtime.group_manager is not None
-        return self.runtime.group_manager.get_group(MeshAxis.TP)
+        return self.runtime.get_group(MeshAxis.TP)
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         if not isinstance(model, ParallelizableModule):
@@ -53,12 +52,11 @@ class TensorParallelPluginV2(RuntimePlugin):
         if phase != RuntimePhase.TRANSFORM_MODEL:
             return
         assert self.runtime is not None
-        assert self.runtime.group_manager is not None
         for fq_name, handle in self.runtime.state_registry.items():
             handle.runtime.logical_shape = tuple(handle.param.shape)
             handle.runtime.local_shape = tuple(handle.param.shape)
             handle.runtime.extra = {
                 "parallelism": "tp",
-                "tp_world_size": 1 if self.tp_group is None else self.runtime.group_manager.mesh.tp,
+                "tp_world_size": 1 if self.tp_group is None else self.runtime.mesh.tp,
                 "note": "After module replacement, this metadata can be refined per shard rule.",
             }

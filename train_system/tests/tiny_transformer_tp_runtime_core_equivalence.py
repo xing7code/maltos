@@ -1,12 +1,17 @@
-"""Equivalence test: baseline TinyTransformer vs RuntimeCore TP v2.
+"""Equivalence test: baseline TinyTransformer vs RuntimeCore TP/SP v2.
 
-This is the migration gate for moving TP from the legacy Trainer/BasePlugin
-path to RuntimeCore/RuntimePlugin.
+This is the migration gate for moving TP and SP from the legacy
+Trainer/BasePlugin path to RuntimeCore/RuntimePlugin.
 
 Usage:
   PYTHONPATH=. .venv/bin/python train_system/tests/tiny_transformer_tp_runtime_core_equivalence.py \
     --world-size 2 \
     --tp-size 2
+
+  PYTHONPATH=. .venv/bin/python train_system/tests/tiny_transformer_tp_runtime_core_equivalence.py \
+    --world-size 2 \
+    --tp-size 2 \
+    --use-sp true
 """
 
 from __future__ import annotations
@@ -18,9 +23,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from train_system.examples import TinyTransformer, TinyTransformerTp
+from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshConfig, RuntimeCore
+from train_system.runtime.plugins.sp_v2 import SequenceParallelPluginV2
 from train_system.runtime.plugins.tp_v2 import TensorParallelPluginV2
 
 
@@ -38,10 +44,20 @@ _MODEL_KWARGS = dict(
 _ATOL = 1e-3
 
 
+def _str_to_bool(value: str) -> bool:
+    normalized = value.lower()
+    if normalized in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if normalized in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected boolean value, got {value!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=2)
+    parser.add_argument("--use-sp", type=_str_to_bool, default=False)
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29515)
     parser.add_argument("--backend", type=str, default="gloo")
@@ -76,15 +92,20 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
     baseline_loss = _baseline_loss(baseline_model, tokens)
 
-    sharded_model = TinyTransformerTp(**_MODEL_KWARGS)
+    sharded_cls = TinyTransformerTpSp if args.use_sp else TinyTransformerTp
+    sharded_model = sharded_cls(**_MODEL_KWARGS)
     sharded_model.load_state_dict(baseline_model.state_dict())
+
+    plugins = [TensorParallelPluginV2()]
+    if args.use_sp:
+        plugins.append(SequenceParallelPluginV2())
 
     core = RuntimeCore(
         mesh=MeshConfig(dp=1, tp=args.tp_size, pp=1, cp=1, ep=1),
         plan=ParallelPlan(),
         model=sharded_model,
         optimizer=None,
-        plugins=[TensorParallelPluginV2()],
+        plugins=plugins,
     )
     core.setup()
     core.model.eval()
@@ -95,8 +116,9 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if rank == 0:
         sharded_loss = sharded_loss.item()
         diff = abs(baseline_loss - sharded_loss)
+        runtime_label = "RuntimeCore TP+SP" if args.use_sp else "RuntimeCore TP"
         print(f"Baseline loss : {baseline_loss:.6f}")
-        print(f"RuntimeCore TP: {sharded_loss:.6f}")
+        print(f"{runtime_label}: {sharded_loss:.6f}")
         print(f"Diff          : {diff:.2e}  (atol={_ATOL:.2e})")
         if diff <= _ATOL:
             print("PASS")

@@ -7,9 +7,10 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
 from train_system.parallel.plan import ParallelPlan
-from train_system.runtime.mesh import MeshConfig, ProcessGroupManager
+from train_system.runtime.mesh import MeshAxis, MeshConfig, ProcessGroupManager
 from train_system.runtime.plugin import RuntimePlugin
 from train_system.state.registry import StateRegistry
 
@@ -93,6 +94,10 @@ class RuntimeCore:
         self.state.step += 1
         return self.state.loss
 
+    def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:
+        assert self.group_manager is not None
+        return self.group_manager.get_group(axis)
+
     def _run_phase(self, phase: RuntimePhase) -> None:
         for plugin in self.plugins:
             plugin.on_phase(phase)
@@ -106,17 +111,23 @@ class RuntimeCore:
     def _resolve_plugin_order(self, plugins: list[RuntimePlugin]) -> list[RuntimePlugin]:
         if not plugins:
             return []
-        plugin_by_name = {plugin.name: plugin for plugin in plugins}
+        plugin_by_id = {}
+        for plugin in plugins:
+            if plugin.id in plugin_by_id:
+                raise ValueError(f"duplicate plugin id={plugin.id.value}")
+            plugin_by_id[plugin.id] = plugin
+
         sorter = TopologicalSorter()
         for plugin in plugins:
-            missing = set(plugin.requires) - set(plugin_by_name)
+            missing = set(plugin.requires) - set(plugin_by_id)
             if missing:
-                raise ValueError(f"plugin={plugin.name} requires missing plugins={sorted(missing)}")
-            deps = set(plugin.requires) | (set(plugin.runs_after) & set(plugin_by_name))
-            sorter.add(plugin.name, *deps)
+                missing_values = sorted(plugin_id.value for plugin_id in missing)
+                raise ValueError(f"plugin={plugin.name} requires missing plugins={missing_values}")
+            deps = set(plugin.requires) | (set(plugin.runs_after) & set(plugin_by_id))
+            sorter.add(plugin.id, *deps)
         for plugin in plugins:
             for before_name in plugin.runs_before:
-                if before_name in plugin_by_name:
-                    sorter.add(before_name, plugin.name)
-        order = [name for name in sorter.static_order() if name in plugin_by_name]
-        return [plugin_by_name[name] for name in order]
+                if before_name in plugin_by_id:
+                    sorter.add(before_name, plugin.id)
+        order = [plugin_id for plugin_id in sorter.static_order() if plugin_id in plugin_by_id]
+        return [plugin_by_id[plugin_id] for plugin_id in order]

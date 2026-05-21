@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from train_system.parallel import ParallelPlan
-from train_system.runtime import MeshConfig, RuntimeCore, RuntimePhase
+from train_system.runtime import MeshConfig, PluginId, RuntimeCore, RuntimePhase
 from train_system.runtime.plugin import RuntimePlugin
 
 
@@ -26,13 +26,15 @@ class LossModel(nn.Module):
 class RecordingPlugin(RuntimePlugin):
     def __init__(
         self,
-        name: str,
+        plugin_id: PluginId,
         event_log: list[str],
-        requires: set[str] | None = None,
-        runs_after: set[str] | None = None,
-        runs_before: set[str] | None = None,
+        name: str | None = None,
+        requires: set[PluginId] | None = None,
+        runs_after: set[PluginId] | None = None,
+        runs_before: set[PluginId] | None = None,
     ) -> None:
         super().__init__(
+            id=plugin_id,
             name=name,
             requires=requires or set(),
             runs_after=runs_after or set(),
@@ -51,9 +53,9 @@ class RecordingPlugin(RuntimePlugin):
 def test_plugin_ordering() -> None:
     events: list[str] = []
     plugins = [
-        RecordingPlugin("profiler", events, runs_after={"missing_optional", "tp"}),
-        RecordingPlugin("tp", events),
-        RecordingPlugin("checkpoint", events, runs_before={"profiler"}),
+        RecordingPlugin(PluginId.PROFILER, events, name="custom_profiler", runs_after={PluginId.CP, PluginId.TP}),
+        RecordingPlugin(PluginId.TP, events, name="custom_tensor"),
+        RecordingPlugin(PluginId.CHECKPOINT, events, runs_before={PluginId.PROFILER}),
     ]
     core = RuntimeCore(
         mesh=MeshConfig(),
@@ -62,7 +64,8 @@ def test_plugin_ordering() -> None:
         plugins=plugins,
     )
 
-    assert [plugin.name for plugin in core.plugins] == ["tp", "checkpoint", "profiler"]
+    assert [plugin.id for plugin in core.plugins] == [PluginId.TP, PluginId.CHECKPOINT, PluginId.PROFILER]
+    assert [plugin.name for plugin in core.plugins] == ["custom_tensor", "checkpoint", "custom_profiler"]
 
 
 def test_missing_required_plugin_fails() -> None:
@@ -71,7 +74,7 @@ def test_missing_required_plugin_fails() -> None:
             mesh=MeshConfig(),
             plan=ParallelPlan(),
             model=LossModel(),
-            plugins=[RecordingPlugin("sp", [], requires={"tp"})],
+            plugins=[RecordingPlugin(PluginId.SP, [], requires={PluginId.TP})],
         )
     except ValueError as exc:
         assert "requires missing plugins=['tp']" in str(exc)
@@ -88,7 +91,7 @@ def test_train_step_phases_and_state_registry() -> None:
         plan=ParallelPlan(),
         model=model,
         optimizer=optimizer,
-        plugins=[RecordingPlugin("recorder", events)],
+        plugins=[RecordingPlugin(PluginId.PROFILER, events, name="recorder")],
     )
     core.setup()
     loss = core.run_train_step(torch.ones(2, 4))
