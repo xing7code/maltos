@@ -87,7 +87,7 @@ class RuntimeCore:
         self.state.loss.backward()
         self._run_phase(RuntimePhase.POST_BACKWARD)
         self._run_phase(RuntimePhase.PRE_STEP)
-        if self.optimizer is not None:
+        if self.optimizer is not None and not self._plugin_owns_optimizer():
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
         self._run_phase(RuntimePhase.POST_STEP)
@@ -101,6 +101,9 @@ class RuntimeCore:
     def _run_phase(self, phase: RuntimePhase) -> None:
         for plugin in self.plugins:
             plugin.on_phase(phase)
+
+    def _plugin_owns_optimizer(self) -> bool:
+        return any(plugin.owns_optimizer for plugin in self.plugins)
 
     def _validate_mesh_and_plan(self) -> None:
         if self.plan.zero_stage > 0 and self.mesh.dp <= 1:

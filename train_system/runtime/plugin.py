@@ -61,6 +61,7 @@ class RuntimePlugin:
     requires: set[PluginId] = field(default_factory=set)
     runs_after: set[PluginId] = field(default_factory=set)
     runs_before: set[PluginId] = field(default_factory=set)
+    owns_optimizer: bool = False
     runtime: "RuntimeCore | None" = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
