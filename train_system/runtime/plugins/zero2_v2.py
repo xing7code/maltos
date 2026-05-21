@@ -63,6 +63,7 @@ class Zero2PluginV2(RuntimePlugin):
         self.data_buffer: torch.Tensor | None = None
         self.grad_buffer: torch.Tensor | None = None
         self.buckets: list[_Bucket] = []
+        self.active_grad_handle: dist.Work | _AllReduceShardWork | None = None
         self.optimizer: torch.optim.Optimizer | None = None
 
     def transform_model(self, model: nn.Module) -> nn.Module:
@@ -140,20 +141,17 @@ class Zero2PluginV2(RuntimePlugin):
         return buckets
 
     def _add_param_hooks(self) -> None:
-        prev_bucket: _Bucket | None = None
         for bucket in self.buckets:
             for param in bucket.params:
-                param.register_hook(self._make_attach_hook(bucket, prev_bucket))
+                param.register_hook(self._make_attach_hook(bucket))
                 param.register_post_accumulate_grad_hook(self._make_grad_sync_hook(bucket))
-            prev_bucket = bucket
 
-    def _make_attach_hook(self, bucket: _Bucket, prev_bucket: _Bucket | None):
+    def _make_attach_hook(self, bucket: _Bucket):
         def hook(grad: torch.Tensor) -> torch.Tensor:
             if not bucket.attached:
-                if prev_bucket is not None:
-                    if prev_bucket.handle is None:
-                        raise RuntimeError("previous ZeRO2 bucket has no grad sync handle")
-                    prev_bucket.handle.wait()
+                if self.active_grad_handle is not None:
+                    self.active_grad_handle.wait()
+                    self.active_grad_handle = None
                 self._attach_bucket_grad_buffer(bucket)
                 bucket.attached = True
             return grad
@@ -175,6 +173,7 @@ class Zero2PluginV2(RuntimePlugin):
                 if bucket.local_param.grad is None:
                     bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
                 bucket.handle = self._reduce_scatter_avg(bucket)
+                self.active_grad_handle = bucket.handle
 
         return hook
 
@@ -224,10 +223,18 @@ class Zero2PluginV2(RuntimePlugin):
             return
         last_bucket = self.buckets[-1]
         if last_bucket.handle is None:
-            raise RuntimeError("last ZeRO2 bucket handle is None after backward")
+            if self.active_grad_handle is None:
+                raise RuntimeError("no ZeRO2 bucket handle was launched after backward")
+            self.active_grad_handle.wait()
+            self.active_grad_handle = None
+            return
         last_bucket.handle.wait()
+        if self.active_grad_handle is not None and self.active_grad_handle is not last_bucket.handle:
+            self.active_grad_handle.wait()
+        self.active_grad_handle = None
 
     def _reset_buckets(self) -> None:
+        self.active_grad_handle = None
         for bucket in self.buckets:
             bucket.pending = len(bucket.params)
             bucket.handle = None
