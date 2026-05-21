@@ -1,41 +1,40 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 
-from train_system.runtime.plugin import BaseParallelPlugin
+from train_system.runtime.core import RuntimePhase
+from train_system.runtime.mesh import MeshAxis
+from train_system.runtime.plugin import PluginId, RuntimePlugin
 
 
-class NaiveDdpPlugin(BaseParallelPlugin):
+class DataParallelPlugin(RuntimePlugin):
+    """RuntimeCore data parallel gradient synchronization."""
 
-    def __init__(self, ddp_group: dist.ProcessGroup):
-        self.ddp_group = ddp_group
-        self.world_size = dist.get_world_size(self.ddp_group)
-        self.rank = dist.get_rank(self.ddp_group)
+    def __init__(self, async_op: bool = False) -> None:
+        name = "data_parallel_async" if async_op else "data_parallel"
+        super().__init__(id=PluginId.DP, name=name)
+        self.async_op = async_op
 
-    def after_backward(self, model: nn.Module):
-        for k, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            assert p.grad is not None, f"param {k} has requires_grad=True but grad is None"
-            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=self.ddp_group)
-
-
-class NaiveAsyncDdpPlugin(BaseParallelPlugin):
-
-    def __init__(self, ddp_group: dist.ProcessGroup):
-        self.ddp_group = ddp_group
-        self.world_size = dist.get_world_size(self.ddp_group)
-        self.rank = dist.get_rank(self.ddp_group)
-
-    def after_backward(self, model: nn.Module):
+    def on_phase(self, phase: RuntimePhase) -> None:
+        if phase != RuntimePhase.POST_BACKWARD:
+            return
+        assert self.runtime is not None
+        dp_group = self.runtime.get_group(MeshAxis.DP)
+        if dp_group is None:
+            return
         handles = []
-        for k, p in model.named_parameters():
-            if not p.requires_grad:
+        for name, param in self.runtime.model.named_parameters():
+            if not param.requires_grad:
                 continue
-            assert p.grad is not None, f"param {k} has requires_grad=True but grad is None"
-            handles.append(dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=self.ddp_group, async_op=True))
+            if param.grad is None:
+                raise RuntimeError(f"param={name} requires grad but has no gradient")
+            handle = dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=dp_group, async_op=self.async_op)
+            if self.async_op:
+                handles.append(handle)
         for handle in handles:
             handle.wait()
 
@@ -50,76 +49,82 @@ class _Bucket:
     pending: int = 0
     handle: dist.Work | None = None
 
-    def add_param(self, p):
-        self.params.append(p)
-        self.total_bytes += p.numel() * p.element_size()
+    def add_param(self, param: nn.Parameter) -> None:
+        self.params.append(param)
+        self.total_bytes += param.numel() * param.element_size()
 
-    def finalize(self):
-        total_numel = sum(p.numel() for p in self.params)
+    def finalize(self) -> None:
+        total_numel = sum(param.numel() for param in self.params)
         dtype, device = self.params[0].dtype, self.params[0].device
         self.flat_buffer = torch.zeros(total_numel, dtype=dtype, device=device)
         offset = 0
-        for p in self.params:
-            p_view = self.flat_buffer[offset : offset+p.numel()].view_as(p)
-            self.param_views.append(p_view)
-            offset += p.numel()
+        for param in self.params:
+            view = self.flat_buffer[offset : offset + param.numel()].view_as(param)
+            self.param_views.append(view)
+            offset += param.numel()
         self.reset()
 
-    def reset(self):
+    def reset(self) -> None:
+        assert self.flat_buffer is not None
         self.pending = len(self.params)
         self.handle = None
-        # This is needed every round of backward, incase zero_grad called to set p.grad to None.
         self.flat_buffer.zero_()
-        for p, view in zip(self.params, self.param_views):
-            p.grad = view
-
-    def _sync_grad(self):
-        self.handle = dist.all_reduce(self.flat_buffer, op=dist.ReduceOp.AVG, group=self.group, async_op=True)
+        for param, view in zip(self.params, self.param_views):
+            param.grad = view
 
     def make_hook(self):
-        def hook(p):
+        def hook(param):
             self.pending -= 1
-            if self.pending==0:
-                self._sync_grad()
+            if self.pending == 0:
+                assert self.flat_buffer is not None
+                self.handle = dist.all_reduce(
+                    self.flat_buffer,
+                    op=dist.ReduceOp.AVG,
+                    group=self.group,
+                    async_op=True,
+                )
+
         return hook
-    
 
-class DdpWithBucketPlugin(BaseParallelPlugin):
 
-    def __init__(self, ddp_group: dist.ProcessGroup, bucket_mb_size: int):
-        self.ddp_group = ddp_group
-        self.world_size = dist.get_world_size(ddp_group)
-        self.rank = dist.get_rank(ddp_group)
+class BucketDataParallelPlugin(RuntimePlugin):
+    """Bucketized DDP that starts async grad sync during backward."""
+
+    def __init__(self, bucket_mb_size: int = 25) -> None:
+        super().__init__(id=PluginId.DP, name="bucket_data_parallel")
         self.bucket_byte_size = bucket_mb_size * 1024 * 1024
-        self.buckets = None
+        self.buckets: list[_Bucket] = []
 
-    def _build_buckets(self, model):
-        self.buckets = []
-
-        for p in reversed(list(model.parameters())):
-            if not p.requires_grad:
-                continue
-            if not self.buckets or self.buckets[-1].total_bytes >= self.bucket_byte_size:
-                if self.buckets:
-                    self.buckets[-1].finalize()
-                self.buckets.append(_Bucket(self.ddp_group))
-            self.buckets[-1].add_param(p)
-        self.buckets[-1].finalize()
-
-    def setup_model(self, model: nn.Module) -> nn.Module:
-        self._build_buckets(model)
-        for bkt in self.buckets:
-            for p in bkt.params:
-                p.register_post_accumulate_grad_hook(bkt.make_hook())
+    def transform_model(self, model: nn.Module) -> nn.Module:
+        assert self.runtime is not None
+        dp_group = self.runtime.get_group(MeshAxis.DP)
+        if dp_group is None:
+            return model
+        self._build_buckets(model, dp_group)
+        for bucket in self.buckets:
+            for param in bucket.params:
+                param.register_post_accumulate_grad_hook(bucket.make_hook())
         return model
 
-    def before_forward(self, model: nn.Module):
-        for bkt in self.buckets:
-            bkt.reset()
+    def on_phase(self, phase: RuntimePhase) -> None:
+        if phase == RuntimePhase.PRE_FORWARD:
+            for bucket in self.buckets:
+                bucket.reset()
+        elif phase == RuntimePhase.POST_BACKWARD:
+            for bucket in self.buckets:
+                if bucket.handle is None:
+                    raise RuntimeError(f"bucket with {len(bucket.params)} params was never synchronized")
+                bucket.handle.wait()
 
-    def after_backward(self, model: nn.Module):
-        for bkt in self.buckets:
-            assert bkt.handle is not None, f"bucket with {len(bkt.params)} params was never synced, likely some params have no grad"
-            bkt.handle.wait()
-
-    
+    def _build_buckets(self, model: nn.Module, dp_group: dist.ProcessGroup) -> None:
+        self.buckets = []
+        current_bucket: _Bucket | None = None
+        for param in reversed([p for p in model.parameters() if p.requires_grad]):
+            if current_bucket is None or current_bucket.total_bytes >= self.bucket_byte_size:
+                if current_bucket is not None:
+                    current_bucket.finalize()
+                current_bucket = _Bucket(dp_group)
+                self.buckets.append(current_bucket)
+            current_bucket.add_param(param)
+        if current_bucket is not None:
+            current_bucket.finalize()

@@ -1,47 +1,92 @@
-from absl import logging
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 
-from train_system.runtime.plugin import BaseParallelPlugin, ParallelizableModule
-from train_system.runtime.functional import all_gather
+from train_system.parallel.spec import OpShardRule
+from train_system.runtime.core import RuntimePhase
+from train_system.runtime.layers.functional import all_gather
+from train_system.runtime.mesh import MeshAxis
+from train_system.runtime.plugin import ParallelizableModule, PluginId, RuntimePlugin
 
 
-class SpPlugin(BaseParallelPlugin):
+class SequenceParallelPlugin(RuntimePlugin):
+    """Sequence parallel hooks for the RuntimeCore plugin path.
 
-    def __init__(self, sp_group: dist.ProcessGroup):
-        self.sp_group = sp_group
-        self.rank = dist.get_rank(sp_group)
-        self.world_size = dist.get_world_size(sp_group)
+    SP composes with TP in this minimal runtime: TP rewrites the transformer
+    linears first, then SP registers activation layout hooks around modules
+    annotated with ``shard_style="seq"``.
+    """
 
-    def _make_all_gather_hook(self, comm_dim):
+    def __init__(self) -> None:
+        super().__init__(
+            id=PluginId.SP,
+            name="sequence_parallel",
+            requires={PluginId.TP},
+            runs_after={PluginId.TP},
+        )
+
+    @property
+    def sp_group(self) -> dist.ProcessGroup:
+        assert self.runtime is not None
+        group = self.runtime.get_group(MeshAxis.TP)
+        if group is None:
+            raise ValueError("SequenceParallelPlugin requires a TP process group")
+        return group
+
+    @property
+    def rank(self) -> int:
+        return dist.get_rank(self.sp_group)
+
+    @property
+    def world_size(self) -> int:
+        return dist.get_world_size(self.sp_group)
+
+    def transform_model(self, model: nn.Module) -> nn.Module:
+        if not isinstance(model, ParallelizableModule):
+            return model
+
+        for rule in model.parallelize_spec().rules:
+            if rule.shard_style != "seq":
+                continue
+            module = model.get_submodule(rule.module_path)
+            self._register_sequence_hook(module, rule)
+        return model
+
+    def on_phase(self, phase: RuntimePhase) -> None:
+        if phase != RuntimePhase.TRANSFORM_MODEL:
+            return
+        assert self.runtime is not None
+        for _, handle in self.runtime.state_registry.items():
+            extra = dict(handle.runtime.extra or {})
+            extra["sequence_parallel"] = True
+            extra["sp_world_size"] = self.world_size
+            handle.runtime.extra = extra
+
+    def _register_sequence_hook(self, module: nn.Module, rule: OpShardRule) -> None:
+        if rule.pre_comm == "all_gather":
+            module.register_forward_pre_hook(self._make_all_gather_hook(rule.comm_dim))
+        elif rule.post_comm == "scatter":
+            module.register_forward_hook(self._make_scatter_hook(rule.comm_dim))
+        else:
+            raise NotImplementedError(
+                "SequenceParallelPlugin supports seq rules with "
+                f"pre_comm='all_gather' or post_comm='scatter', got "
+                f"pre_comm={rule.pre_comm!r}, post_comm={rule.post_comm!r}"
+            )
+
+    def _make_all_gather_hook(self, comm_dim: int):
         def hook(module, input):
-            input, *args = input
-            input = all_gather(input, self.sp_group, comm_dim)
-            return (input, *args)
+            x, *args = input
+            x = all_gather(x, self.sp_group, comm_dim)
+            return (x, *args)
+
         return hook
 
-    def _make_scatter_hook(self, comm_dim):
+    def _make_scatter_hook(self, comm_dim: int):
         def hook(module, input, output):
             per_rank_dim = output.size(comm_dim) // self.world_size
-            output = torch.narrow(output, dim=comm_dim, start=self.rank*per_rank_dim, length=per_rank_dim)
-            return output
+            return torch.narrow(output, dim=comm_dim, start=self.rank * per_rank_dim, length=per_rank_dim)
+
         return hook
-    
-    def setup_model(self, model: nn.Module) -> nn.Module:
-        if not isinstance(model, ParallelizableModule):
-            logging.warn(f"model {model._get_name()} did not impl parallelize_spec, ignoring SpPlugin!")
-            return model
-        spec = model.parallelize_spec()
-        for r in spec.rules:
-            if r.shard_style != "seq":
-                continue
-            mod = model.get_submodule(r.module_path)
-            if r.pre_comm == "all_gather":
-                mod.register_forward_pre_hook(self._make_all_gather_hook(r.comm_dim))
-            elif r.post_comm == "scatter":
-                mod.register_forward_hook(self._make_scatter_hook(r.comm_dim))
-            else:
-                print(f"Sp plugin only support shard_style=seq, pre_comm=all_gather or post_comm=scatter, skip pre_comm={r.pre_comm}")
-        return model

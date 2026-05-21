@@ -1,6 +1,6 @@
 """Equivalence test: full-batch TinyModel vs RuntimeCore ZeRO-3 v2.
 
-Each rank sees a different local batch. Zero3PluginV2 keeps wrapped module
+Each rank sees a different local batch. Zero3Plugin keeps wrapped module
 parameters sharded, materializes full params around forward/backward compute,
 reduce-scatters averaged gradients into local shards, and steps only shard
 parameters.
@@ -22,7 +22,7 @@ import torch.multiprocessing as mp
 from train_system.examples import TinyModel
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshConfig, RuntimeCore
-from train_system.runtime.plugins.zero3_v2 import Zero3PluginV2
+from train_system.runtime.plugins.zero3 import Zero3Plugin
 
 
 _ATOL = 1e-6
@@ -84,7 +84,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_loss = baseline_model(full_batch)
     baseline_loss.backward()
 
-    zero3 = Zero3PluginV2(enable_prefetch=not args.disable_prefetch, optimizer_cls=torch.optim.SGD, lr=_LR)
+    zero3 = Zero3Plugin(enable_prefetch=not args.disable_prefetch, optimizer_cls=torch.optim.SGD, lr=_LR)
     core = RuntimeCore(
         mesh=MeshConfig(dp=args.world_size, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=3),

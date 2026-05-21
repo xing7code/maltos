@@ -1,6 +1,6 @@
 """Equivalence test: full-batch TinyModel vs RuntimeCore ZeRO-1 v2.
 
-Each rank sees a different local batch. Zero1PluginV2 reduce-scatters averaged
+Each rank sees a different local batch. Zero1Plugin reduce-scatters averaged
 gradients into optimizer-owned parameter shards, steps those shards, then
 all-gathers updated parameters back into the replicated model buffer.
 
@@ -21,7 +21,7 @@ import torch.multiprocessing as mp
 from train_system.examples import TinyModel
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshConfig, RuntimeCore
-from train_system.runtime.plugins.zero1_v2 import Zero1PluginV2
+from train_system.runtime.plugins.zero1 import Zero1Plugin
 
 
 _ATOL = 1e-6
@@ -89,7 +89,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         model=zero_model,
         optimizer=None,
         plugins=[
-            Zero1PluginV2(
+            Zero1Plugin(
                 bucket_mb_size=args.bucket_mb_size,
                 optimizer_cls=torch.optim.SGD,
                 lr=_LR,

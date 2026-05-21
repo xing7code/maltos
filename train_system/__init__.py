@@ -2,7 +2,6 @@
 
 from .parallel.plan import ParallelPlan
 from .runtime.mesh import MeshAxis, MeshConfig
-from .runtime.context import RuntimeContext
-from .engine.trainer import Trainer
+from .runtime.core import RuntimeCore
 
-__all__ = ["ParallelPlan", "MeshConfig", "MeshAxis", "RuntimeContext", "Trainer"]
+__all__ = ["ParallelPlan", "MeshConfig", "MeshAxis", "RuntimeCore"]

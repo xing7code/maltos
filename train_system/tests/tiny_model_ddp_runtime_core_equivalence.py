@@ -1,6 +1,6 @@
 """Equivalence test: full-batch TinyModel vs RuntimeCore DDP v2.
 
-Each rank sees a different local batch. DataParallelPluginV2 averages gradients
+Each rank sees a different local batch. DataParallelPlugin averages gradients
 across the DP group, which should match a single-process full-batch baseline.
 
 Usage:
@@ -21,7 +21,7 @@ import torch.multiprocessing as mp
 from train_system.examples import TinyModel
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshConfig, RuntimeCore
-from train_system.runtime.plugins.ddp_v2 import BucketDataParallelPluginV2, DataParallelPluginV2
+from train_system.runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 
 
 _ATOL = 1e-6
@@ -102,11 +102,11 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_loss.backward()
 
     if args.ddp_mode == "naive":
-        plugins = [DataParallelPluginV2(async_op=False)]
+        plugins = [DataParallelPlugin(async_op=False)]
     elif args.ddp_mode == "async":
-        plugins = [DataParallelPluginV2(async_op=True)]
+        plugins = [DataParallelPlugin(async_op=True)]
     elif args.ddp_mode == "bucket":
-        plugins = [BucketDataParallelPluginV2(bucket_mb_size=args.bucket_mb_size)]
+        plugins = [BucketDataParallelPlugin(bucket_mb_size=args.bucket_mb_size)]
     else:
         raise ValueError(f"unknown ddp_mode={args.ddp_mode}")
 

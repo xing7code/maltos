@@ -25,13 +25,13 @@ import torch.multiprocessing as mp
 from train_system.examples import TinyTransformer, TinyTransformerTpSp
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshAxis, MeshConfig, RuntimeCore
-from train_system.runtime.plugins.ddp_v2 import BucketDataParallelPluginV2, DataParallelPluginV2
-from train_system.runtime.plugins.sp_v2 import SequenceParallelPluginV2
-from train_system.runtime.plugins.tp import ColumnParallelLinear, RowParallelLinear
-from train_system.runtime.plugins.tp_v2 import TensorParallelPluginV2
-from train_system.runtime.plugins.zero1_v2 import Zero1PluginV2
-from train_system.runtime.plugins.zero2_v2 import Zero2PluginV2
-from train_system.runtime.plugins.zero3_v2 import Zero3PluginV2
+from train_system.runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
+from train_system.runtime.plugins.sp import SequenceParallelPlugin
+from train_system.runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
+from train_system.runtime.plugins.tp import TensorParallelPlugin
+from train_system.runtime.plugins.zero1 import Zero1Plugin
+from train_system.runtime.plugins.zero2 import Zero2Plugin
+from train_system.runtime.plugins.zero3 import Zero3Plugin
 
 
 _MODEL_KWARGS = dict(
@@ -142,22 +142,22 @@ def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tup
 
 
 def _make_plugins(case: str):
-    plugins = [TensorParallelPluginV2(), SequenceParallelPluginV2()]
+    plugins = [TensorParallelPlugin(), SequenceParallelPlugin()]
     if case == "tp_sp":
         return plugins, 0
     if case == "tp_sp_ddp_sync":
-        return plugins + [DataParallelPluginV2(async_op=False)], 0
+        return plugins + [DataParallelPlugin(async_op=False)], 0
     if case == "tp_sp_ddp_async":
-        return plugins + [DataParallelPluginV2(async_op=True)], 0
+        return plugins + [DataParallelPlugin(async_op=True)], 0
     if case == "tp_sp_ddp_bucket":
-        return plugins + [BucketDataParallelPluginV2(bucket_mb_size=0)], 0
+        return plugins + [BucketDataParallelPlugin(bucket_mb_size=0)], 0
     if case == "tp_sp_zero1":
-        return plugins + [Zero1PluginV2(bucket_mb_size=0, optimizer_cls=torch.optim.SGD, lr=_LR)], 1
+        return plugins + [Zero1Plugin(bucket_mb_size=0, optimizer_cls=torch.optim.SGD, lr=_LR)], 1
     if case == "tp_sp_zero2":
-        return plugins + [Zero2PluginV2(bucket_mb_size=0, optimizer_cls=torch.optim.SGD, lr=_LR)], 2
+        return plugins + [Zero2Plugin(bucket_mb_size=0, optimizer_cls=torch.optim.SGD, lr=_LR)], 2
     if case == "tp_sp_zero3":
         return plugins + [
-            Zero3PluginV2(
+            Zero3Plugin(
                 wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
                 optimizer_cls=torch.optim.SGD,
                 lr=_LR,
@@ -212,7 +212,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if dp_group is not None:
         dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG, group=dp_group)
 
-    zero3_plugin = next((plugin for plugin in core.plugins if isinstance(plugin, Zero3PluginV2)), None)
+    zero3_plugin = next((plugin for plugin in core.plugins if isinstance(plugin, Zero3Plugin)), None)
     if zero3_plugin is not None:
         zero3_plugin.materialize_model()
 

@@ -1,18 +1,34 @@
-# Note: zero2 and zero1 there are no big difference per impl.
-# Even zero2 shard all params grad, we still need a buffer to save full grad before sharding.
-# The only difference is lifetime of this buffer, zero1 need full lifetime, while zero2 only need it until current bucket.
-#
-# Though, we implement here as another strategy for both zero1 and zero2:
-#     Instead of maintaining global buffer like Zero1Plugin, we move the buffer to per bucket.
-#     And this buffer can be reused among different bucket.
-#     (There's downside of doing this, is each bucket has to wait for previous bucket reduce_scatter finish.) 
+from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
 import torch
-import torch.nn as nn
 import torch.distributed as dist
+import torch.nn as nn
 
-from train_system.runtime.plugin import BaseParallelPlugin
+from train_system.runtime.core import RuntimePhase
+from train_system.runtime.mesh import MeshAxis
+from train_system.runtime.plugin import PluginId, RuntimePlugin
+
+
+class _AllReduceShardWork:
+    def __init__(
+        self,
+        work: dist.Work,
+        grad_buffer: torch.Tensor,
+        local_grad: torch.Tensor,
+        shard_start: int,
+        shard_end: int,
+    ):
+        self.work = work
+        self.grad_buffer = grad_buffer
+        self.local_grad = local_grad
+        self.shard_start = shard_start
+        self.shard_end = shard_end
+
+    def wait(self) -> None:
+        self.work.wait()
+        self.local_grad.copy_(self.grad_buffer[self.shard_start : self.shard_end])
 
 
 @dataclass
@@ -22,133 +38,207 @@ class _Bucket:
     end: int
     shard_start: int
     shard_end: int
-    local_params: nn.Parameter
+    local_param: nn.Parameter
     pending: int
-    handle: dist.Work | None = None
-    # status if params attach grad to the global buffer.
+    handle: dist.Work | _AllReduceShardWork | None = None
     attached: bool = False
 
 
-class Zero2Plugin(BaseParallelPlugin):
+class Zero2Plugin(RuntimePlugin):
+    """ZeRO-2 style optimizer and gradient sharding over the DP axis."""
 
-    owns_optimizer = True
-
-    def __init__(self, dp_group: dist.ProcessGroup, bucket_mb_size: int, optimizer_cls=torch.optim.AdamW, **optimizer_kwargs):
-        self.dp_group = dp_group
-        self.world_size = dist.get_world_size(dp_group)
-        self.rank = dist.get_rank(dp_group)
+    def __init__(
+        self,
+        bucket_mb_size: int = 25,
+        optimizer_cls: type[torch.optim.Optimizer] = torch.optim.AdamW,
+        **optimizer_kwargs,
+    ):
+        super().__init__(id=PluginId.ZERO2, name="zero2", owns_optimizer=True)
         self.bucket_byte_size = bucket_mb_size * 1024 * 1024
         self.optimizer_cls = optimizer_cls
         self.optimizer_kwargs = optimizer_kwargs
-        self._data_buffer = None
-        self._grad_buffer = None
-        self.buckets = []
+        self.dp_group: dist.ProcessGroup | None = None
+        self.world_size = 1
+        self.rank = 0
+        self.data_buffer: torch.Tensor | None = None
+        self.grad_buffer: torch.Tensor | None = None
+        self.buckets: list[_Bucket] = []
+        self.active_grad_handle: dist.Work | _AllReduceShardWork | None = None
+        self.optimizer: torch.optim.Optimizer | None = None
 
-    def _reset_buckets(self):
-        for bkt in self.buckets:
-            bkt.pending = len(bkt.params)
-            bkt.handle = None
-            bkt.attached = False
+    def transform_model(self, model: nn.Module) -> nn.Module:
+        assert self.runtime is not None
+        self.dp_group = self.runtime.get_group(MeshAxis.DP)
+        if self.dp_group is None:
+            raise ValueError("Zero2Plugin requires mesh.dp > 1")
+        self.world_size = dist.get_world_size(self.dp_group)
+        self.rank = dist.get_rank(self.dp_group)
+        self._prepare_buffers_and_buckets(model)
+        self.optimizer = self.optimizer_cls([bucket.local_param for bucket in self.buckets], **self.optimizer_kwargs)
+        return model
 
-    def _add_param_hooks(self):
-        def make_hook(bkt_inst):
-            def hook(p):
-                bkt_inst.pending -= 1
-                if bkt_inst.pending == 0:
-                    if bkt_inst.local_params.grad is None:
-                        bkt_inst.local_params.grad = torch.empty_like(bkt_inst.local_params.data)
-                    bkt_inst.handle = dist.reduce_scatter_tensor(bkt_inst.local_params.grad, self._grad_buffer[:bkt_inst.end-bkt_inst.start], op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
-            return hook
-        for bkt in self.buckets:
-            for p in bkt.params:
-                p.register_post_accumulate_grad_hook(make_hook(bkt))
-        def make_pre_hook(bkt_inst, prev_bkt):
-            def hook(grad):
-                if not bkt_inst.attached:
-                    if prev_bkt is not None:
-                        prev_bkt.handle.wait()
-                    self._grad_buffer.zero_()
-                    offset = 0
-                    for p in bkt_inst.params:
-                        p.grad = self._grad_buffer[offset:offset+p.numel()].view_as(p)
-                        offset += p.numel()
-                    bkt_inst.attached = True
-                return grad
-            return hook
-        prev_bkt = None
-        for bkt in self.buckets:
-            for p in bkt.params:
-                p.register_hook(make_pre_hook(bkt, prev_bkt))
-            prev_bkt = bkt
+    def on_phase(self, phase: RuntimePhase) -> None:
+        if phase == RuntimePhase.PRE_FORWARD:
+            self._reset_buckets()
+        elif phase == RuntimePhase.POST_BACKWARD:
+            self._wait_last_grad_sync()
+        elif phase == RuntimePhase.PRE_STEP:
+            self._step_and_gather()
 
-    def _prepare_buffer_and_buckets(self, model):
-        all_params = [p for p in model.parameters() if p.requires_grad][::-1]
-        dtype, device = all_params[0].dtype, all_params[0].device
-        param_buckets = []
-        curr_bytes = 0
-        curr_bucket = []
-        # TODO: consider multiply for hardware alignment
-        pad_to_size = self.world_size
-        def padded_len(l):
-            return (l+(pad_to_size-1))//pad_to_size*pad_to_size
-        for p in all_params:
-            if curr_bytes + p.numel() * p.element_size() > self.bucket_byte_size:
-                param_buckets.append(curr_bucket[:])
-                curr_bytes = 0
-                curr_bucket = []
-            curr_bytes += p.numel() * p.element_size()
-            curr_bucket.append(p)
-        if curr_bytes > 0:
-            param_buckets.append(curr_bucket[:])
-        param_padded_size = [padded_len(sum(p.numel() for p in bkt)) for bkt in param_buckets]
-        self._data_buffer = torch.zeros(sum(param_padded_size), dtype=dtype, device=device)
-        # Different from Zero1Plugin, we set grad_buffer to the biggest bucket, and reuse for all.
-        self._grad_buffer = torch.zeros(max(param_padded_size), dtype=dtype, device=device)
+    def _prepare_buffers_and_buckets(self, model: nn.Module) -> None:
+        params = [param for param in model.parameters() if param.requires_grad][::-1]
+        if not params:
+            return
+
+        dtype, device = params[0].dtype, params[0].device
+        param_buckets = self._build_param_buckets(params)
+        padded_sizes = [self._padded_len(sum(param.numel() for param in bucket)) for bucket in param_buckets]
+        self.data_buffer = torch.zeros(sum(padded_sizes), dtype=dtype, device=device)
+        self.grad_buffer = torch.zeros(max(padded_sizes), dtype=dtype, device=device)
+
         offset = 0
-        for params, padded_size in zip(param_buckets, param_padded_size):
-            assert padded_size % self.world_size == 0, f"Bucket padded numel({padded_size}) should be divisible by world_size({self.world_size})!"
+        for bucket_params, padded_size in zip(param_buckets, padded_sizes):
             param_offset = offset
-            for p in params:
+            for param in bucket_params:
                 with torch.no_grad():
-                    self._data_buffer[param_offset:param_offset+p.numel()].copy_(p.view(-1))
-                    p.data = self._data_buffer[param_offset:param_offset+p.numel()].view_as(p)
-                param_offset+=p.numel()
+                    self.data_buffer[param_offset : param_offset + param.numel()].copy_(param.detach().view(-1))
+                    param.data = self.data_buffer[param_offset : param_offset + param.numel()].view_as(param)
+                param_offset += param.numel()
+
             per_rank_size = padded_size // self.world_size
-            shard_start = offset+self.rank*per_rank_size
-            shard_end = offset+(self.rank+1)*per_rank_size
+            shard_start = offset + self.rank * per_rank_size
+            shard_end = offset + (self.rank + 1) * per_rank_size
             self.buckets.append(
                 _Bucket(
-                    params=params,
+                    params=bucket_params,
                     start=offset,
-                    end=offset+padded_size,
+                    end=offset + padded_size,
                     shard_start=shard_start,
                     shard_end=shard_end,
-                    local_params=nn.Parameter(self._data_buffer[shard_start:shard_end].clone()),
-                    pending=len(params)
+                    local_param=nn.Parameter(self.data_buffer[shard_start:shard_end].clone()),
+                    pending=len(bucket_params),
                 )
             )
             offset += padded_size
+
         self._reset_buckets()
         self._add_param_hooks()
 
-    def setup_model(self, model: nn.Module) -> nn.Module:
-        self._prepare_buffer_and_buckets(model)
-        self.optimizer = self.optimizer_cls([bkt.local_params for bkt in self.buckets], **self.optimizer_kwargs)
-        return model
+    def _build_param_buckets(self, params: list[nn.Parameter]) -> list[list[nn.Parameter]]:
+        buckets: list[list[nn.Parameter]] = []
+        curr_bucket: list[nn.Parameter] = []
+        curr_bytes = 0
+        for param in params:
+            param_bytes = param.numel() * param.element_size()
+            if curr_bucket and curr_bytes + param_bytes > self.bucket_byte_size:
+                buckets.append(curr_bucket)
+                curr_bucket = []
+                curr_bytes = 0
+            curr_bucket.append(param)
+            curr_bytes += param_bytes
+        if curr_bucket:
+            buckets.append(curr_bucket)
+        return buckets
 
-    def before_forward(self, model: nn.Module) -> None:
-        self._reset_buckets()
+    def _add_param_hooks(self) -> None:
+        for bucket in self.buckets:
+            for param in bucket.params:
+                param.register_hook(self._make_attach_hook(bucket))
+                param.register_post_accumulate_grad_hook(self._make_grad_sync_hook(bucket))
 
-    def after_backward(self, model: nn.Module) -> None:
-        # previous handles already wait in hooks, only need wait for the last one.
-        self.buckets[-1].handle.wait()
+    def _make_attach_hook(self, bucket: _Bucket):
+        def hook(grad: torch.Tensor) -> torch.Tensor:
+            if not bucket.attached:
+                if self.active_grad_handle is not None:
+                    self.active_grad_handle.wait()
+                    self.active_grad_handle = None
+                self._attach_bucket_grad_buffer(bucket)
+                bucket.attached = True
+            return grad
 
-    def step(self, model: nn.Module):
+        return hook
+
+    def _attach_bucket_grad_buffer(self, bucket: _Bucket) -> None:
+        assert self.grad_buffer is not None
+        self.grad_buffer.zero_()
+        offset = 0
+        for param in bucket.params:
+            param.grad = self.grad_buffer[offset : offset + param.numel()].view_as(param)
+            offset += param.numel()
+
+    def _make_grad_sync_hook(self, bucket: _Bucket):
+        def hook(_param: nn.Parameter) -> None:
+            bucket.pending -= 1
+            if bucket.pending == 0:
+                if bucket.local_param.grad is None:
+                    bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
+                bucket.handle = self._reduce_scatter_avg(bucket)
+                self.active_grad_handle = bucket.handle
+
+        return hook
+
+    def _reduce_scatter_avg(self, bucket: _Bucket) -> dist.Work | _AllReduceShardWork:
+        assert self.dp_group is not None
+        assert self.grad_buffer is not None
+        assert bucket.local_param.grad is not None
+        bucket_numel = bucket.end - bucket.start
+        full_grad = self.grad_buffer[:bucket_numel]
+        if dist.get_backend(self.dp_group) == "gloo":
+            work = dist.all_reduce(full_grad, op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
+            shard_len = bucket.local_param.numel()
+            shard_start = self.rank * shard_len
+            shard_end = (self.rank + 1) * shard_len
+            return _AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end)
+        return dist.reduce_scatter_tensor(
+            bucket.local_param.grad,
+            full_grad,
+            op=dist.ReduceOp.AVG,
+            group=self.dp_group,
+            async_op=True,
+        )
+
+    def _step_and_gather(self) -> None:
+        if self.optimizer is None:
+            return
+        assert self.dp_group is not None
+        assert self.data_buffer is not None
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
+        handles = []
         with torch.no_grad():
-            for bkt in self.buckets:
-                bkt.handle = dist.all_gather_into_tensor(self._data_buffer[bkt.start:bkt.end], bkt.local_params.data.contiguous(), group=self.dp_group, async_op=True)
-            for bkt in self.buckets:
-                bkt.handle.wait()
+            for bucket in self.buckets:
+                handles.append(
+                    dist.all_gather_into_tensor(
+                        self.data_buffer[bucket.start : bucket.end],
+                        bucket.local_param.detach().contiguous(),
+                        group=self.dp_group,
+                        async_op=True,
+                    )
+                )
+            for handle in handles:
+                handle.wait()
 
+    def _wait_last_grad_sync(self) -> None:
+        if not self.buckets:
+            return
+        last_bucket = self.buckets[-1]
+        if last_bucket.handle is None:
+            if self.active_grad_handle is None:
+                raise RuntimeError("no ZeRO2 bucket handle was launched after backward")
+            self.active_grad_handle.wait()
+            self.active_grad_handle = None
+            return
+        last_bucket.handle.wait()
+        if self.active_grad_handle is not None and self.active_grad_handle is not last_bucket.handle:
+            self.active_grad_handle.wait()
+        self.active_grad_handle = None
+
+    def _reset_buckets(self) -> None:
+        self.active_grad_handle = None
+        for bucket in self.buckets:
+            bucket.pending = len(bucket.params)
+            bucket.handle = None
+            bucket.attached = False
+
+    def _padded_len(self, numel: int) -> int:
+        return (numel + self.world_size - 1) // self.world_size * self.world_size

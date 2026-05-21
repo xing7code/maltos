@@ -1,7 +1,6 @@
 """Equivalence test: baseline TinyTransformer vs RuntimeCore TP/SP v2.
 
-This is the migration gate for moving TP and SP from the legacy
-Trainer/BasePlugin path to RuntimeCore/RuntimePlugin.
+This is the migration gate for TP and SP on the RuntimeCore/RuntimePlugin path.
 
 Usage:
   PYTHONPATH=. .venv/bin/python train_system/tests/tiny_transformer_tp_runtime_core_equivalence.py \
@@ -26,8 +25,8 @@ import torch.multiprocessing as mp
 from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshConfig, RuntimeCore
-from train_system.runtime.plugins.sp_v2 import SequenceParallelPluginV2
-from train_system.runtime.plugins.tp_v2 import TensorParallelPluginV2
+from train_system.runtime.plugins.sp import SequenceParallelPlugin
+from train_system.runtime.plugins.tp import TensorParallelPlugin
 
 
 _MODEL_KWARGS = dict(
@@ -153,9 +152,9 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     sharded_model = sharded_cls(**_MODEL_KWARGS)
     sharded_model.load_state_dict(baseline_model.state_dict())
 
-    plugins = [TensorParallelPluginV2()]
+    plugins = [TensorParallelPlugin()]
     if args.use_sp:
-        plugins.append(SequenceParallelPluginV2())
+        plugins.append(SequenceParallelPlugin())
 
     core = RuntimeCore(
         mesh=MeshConfig(dp=1, tp=args.tp_size, pp=1, cp=1, ep=1),

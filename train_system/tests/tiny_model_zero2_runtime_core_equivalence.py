@@ -1,6 +1,6 @@
 """Equivalence test: full-batch TinyModel vs RuntimeCore ZeRO-2 v2.
 
-Each rank sees a different local batch. Zero2PluginV2 reuses a bucket-local grad
+Each rank sees a different local batch. Zero2Plugin reuses a bucket-local grad
 buffer, reduce-scatters averaged gradients into optimizer-owned parameter
 shards, steps those shards, then all-gathers updated parameters.
 
@@ -21,7 +21,7 @@ import torch.multiprocessing as mp
 from train_system.examples import TinyModel
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshConfig, RuntimeCore
-from train_system.runtime.plugins.zero2_v2 import Zero2PluginV2
+from train_system.runtime.plugins.zero2 import Zero2Plugin
 
 
 _ATOL = 1e-6
@@ -89,7 +89,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         model=zero_model,
         optimizer=None,
         plugins=[
-            Zero2PluginV2(
+            Zero2Plugin(
                 bucket_mb_size=args.bucket_mb_size,
                 optimizer_cls=torch.optim.SGD,
                 lr=_LR,
