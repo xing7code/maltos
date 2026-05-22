@@ -20,6 +20,8 @@ class ParallelizableModule(Protocol):
 
 
 class PluginId(str, Enum):
+    PRECISION = "precision"
+    GRAD_CLIP = "grad_clip"
     TP = "tp"
     SP = "sp"
     TP_SP = "tp_sp"
@@ -76,4 +78,10 @@ class RuntimePlugin:
         return False
 
     def annotate_checkpoint_state(self, entry: ParamState) -> None:
+        pass
+
+    def export_plugin_state(self) -> dict[str, object]:
+        return {}
+
+    def import_plugin_state(self, state: dict[str, object]) -> None:
         pass

@@ -12,6 +12,8 @@ import torch.nn as nn
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshConfig, PluginId, RuntimeCore, RuntimePhase
 from train_system.runtime.plugins.ddp import DataParallelPlugin
+from train_system.runtime.plugins.grad_clip import GradClipPlugin
+from train_system.runtime.plugins.precision import PrecisionPlugin
 from train_system.runtime.plugins.tp import TensorParallelPlugin
 from train_system.runtime.plugin import RuntimePlugin
 from train_system.runtime.plugins.zero1 import Zero1Plugin
@@ -52,6 +54,20 @@ class RecordingPlugin(RuntimePlugin):
 
     def on_phase(self, phase: RuntimePhase) -> None:
         self.event_log.append(f"{self.name}:{phase.value}")
+
+
+class PluginStateEcho(RuntimePlugin):
+    def __init__(self) -> None:
+        super().__init__(id=PluginId.PROFILER, name="plugin_state_echo")
+        self.value = 0
+
+    def export_plugin_state(self) -> dict[str, object]:
+        return {"value": self.value}
+
+    def import_plugin_state(self, state: dict[str, object]) -> None:
+        value = state.get("value")
+        if isinstance(value, int):
+            self.value = value
 
 
 def test_plugin_ordering() -> None:
@@ -214,6 +230,60 @@ def test_runtime_optimizer_checkpoint_policy() -> None:
     assert tp_dp_core.optimizer_state_source_rank(3) == 1
 
 
+def test_precision_plugin_metrics_and_clip() -> None:
+    model = LossModel()
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        plugins=[PrecisionPlugin(compute_dtype=None), GradClipPlugin(max_norm=1.0)],
+    )
+    core.setup()
+    _ = core.run_train_step(torch.ones(2, 4))
+    assert "grad_norm" in core.state.metadata
+    assert isinstance(core.state.metadata["overflow"], bool)
+    assert core.state.metadata["overflow"] is False
+    assert core.state.metadata["loss_scale"] is None
+
+
+def test_precision_plugin_fp16_requires_cuda() -> None:
+    model = LossModel()
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        plugins=[PrecisionPlugin(compute_dtype=torch.float16)],
+    )
+    try:
+        core.setup()
+    except ValueError as exc:
+        assert "requires CUDA model parameters" in str(exc)
+    else:
+        raise AssertionError("PrecisionPlugin(fp16) should fail on CPU model parameters")
+
+
+def test_trainer_state_plugin_states_roundtrip() -> None:
+    model = LossModel()
+    echo = PluginStateEcho()
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        plugins=[echo],
+    )
+    core.setup()
+    echo.value = 7
+    trainer_state = core.state_manager.export_trainer_state()
+    assert trainer_state.plugin_states is not None
+    assert trainer_state.plugin_states["profiler"]["value"] == 7
+    echo.value = 0
+    core.state_manager.import_trainer_state(trainer_state)
+    assert echo.value == 7
+
+
 def main() -> None:
     test_plugin_ordering()
     test_missing_required_plugin_fails()
@@ -222,6 +292,9 @@ def main() -> None:
     test_multiple_optimizer_plugin_owners_fail()
     test_runtime_core_requires_optimizer_owner()
     test_runtime_optimizer_checkpoint_policy()
+    test_precision_plugin_metrics_and_clip()
+    test_precision_plugin_fp16_requires_cuda()
+    test_trainer_state_plugin_states_roundtrip()
     print("runtime core smoke ok")
 
 

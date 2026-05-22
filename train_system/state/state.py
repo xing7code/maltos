@@ -45,6 +45,7 @@ class TrainerState:
     rng: RngState
     consumed_tokens: int | None = None
     dataloader: dict[str, Any] | None = None
+    plugin_states: dict[str, dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -159,7 +160,7 @@ class StateManager:
             optimizer = getattr(plugin, "optimizer", None)
             if optimizer is None:
                 continue
-            state = {f"{self._OPTIMIZER_STATE_PREFIX}{plugin.id.value}": optimizer.state_dict()}
+            state: dict[str, Any] = {f"{self._OPTIMIZER_STATE_PREFIX}{plugin.id.value}": optimizer.state_dict()}
             scheduler = getattr(plugin, "scheduler", None)
             if scheduler is not None:
                 state[f"{self._SCHEDULER_STATE_PREFIX}{plugin.id.value}"] = scheduler.state_dict()
@@ -239,11 +240,17 @@ class StateManager:
             cpu=torch.get_rng_state(),
             cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         )
+        plugin_states: dict[str, dict[str, Any]] = {}
+        for plugin in runtime.plugins:
+            state = plugin.export_plugin_state()
+            if state:
+                plugin_states[plugin.id.value] = state
         return TrainerState(
             step=runtime.state.step,
             consumed_tokens=runtime.state.metadata.get("consumed_tokens"),
             dataloader=runtime.state.metadata.get("dataloader"),
             rng=rng_state,
+            plugin_states=plugin_states if plugin_states else None,
         )
 
     def import_trainer_state(self, state: TrainerState) -> None:
@@ -256,3 +263,8 @@ class StateManager:
         torch.set_rng_state(state.rng.cpu)
         if state.rng.cuda is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state.rng.cuda)
+        if state.plugin_states is not None:
+            for plugin in runtime.plugins:
+                plugin_state = state.plugin_states.get(plugin.id.value)
+                if isinstance(plugin_state, dict):
+                    plugin.import_plugin_state(plugin_state)

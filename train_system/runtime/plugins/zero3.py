@@ -94,8 +94,6 @@ class Zero3Plugin(RuntimePlugin):
                 self._prefetch_bucket(self.buckets[0], direction="forward")
         elif phase == RuntimePhase.POST_BACKWARD:
             self._wait_all_grad_sync()
-        elif phase == RuntimePhase.PRE_STEP:
-            self._step()
 
     def _prepare_buckets(self, model: nn.Module) -> None:
         visited: set[str] = set()
@@ -305,12 +303,6 @@ class Zero3Plugin(RuntimePlugin):
             group=self.dp_group,
             async_op=True,
         )
-
-    def _step(self) -> None:
-        if self.optimizer is None:
-            return
-        self.optimizer.step()
-        self.optimizer.zero_grad(set_to_none=True)
 
     def materialize_model(self) -> None:
         self._materialized_buffers.clear()

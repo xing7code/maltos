@@ -27,6 +27,7 @@ from train_system.parallel.specs import TpSpShardAxis
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshAxis, MeshConfig, RuntimeCore
 from train_system.runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
+from train_system.runtime.plugins.precision import PrecisionPlugin
 from train_system.runtime.plugins.sp import SequenceParallelPlugin
 from train_system.runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
 from train_system.runtime.plugins.tp import TensorParallelPlugin
@@ -57,6 +58,7 @@ def parse_args() -> argparse.Namespace:
         "--case",
         choices=(
             "tp_sp",
+            "tp_bf16",
             "tp_sp_ddp_sync",
             "tp_sp_ddp_async",
             "tp_sp_ddp_bucket",
@@ -146,6 +148,8 @@ def _make_plugins(case: str):
     plugins = [TensorParallelPlugin(), SequenceParallelPlugin()]
     if case == "tp_sp":
         return plugins, 0
+    if case == "tp_bf16":
+        return [TensorParallelPlugin(), PrecisionPlugin(compute_dtype=torch.bfloat16)], 0
     if case == "tp_sp_ddp_sync":
         return plugins + [DataParallelPlugin(async_op=False)], 0
     if case == "tp_sp_ddp_async":
@@ -193,17 +197,44 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_train_loss = baseline_model((full_tokens, full_tokens.clone()))
     baseline_train_loss.backward()
 
+    if args.case == "tp_bf16" and not _supports_bf16_autocast():
+        if rank == 0:
+            print("SKIP: bf16 autocast is not supported on this runtime")
+        dist.destroy_process_group()
+        return
+
     plugins, zero_stage = _make_plugins(args.case)
+    has_plugin_optimizer_owner = any(plugin.owns_optimizer for plugin in plugins)
     core = RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=zero_stage),
         model=sharded_model,
-        optimizer=torch.optim.SGD(sharded_model.parameters(), lr=0.0) if zero_stage == 0 else None,
+        optimizer=torch.optim.SGD(sharded_model.parameters(), lr=0.0)
+        if zero_stage == 0 and not has_plugin_optimizer_owner
+        else None,
         plugins=plugins,
     )
     core.setup()
-    if zero_stage == 0:
+    if zero_stage == 0 and not has_plugin_optimizer_owner:
         core.optimizer = torch.optim.SGD(core.model.parameters(), lr=_LR)
+
+    if args.case == "tp_bf16":
+        bf16_ok = 1
+        bf16_error = ""
+        try:
+            with torch.no_grad():
+                _ = core.model((local_tokens, local_tokens.clone()))
+        except Exception as exc:
+            bf16_ok = 0
+            bf16_error = str(exc)
+        ok_tensor = torch.tensor([bf16_ok], dtype=torch.int64)
+        dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
+        if ok_tensor.item() == 0:
+            if rank == 0:
+                detail = bf16_error if bf16_error else "one or more ranks failed bf16 forward preflight"
+                print(f"SKIP: tp_bf16 preflight failed: {detail}")
+            dist.destroy_process_group()
+            return
 
     sharded_train_loss = core.run_train_step((local_tokens, local_tokens.clone()))
     baseline_optimizer.step()
@@ -247,6 +278,16 @@ def main() -> None:
     args = parse_args()
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     mp.spawn(_run_worker, args=(args,), nprocs=args.world_size, join=True)
+
+
+def _supports_bf16_autocast() -> bool:
+    try:
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            x = torch.randn(8, 8)
+            _ = x @ x
+        return True
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":

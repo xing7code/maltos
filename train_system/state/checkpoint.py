@@ -139,6 +139,7 @@ def load_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
                 step=int(trainer_state.get("step", 0)),
                 consumed_tokens=trainer_state.get("consumed_tokens"),
                 dataloader=trainer_state.get("dataloader"),
+                plugin_states=trainer_state.get("plugin_states"),
                 rng=RngState(
                     cpu=trainer_state["rng"]["cpu"],
                     cuda=trainer_state["rng"].get("cuda"),

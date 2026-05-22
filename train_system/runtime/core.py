@@ -45,6 +45,7 @@ class RuntimeState:
     batch: Any = None
     outputs: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    scaler: torch.amp.GradScaler | None = None
 
 
 @dataclass
@@ -90,11 +91,7 @@ class RuntimeCore:
         self.state.loss.backward()
         self._run_phase(RuntimePhase.POST_BACKWARD)
         self._run_phase(RuntimePhase.PRE_STEP)
-        if self.optimizer is not None and not self._plugin_owns_optimizer():
-            self.optimizer.step()
-            if self.scheduler is not None:
-                self.scheduler.step()
-            self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer_step()
         self._run_phase(RuntimePhase.POST_STEP)
         self.state.step += 1
         return self.state.loss
@@ -102,6 +99,36 @@ class RuntimeCore:
     def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:
         assert self.group_manager is not None
         return self.group_manager.get_group(axis)
+
+    def get_optimizer_and_scheduler(
+        self,
+    ) -> tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LRScheduler | None]:
+        if self.optimizer is not None:
+            return self.optimizer, self.scheduler
+        for plugin in self.plugins:
+            if plugin.owns_optimizer:
+                return getattr(plugin, "optimizer", None), getattr(plugin, "scheduler", None)
+        return None, None
+
+    def optimizer_step(self) -> None:
+        optimizer, scheduler = self.get_optimizer_and_scheduler()
+        if optimizer is None:
+            return
+        scaler = self.state.scaler
+        if scaler is not None:
+            prev_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            next_scale = scaler.get_scale()
+            self.state.metadata["loss_scale"] = float(next_scale)
+            self.state.metadata["overflow"] = bool(next_scale < prev_scale)
+        else:
+            optimizer.step()
+            self.state.metadata["loss_scale"] = None
+            self.state.metadata["overflow"] = False
+        if scheduler is not None:
+            scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
 
     def should_save_optimizer(self, rank_id: int) -> bool:
         return self.optimizer_state_source_rank(rank_id) == rank_id

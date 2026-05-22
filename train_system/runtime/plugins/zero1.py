@@ -80,8 +80,8 @@ class Zero1Plugin(RuntimePlugin):
             self._reset_buckets()
         elif phase == RuntimePhase.POST_BACKWARD:
             self._wait_grad_sync()
-        elif phase == RuntimePhase.PRE_STEP:
-            self._step_and_gather()
+        elif phase == RuntimePhase.POST_STEP:
+            self._gather_updated_params()
         elif phase == RuntimePhase.POST_LOAD:
             self._sync_local_params_from_data_buffer()
 
@@ -171,14 +171,10 @@ class Zero1Plugin(RuntimePlugin):
             async_op=True,
         )
 
-    def _step_and_gather(self) -> None:
-        if self.optimizer is None:
-            return
+    def _gather_updated_params(self) -> None:
         assert self.dp_group is not None
         assert self.data_buffer is not None
         assert self.grad_buffer is not None
-        self.optimizer.step()
-        self.optimizer.zero_grad(set_to_none=True)
         self.grad_buffer.zero_()
         handles = []
         with torch.no_grad():
