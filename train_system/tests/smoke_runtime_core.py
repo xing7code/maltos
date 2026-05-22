@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import tempfile
 
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshConfig, PluginId, RuntimeCore, RuntimePhase
@@ -17,7 +16,6 @@ from train_system.runtime.plugins.tp import TensorParallelPlugin
 from train_system.runtime.plugin import RuntimePlugin
 from train_system.runtime.plugins.zero1 import Zero1Plugin
 from train_system.runtime.plugins.zero2 import Zero2Plugin
-from train_system.state import load_sharded_checkpoint, save_sharded_checkpoint
 
 
 class LossModel(nn.Module):
@@ -216,28 +214,6 @@ def test_runtime_optimizer_checkpoint_policy() -> None:
     assert tp_dp_core.optimizer_state_source_rank(3) == 1
 
 
-def test_state_registry_checkpoint_roundtrip() -> None:
-    model = LossModel()
-    core = RuntimeCore(
-        mesh=MeshConfig(),
-        plan=ParallelPlan(),
-        model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
-    )
-    core.setup()
-    control = {"value": 7}
-    core.state_registry.register_state(
-        name="unit_test.counter",
-        save=lambda: {"value": control["value"]},
-        load=lambda payload: control.update(value=int(payload["value"])),
-    )
-    ckpt_dir = tempfile.mkdtemp(prefix="registry_ckpt_")
-    save_sharded_checkpoint(core, ckpt_dir)
-    control["value"] = 0
-    load_sharded_checkpoint(core, ckpt_dir)
-    assert control["value"] == 7
-
-
 def main() -> None:
     test_plugin_ordering()
     test_missing_required_plugin_fails()
@@ -246,7 +222,6 @@ def main() -> None:
     test_multiple_optimizer_plugin_owners_fail()
     test_runtime_core_requires_optimizer_owner()
     test_runtime_optimizer_checkpoint_policy()
-    test_state_registry_checkpoint_roundtrip()
     print("runtime core smoke ok")
 
 

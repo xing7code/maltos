@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 import torch.nn as nn
 
@@ -51,13 +51,6 @@ class StateShard:
 
 
 @dataclass
-class RegisteredStateHandler:
-    name: str
-    save: Callable[[], Any]
-    load: Callable[[Any], None]
-
-
-@dataclass
 class StateRegistry:
     """Runtime-owned index of logical training state.
 
@@ -67,7 +60,6 @@ class StateRegistry:
     eventually gradient and optimizer-state handles.
     """
 
-    states: dict[str, RegisteredStateHandler] = field(default_factory=dict)
     shards: dict[str, StateShard] = field(default_factory=dict)
     _runtime_params: dict[str, nn.Parameter] = field(default_factory=dict, repr=False)
     _runtime_status: dict[str, RuntimeParamStatus] = field(default_factory=dict, repr=False)
@@ -94,29 +86,6 @@ class StateRegistry:
                     dtype=str(param.dtype),
                 ),
             )
-
-    def register_state(
-        self,
-        name: str,
-        save: Callable[[], Any],
-        load: Callable[[Any], None],
-    ) -> None:
-        if name in self.states:
-            raise ValueError(f"duplicate state registration: {name}")
-        self.states[name] = RegisteredStateHandler(name=name, save=save, load=load)
-
-    def dump_state(self) -> dict[str, Any]:
-        return {name: entry.save() for name, entry in self.states.items()}
-
-    def load_state(self, state: dict[str, Any], strict: bool = True) -> None:
-        unknown = set(state) - set(self.states)
-        if strict and unknown:
-            unknown_names = sorted(unknown)
-            raise ValueError(f"unknown registry states in checkpoint: {unknown_names}")
-        for name, value in state.items():
-            entry = self.states.get(name)
-            if entry is not None:
-                entry.load(value)
 
     def update_param_shard(
         self,

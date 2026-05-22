@@ -58,7 +58,6 @@ class TrainerCheckpointState:
     rng: RngCheckpointState
     consumed_tokens: int | None = None
     dataloader: dict[str, Any] | None = None
-    registry: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,7 +65,6 @@ class TrainerCheckpointState:
             "consumed_tokens": self.consumed_tokens,
             "dataloader": self.dataloader,
             "rng": self.rng.to_dict(),
-            "registry": self.registry,
         }
 
     @classmethod
@@ -75,7 +73,6 @@ class TrainerCheckpointState:
             step=int(state.get("step", 0)),
             consumed_tokens=state.get("consumed_tokens"),
             dataloader=state.get("dataloader"),
-            registry=state.get("registry"),
             rng=RngCheckpointState.from_dict(state["rng"]),
         )
 
@@ -384,7 +381,6 @@ def _local_trainer_state(runtime: "RuntimeCore") -> TrainerCheckpointState:
         step=runtime.state.step,
         consumed_tokens=runtime.state.metadata.get("consumed_tokens"),
         dataloader=runtime.state.metadata.get("dataloader"),
-        registry=runtime.state_registry.dump_state(),
         rng=rng_state,
     )
 
@@ -393,8 +389,6 @@ def _load_trainer_state(runtime: "RuntimeCore", state: TrainerCheckpointState) -
     runtime.state.step = state.step
     runtime.state.metadata["consumed_tokens"] = state.consumed_tokens
     runtime.state.metadata["dataloader"] = state.dataloader
-    if state.registry is not None:
-        runtime.state_registry.load_state(state.registry, strict=False)
 
     torch.set_rng_state(state.rng.cpu)
     if state.rng.cuda is not None and torch.cuda.is_available():
