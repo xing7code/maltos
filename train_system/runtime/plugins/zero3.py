@@ -9,7 +9,7 @@ import torch.nn as nn
 from train_system.runtime.core import RuntimePhase
 from train_system.runtime.mesh import MeshAxis
 from train_system.runtime.plugin import PluginId, RuntimePlugin
-from train_system.state.registry import ParamState
+from train_system.state.state import ParamState
 
 
 class _AllReduceShardWork:
@@ -322,7 +322,7 @@ class Zero3Plugin(RuntimePlugin):
             self._free_full_params(bucket)
         self._materialized_buffers.clear()
 
-    def local_state_dict(self) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
+    def override_param_state_dict(self) -> tuple[dict[str, torch.Tensor], list[ParamState]] | None:
         state = {}
         metadata = []
         for bucket in self.buckets:
@@ -357,12 +357,13 @@ class Zero3Plugin(RuntimePlugin):
             },
         )
 
-    def load_local_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+    def load_param_state_dict(self, state: dict[str, torch.Tensor]) -> bool:
         for bucket in self.buckets:
             state_key = f"zero3_bucket_{bucket.index}"
             tensor = state[state_key].to(device=bucket.local_param.device, dtype=bucket.local_param.dtype)
             bucket.local_param.data.copy_(tensor)
             self._free_full_params(bucket)
+        return True
 
     def _wait_all_grad_sync(self) -> None:
         for bucket in self.buckets:

@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
+import torch
 import torch.nn as nn
 
 from train_system.parallel.specs import TpSpParallelSpec
 from train_system.runtime.mesh import MeshAxis
+from train_system.state.state import ParamState
 
 if TYPE_CHECKING:
     from train_system.runtime.core import RuntimeCore, RuntimePhase
@@ -66,3 +68,12 @@ class RuntimePlugin:
 
     def optimizer_state_source_rank(self, rank_id: int) -> int:
         return rank_id
+
+    def override_param_state_dict(self) -> tuple[dict[str, torch.Tensor], list[ParamState]] | None:
+        return None
+
+    def load_param_state_dict(self, state: dict[str, torch.Tensor]) -> bool:
+        return False
+
+    def annotate_checkpoint_state(self, entry: ParamState) -> None:
+        pass

@@ -12,7 +12,7 @@ import torch.distributed as dist
 from train_system.parallel.plan import ParallelPlan
 from train_system.runtime.mesh import MeshAxis, MeshConfig, ProcessGroupManager
 from train_system.runtime.plugin import RuntimePlugin
-from train_system.state.registry import StateRegistry
+from train_system.state.state import StateManager
 
 
 class RuntimePhase(str, Enum):
@@ -56,7 +56,7 @@ class RuntimeCore:
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
     plugins: list[RuntimePlugin] = field(default_factory=list)
     group_manager: ProcessGroupManager | None = None
-    state_registry: StateRegistry = field(default_factory=StateRegistry)
+    state_manager: StateManager = field(default_factory=StateManager)
     state: RuntimeState = field(default_factory=RuntimeState)
 
     def __post_init__(self) -> None:
@@ -67,12 +67,13 @@ class RuntimeCore:
         self._validate_optimizer_owner()
 
     def setup(self) -> None:
+        self.state_manager.bind(self)
         for plugin in self.plugins:
             plugin.bind(self)
         self._run_phase(RuntimePhase.SETUP)
         for plugin in self.plugins:
             self.model = plugin.transform_model(self.model)
-        self.state_registry.register_module(self.model)
+        self.state_manager.register_module(self.model)
         self._run_phase(RuntimePhase.TRANSFORM_MODEL)
 
     def run_train_step(self, batch: Any) -> torch.Tensor:

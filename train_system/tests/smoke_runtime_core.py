@@ -88,7 +88,7 @@ def test_missing_required_plugin_fails() -> None:
         raise AssertionError("RuntimeCore accepted a plugin with a missing hard dependency")
 
 
-def test_train_step_phases_and_state_registry() -> None:
+def test_train_step_phases_and_state_manager() -> None:
     events: list[str] = []
     model = LossModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -104,7 +104,7 @@ def test_train_step_phases_and_state_registry() -> None:
 
     assert loss.ndim == 0
     assert core.state.step == 1
-    assert "proj.weight" in core.state_registry.shards
+    assert "proj.weight" in core.state_manager.param_states
     assert events == [
         "recorder:setup",
         "recorder:transform",
@@ -217,7 +217,7 @@ def test_runtime_optimizer_checkpoint_policy() -> None:
 def main() -> None:
     test_plugin_ordering()
     test_missing_required_plugin_fails()
-    test_train_step_phases_and_state_registry()
+    test_train_step_phases_and_state_manager()
     test_duplicate_optimizer_owners_fail()
     test_multiple_optimizer_plugin_owners_fail()
     test_runtime_core_requires_optimizer_owner()

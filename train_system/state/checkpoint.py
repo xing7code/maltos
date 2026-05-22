@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import torch.distributed as dist
-from train_system.state.registry import ParamState
+from train_system.state.state import (
+    OptimizerCheckpointState,
+    ParamState,
+    RngCheckpointState,
+    TrainerCheckpointState,
+)
 
 if TYPE_CHECKING:
     from train_system.runtime.core import RuntimeCore
@@ -36,54 +41,15 @@ class CheckpointArtifact:
     source_rank: int | None = None
 
 
-@dataclass(frozen=True)
-class RngCheckpointState:
-    cpu: torch.Tensor
-    cuda: list[torch.Tensor] | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        state: dict[str, Any] = {"cpu": self.cpu}
-        if self.cuda is not None:
-            state["cuda"] = self.cuda
-        return state
-
-    @classmethod
-    def from_dict(cls, state: dict[str, Any]) -> "RngCheckpointState":
-        return cls(cpu=state["cpu"], cuda=state.get("cuda"))
-
-
-@dataclass(frozen=True)
-class TrainerCheckpointState:
-    step: int
-    rng: RngCheckpointState
-    consumed_tokens: int | None = None
-    dataloader: dict[str, Any] | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "step": self.step,
-            "consumed_tokens": self.consumed_tokens,
-            "dataloader": self.dataloader,
-            "rng": self.rng.to_dict(),
-        }
-
-    @classmethod
-    def from_dict(cls, state: dict[str, Any]) -> "TrainerCheckpointState":
-        return cls(
-            step=int(state.get("step", 0)),
-            consumed_tokens=state.get("consumed_tokens"),
-            dataloader=state.get("dataloader"),
-            rng=RngCheckpointState.from_dict(state["rng"]),
-        )
-
-
 def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
     checkpoint_dir = Path(path)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    model_state, optim_state, rank_entries = _local_checkpoint_state(runtime)
+    model_state, rank_entries = runtime.state_manager.export_model_checkpoint()
+    optimizer_state = runtime.state_manager.export_optimizer_checkpoint()
+    optim_state = optimizer_state.state if optimizer_state is not None else None
     model_path = checkpoint_dir / f"model_rank_{rank}.pt"
     torch.save(model_state, model_path)
     local_artifacts: list[dict[str, Any]] = [
@@ -103,7 +69,7 @@ def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
             )
         )
     trainer_path = checkpoint_dir / f"trainer_rank_{rank}.pt"
-    torch.save(_local_trainer_state(runtime).to_dict(), trainer_path)
+    torch.save(asdict(runtime.state_manager.export_trainer_checkpoint()), trainer_path)
     local_artifacts.append(asdict(CheckpointArtifact(kind="trainer", rank=rank, path=trainer_path.name)))
 
     gathered_metadata: list[list[dict] | None] = [None for _ in range(world_size)]
@@ -164,7 +130,25 @@ def load_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
         if optimizer_artifact is not None
         else None
     )
-    _load_local_checkpoint_state(runtime, model_state, optim_state, trainer_state)
+    runtime.state_manager.import_model_checkpoint(model_state)
+    if optim_state is not None:
+        runtime.state_manager.import_optimizer_checkpoint(OptimizerCheckpointState(state=optim_state))
+    if trainer_state is not None:
+        runtime.state_manager.import_trainer_checkpoint(
+            TrainerCheckpointState(
+                step=int(trainer_state.get("step", 0)),
+                consumed_tokens=trainer_state.get("consumed_tokens"),
+                dataloader=trainer_state.get("dataloader"),
+                rng=RngCheckpointState(
+                    cpu=trainer_state["rng"]["cpu"],
+                    cuda=trainer_state["rng"].get("cuda"),
+                ),
+            )
+        )
+
+    from train_system.runtime.core import RuntimePhase
+
+    runtime._run_phase(RuntimePhase.POST_LOAD)
     if dist.is_initialized():
         dist.barrier()
 
@@ -268,128 +252,3 @@ def _validate_unique_artifacts(manifest: CheckpointManifest) -> None:
             raise ValueError(f"duplicate artifact in manifest: kind={artifact.kind}, rank={artifact.rank}")
         seen.add(key)
 
-
-_OPTIMIZER_STATE_PREFIX = "__optimizer_state__."
-_RUNTIME_OPTIMIZER_STATE_KEY = f"{_OPTIMIZER_STATE_PREFIX}runtime"
-_SCHEDULER_STATE_PREFIX = "__scheduler_state__."
-_RUNTIME_SCHEDULER_STATE_KEY = f"{_SCHEDULER_STATE_PREFIX}runtime"
-
-
-def _local_checkpoint_state(
-    runtime: "RuntimeCore",
-) -> tuple[dict[str, torch.Tensor], dict[str, Any] | None, list[ParamState]]:
-    for plugin in runtime.plugins:
-        local_state_dict = getattr(plugin, "local_state_dict", None)
-        if local_state_dict is not None:
-            state, entries = local_state_dict()
-            break
-    else:
-        state = {}
-        entries = []
-        for name, param_state in runtime.state_registry.iter_param_states():
-            param = runtime.state_registry.get_param_tensor(name)
-            tensor = param.detach().cpu().clone()
-            state[name] = tensor
-            entries.append(param_state)
-
-    for entry in entries:
-        for plugin in runtime.plugins:
-            annotate = getattr(plugin, "annotate_checkpoint_state", None)
-            if annotate is not None:
-                annotate(entry)
-    optim_state = _local_optimizer_state(runtime)
-    return state, optim_state, entries
-
-
-def _load_local_checkpoint_state(
-    runtime: "RuntimeCore",
-    model_state: dict[str, torch.Tensor],
-    optim_state: dict[str, Any] | None,
-    trainer_state: dict[str, Any] | None,
-) -> None:
-    for plugin in runtime.plugins:
-        load_local_state_dict = getattr(plugin, "load_local_state_dict", None)
-        if load_local_state_dict is not None:
-            load_local_state_dict(model_state)
-            break
-    else:
-        for name, tensor in model_state.items():
-            param_state = runtime.state_registry.get_param_state(name)
-            param = runtime.state_registry.get_param_tensor(name)
-            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
-
-    from train_system.runtime.core import RuntimePhase
-
-    if optim_state is not None:
-        _load_optimizer_states(runtime, optim_state)
-    if trainer_state is not None:
-        _load_trainer_state(runtime, TrainerCheckpointState.from_dict(trainer_state))
-    runtime._run_phase(RuntimePhase.POST_LOAD)
-
-
-def _local_optimizer_state(runtime: "RuntimeCore") -> dict[str, Any] | None:
-    if runtime.optimizer is not None:
-        state: dict[str, Any] = {_RUNTIME_OPTIMIZER_STATE_KEY: runtime.optimizer.state_dict()}
-        if runtime.scheduler is not None:
-            state[_RUNTIME_SCHEDULER_STATE_KEY] = runtime.scheduler.state_dict()
-        return state
-    for plugin in runtime.plugins:
-        if not plugin.owns_optimizer:
-            continue
-        optimizer = getattr(plugin, "optimizer", None)
-        if optimizer is not None:
-            state = {f"{_OPTIMIZER_STATE_PREFIX}{plugin.id.value}": optimizer.state_dict()}
-            scheduler = getattr(plugin, "scheduler", None)
-            if scheduler is not None:
-                state[f"{_SCHEDULER_STATE_PREFIX}{plugin.id.value}"] = scheduler.state_dict()
-            return state
-    return None
-
-
-def _load_optimizer_states(runtime: "RuntimeCore", state: dict[str, Any]) -> None:
-    if runtime.optimizer is not None:
-        optimizer_state = state.get(_RUNTIME_OPTIMIZER_STATE_KEY)
-        if optimizer_state is not None:
-            runtime.optimizer.load_state_dict(optimizer_state)
-        scheduler_state = state.get(_RUNTIME_SCHEDULER_STATE_KEY)
-        if scheduler_state is not None and runtime.scheduler is not None:
-            runtime.scheduler.load_state_dict(scheduler_state)
-        return
-    for plugin in runtime.plugins:
-        if not plugin.owns_optimizer:
-            continue
-        optimizer = getattr(plugin, "optimizer", None)
-        if optimizer is None:
-            continue
-        optimizer_state = state.get(f"{_OPTIMIZER_STATE_PREFIX}{plugin.id.value}")
-        if optimizer_state is not None:
-            optimizer.load_state_dict(optimizer_state)
-            scheduler = getattr(plugin, "scheduler", None)
-            scheduler_state = state.get(f"{_SCHEDULER_STATE_PREFIX}{plugin.id.value}")
-            if scheduler is not None and scheduler_state is not None:
-                scheduler.load_state_dict(scheduler_state)
-            return
-    raise ValueError("no optimizer state found")
-
-
-def _local_trainer_state(runtime: "RuntimeCore") -> TrainerCheckpointState:
-    rng_state = RngCheckpointState(
-        cpu=torch.get_rng_state(),
-        cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-    )
-    return TrainerCheckpointState(
-        step=runtime.state.step,
-        consumed_tokens=runtime.state.metadata.get("consumed_tokens"),
-        dataloader=runtime.state.metadata.get("dataloader"),
-        rng=rng_state,
-    )
-
-
-def _load_trainer_state(runtime: "RuntimeCore", state: TrainerCheckpointState) -> None:
-    runtime.state.step = state.step
-    runtime.state.metadata["consumed_tokens"] = state.consumed_tokens
-    runtime.state.metadata["dataloader"] = state.dataloader
-
-    torch.set_rng_state(state.rng.cpu)
-    if state.rng.cuda is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state.rng.cuda)

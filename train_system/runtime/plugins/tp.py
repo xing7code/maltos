@@ -7,7 +7,7 @@ from train_system.runtime.core import RuntimePhase
 from train_system.runtime.mesh import MeshAxis
 from train_system.runtime.plugin import ParallelizableModule, PluginId, RuntimePlugin
 from train_system.runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
-from train_system.state.registry import ParamState
+from train_system.state.state import ParamState
 
 
 class TensorParallelPlugin(RuntimePlugin):
@@ -102,11 +102,11 @@ class TensorParallelPlugin(RuntimePlugin):
         if phase != RuntimePhase.TRANSFORM_MODEL:
             return
         assert self.runtime is not None
-        for fq_name, param_state in self.runtime.state_registry.iter_param_states():
-            param = self.runtime.state_registry.get_param_tensor(fq_name)
+        for fq_name, param_state in self.runtime.state_manager.iter_param_states():
+            param = self.runtime.state_manager.get_param_tensor(fq_name)
             logical_shape = self._logical_shapes.get(fq_name, tuple(param.shape))
             local_shape = tuple(param.shape)
-            self.runtime.state_registry.update_param_shard(
+            self.runtime.state_manager.update_param_state(
                 fq_name,
                 logical_names=[fq_name],
                 logical_shapes=[logical_shape],
