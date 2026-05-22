@@ -57,12 +57,6 @@ class SequenceParallelPlugin(RuntimePlugin):
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase != RuntimePhase.TRANSFORM_MODEL:
             return
-        assert self.runtime is not None
-        for _, handle in self.runtime.state_registry.items():
-            extra = dict(handle.runtime.extra or {})
-            extra["sequence_parallel"] = True
-            extra["sp_world_size"] = self.world_size
-            handle.runtime.extra = extra
 
     def _register_sequence_hook(self, module: nn.Module, rule: TpSpShardRule) -> None:
         if rule.pre_comm == TpSpComm.ALL_GATHER:

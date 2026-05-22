@@ -1,43 +1,22 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import torch.distributed as dist
+from train_system.state.registry import ParamState
 
 if TYPE_CHECKING:
     from train_system.runtime.core import RuntimeCore
-    from train_system.runtime.plugin import RuntimePlugin
-
-
-@dataclass
-class CheckpointEntry:
-    state_key: str
-    logical_names: list[str]
-    logical_shapes: list[tuple[int, ...]]
-    physical_shape: tuple[int, ...]
-    dtype: str
-    annotations: dict[str, object] = field(default_factory=dict)
-
-    def add_annotation(self, plugin: "RuntimePlugin") -> None:
-        annotate = getattr(plugin, "annotate_checkpoint_entry", None)
-        if annotate is not None:
-            annotate(self)
-
-    def set_plugin_annotation(self, plugin: "RuntimePlugin", value: object) -> None:
-        key = plugin.id.value
-        if key in self.annotations:
-            raise ValueError(f"duplicate checkpoint annotation: {key}")
-        self.annotations[key] = value
 
 
 @dataclass(frozen=True)
 class RankCheckpointMetadata:
     rank: int
-    entries: list[CheckpointEntry]
+    entries: list[ParamState]
 
 
 @dataclass(frozen=True)
@@ -79,6 +58,7 @@ class TrainerCheckpointState:
     rng: RngCheckpointState
     consumed_tokens: int | None = None
     dataloader: dict[str, Any] | None = None
+    registry: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +66,7 @@ class TrainerCheckpointState:
             "consumed_tokens": self.consumed_tokens,
             "dataloader": self.dataloader,
             "rng": self.rng.to_dict(),
+            "registry": self.registry,
         }
 
     @classmethod
@@ -94,6 +75,7 @@ class TrainerCheckpointState:
             step=int(state.get("step", 0)),
             consumed_tokens=state.get("consumed_tokens"),
             dataloader=state.get("dataloader"),
+            registry=state.get("registry"),
             rng=RngCheckpointState.from_dict(state["rng"]),
         )
 
@@ -144,7 +126,7 @@ def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
             ranks=[
                 RankCheckpointMetadata(
                     rank=rank_idx,
-                    entries=[CheckpointEntry(**item) for item in (entries or [])],
+                    entries=[ParamState(**item) for item in (entries or [])],
                 )
                 for rank_idx, entries in enumerate(gathered_metadata)
             ],
@@ -206,7 +188,7 @@ def _load_manifest(checkpoint_dir: Path) -> CheckpointManifest:
         ranks=[
             RankCheckpointMetadata(
                 rank=int(rank_meta["rank"]),
-                entries=[CheckpointEntry(**entry) for entry in rank_meta["entries"]],
+                entries=[ParamState(**entry) for entry in rank_meta["entries"]],
             )
             for rank_meta in raw["ranks"]
         ],
@@ -296,7 +278,9 @@ _SCHEDULER_STATE_PREFIX = "__scheduler_state__."
 _RUNTIME_SCHEDULER_STATE_KEY = f"{_SCHEDULER_STATE_PREFIX}runtime"
 
 
-def _local_checkpoint_state(runtime: "RuntimeCore") -> tuple[dict[str, torch.Tensor], dict[str, Any] | None, list[CheckpointEntry]]:
+def _local_checkpoint_state(
+    runtime: "RuntimeCore",
+) -> tuple[dict[str, torch.Tensor], dict[str, Any] | None, list[ParamState]]:
     for plugin in runtime.plugins:
         local_state_dict = getattr(plugin, "local_state_dict", None)
         if local_state_dict is not None:
@@ -305,22 +289,17 @@ def _local_checkpoint_state(runtime: "RuntimeCore") -> tuple[dict[str, torch.Ten
     else:
         state = {}
         entries = []
-        for name, param in runtime.model.named_parameters():
+        for name, param_state in runtime.state_registry.iter_param_states():
+            param = runtime.state_registry.get_param_tensor(name)
             tensor = param.detach().cpu().clone()
             state[name] = tensor
-            entry = CheckpointEntry(
-                state_key=name,
-                logical_names=[name],
-                logical_shapes=[tuple(param.shape)],
-                physical_shape=tuple(param.shape),
-                dtype=str(param.dtype),
-                annotations={},
-            )
-            entries.append(entry)
+            entries.append(param_state)
 
     for entry in entries:
         for plugin in runtime.plugins:
-            entry.add_annotation(plugin)
+            annotate = getattr(plugin, "annotate_checkpoint_state", None)
+            if annotate is not None:
+                annotate(entry)
     optim_state = _local_optimizer_state(runtime)
     return state, optim_state, entries
 
@@ -337,9 +316,10 @@ def _load_local_checkpoint_state(
             load_local_state_dict(model_state)
             break
     else:
-        params = dict(runtime.model.named_parameters())
         for name, tensor in model_state.items():
-            params[name].data.copy_(tensor.to(device=params[name].device, dtype=params[name].dtype))
+            param_state = runtime.state_registry.get_param_state(name)
+            param = runtime.state_registry.get_param_tensor(name)
+            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
 
     from train_system.runtime.core import RuntimePhase
 
@@ -404,6 +384,7 @@ def _local_trainer_state(runtime: "RuntimeCore") -> TrainerCheckpointState:
         step=runtime.state.step,
         consumed_tokens=runtime.state.metadata.get("consumed_tokens"),
         dataloader=runtime.state.metadata.get("dataloader"),
+        registry=runtime.state_registry.dump_state(),
         rng=rng_state,
     )
 
@@ -412,6 +393,8 @@ def _load_trainer_state(runtime: "RuntimeCore", state: TrainerCheckpointState) -
     runtime.state.step = state.step
     runtime.state.metadata["consumed_tokens"] = state.consumed_tokens
     runtime.state.metadata["dataloader"] = state.dataloader
+    if state.registry is not None:
+        runtime.state_registry.load_state(state.registry, strict=False)
 
     torch.set_rng_state(state.rng.cpu)
     if state.rng.cuda is not None and torch.cuda.is_available():

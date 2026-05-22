@@ -7,7 +7,7 @@ from train_system.runtime.core import RuntimePhase
 from train_system.runtime.mesh import MeshAxis
 from train_system.runtime.plugin import ParallelizableModule, PluginId, RuntimePlugin
 from train_system.runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
-from train_system.state.checkpoint import CheckpointEntry
+from train_system.state.registry import ParamState
 
 
 class TensorParallelPlugin(RuntimePlugin):
@@ -57,7 +57,7 @@ class TensorParallelPlugin(RuntimePlugin):
     def runtime_optimizer_sharded_axes(self) -> set[MeshAxis]:
         return {MeshAxis.TP} if self.runtime is not None and self.runtime.mesh.tp > 1 else set()
 
-    def annotate_checkpoint_entry(self, entry: CheckpointEntry) -> None:
+    def annotate_checkpoint_state(self, entry: ParamState) -> None:
         group = self.tp_group
         if group is None:
             return
@@ -87,7 +87,7 @@ class TensorParallelPlugin(RuntimePlugin):
                 tp_shard["shard_extent"] = local_extent
             tp_shards.append(tp_shard)
         if tp_shards:
-            entry.set_plugin_annotation(self, {"shards": tp_shards})
+            entry.set_plugin_annotation(self.id.value, {"shards": tp_shards})
 
     def _record_linear_rule(self, module_path: str, module: nn.Linear, shard_axis: TpSpShardAxis) -> None:
         weight_name = f"{module_path}.weight"
@@ -102,11 +102,14 @@ class TensorParallelPlugin(RuntimePlugin):
         if phase != RuntimePhase.TRANSFORM_MODEL:
             return
         assert self.runtime is not None
-        for fq_name, handle in self.runtime.state_registry.items():
-            handle.runtime.logical_shape = tuple(handle.param.shape)
-            handle.runtime.local_shape = tuple(handle.param.shape)
-            handle.runtime.extra = {
-                "parallelism": "tp",
-                "tp_world_size": 1 if self.tp_group is None else self.runtime.mesh.tp,
-                "note": "After module replacement, this metadata can be refined per shard rule.",
-            }
+        for fq_name, param_state in self.runtime.state_registry.iter_param_states():
+            param = self.runtime.state_registry.get_param_tensor(fq_name)
+            logical_shape = self._logical_shapes.get(fq_name, tuple(param.shape))
+            local_shape = tuple(param.shape)
+            self.runtime.state_registry.update_param_shard(
+                fq_name,
+                logical_names=[fq_name],
+                logical_shapes=[logical_shape],
+                physical_shape=local_shape,
+                dtype=str(param.dtype),
+            )

@@ -9,7 +9,7 @@ import torch.nn as nn
 from train_system.runtime.core import RuntimePhase
 from train_system.runtime.mesh import MeshAxis
 from train_system.runtime.plugin import PluginId, RuntimePlugin
-from train_system.state.checkpoint import CheckpointEntry
+from train_system.state.registry import ParamState
 
 
 class _AllReduceShardWork:
@@ -322,14 +322,14 @@ class Zero3Plugin(RuntimePlugin):
             self._free_full_params(bucket)
         self._materialized_buffers.clear()
 
-    def local_state_dict(self) -> tuple[dict[str, torch.Tensor], list[CheckpointEntry]]:
+    def local_state_dict(self) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
         state = {}
         metadata = []
         for bucket in self.buckets:
             state_key = f"zero3_bucket_{bucket.index}"
             state[state_key] = bucket.local_param.detach().cpu().clone()
             metadata.append(
-                CheckpointEntry(
+                ParamState(
                     state_key=state_key,
                     logical_names=bucket.logical_names,
                     logical_shapes=[tuple(shape) for shape in bucket.param_shapes],
@@ -339,14 +339,14 @@ class Zero3Plugin(RuntimePlugin):
             )
         return state, metadata
 
-    def annotate_checkpoint_entry(self, entry: CheckpointEntry) -> None:
+    def annotate_checkpoint_state(self, entry: ParamState) -> None:
         bucket_by_key = {f"zero3_bucket_{bucket.index}": bucket for bucket in self.buckets}
         bucket = bucket_by_key.get(entry.state_key)
         if bucket is None:
             return
         shard_len = bucket.local_param.numel()
         entry.set_plugin_annotation(
-            self,
+            self.id.value,
             {
                 "bucket_index": bucket.index,
                 "rank": self.rank,
