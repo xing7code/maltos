@@ -4,22 +4,22 @@ from .checkpoint import (
     save_sharded_checkpoint,
 )
 from .state import (
-    OptimizerCheckpointState,
+    OptimizerState,
     ParamState,
-    RngCheckpointState,
+    RngState,
     RuntimeParamStatus,
     StateManager,
-    TrainerCheckpointState,
+    TrainerState,
 )
 
 __all__ = [
     "CheckpointManifest",
-    "OptimizerCheckpointState",
+    "OptimizerState",
     "ParamState",
-    "RngCheckpointState",
+    "RngState",
     "RuntimeParamStatus",
     "StateManager",
-    "TrainerCheckpointState",
+    "TrainerState",
     "load_sharded_checkpoint",
     "save_sharded_checkpoint",
 ]

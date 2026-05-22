@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 import torch.distributed as dist
 from train_system.state.state import (
-    OptimizerCheckpointState,
+    OptimizerState,
     ParamState,
-    RngCheckpointState,
-    TrainerCheckpointState,
+    RngState,
+    TrainerState,
 )
 
 if TYPE_CHECKING:
@@ -47,8 +47,8 @@ def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    model_state, rank_entries = runtime.state_manager.export_model_checkpoint()
-    optimizer_state = runtime.state_manager.export_optimizer_checkpoint()
+    model_state, rank_entries = runtime.state_manager.export_model_state()
+    optimizer_state = runtime.state_manager.export_optimizer_state()
     optim_state = optimizer_state.state if optimizer_state is not None else None
     model_path = checkpoint_dir / f"model_rank_{rank}.pt"
     torch.save(model_state, model_path)
@@ -69,7 +69,7 @@ def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
             )
         )
     trainer_path = checkpoint_dir / f"trainer_rank_{rank}.pt"
-    torch.save(asdict(runtime.state_manager.export_trainer_checkpoint()), trainer_path)
+    torch.save(asdict(runtime.state_manager.export_trainer_state()), trainer_path)
     local_artifacts.append(asdict(CheckpointArtifact(kind="trainer", rank=rank, path=trainer_path.name)))
 
     gathered_metadata: list[list[dict] | None] = [None for _ in range(world_size)]
@@ -130,16 +130,16 @@ def load_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
         if optimizer_artifact is not None
         else None
     )
-    runtime.state_manager.import_model_checkpoint(model_state)
+    runtime.state_manager.import_model_state(model_state)
     if optim_state is not None:
-        runtime.state_manager.import_optimizer_checkpoint(OptimizerCheckpointState(state=optim_state))
+        runtime.state_manager.import_optimizer_state(OptimizerState(state=optim_state))
     if trainer_state is not None:
-        runtime.state_manager.import_trainer_checkpoint(
-            TrainerCheckpointState(
+        runtime.state_manager.import_trainer_state(
+            TrainerState(
                 step=int(trainer_state.get("step", 0)),
                 consumed_tokens=trainer_state.get("consumed_tokens"),
                 dataloader=trainer_state.get("dataloader"),
-                rng=RngCheckpointState(
+                rng=RngState(
                     cpu=trainer_state["rng"]["cpu"],
                     cuda=trainer_state["rng"].get("cuda"),
                 ),
@@ -251,4 +251,3 @@ def _validate_unique_artifacts(manifest: CheckpointManifest) -> None:
         if key in seen:
             raise ValueError(f"duplicate artifact in manifest: kind={artifact.kind}, rank={artifact.rank}")
         seen.add(key)
-

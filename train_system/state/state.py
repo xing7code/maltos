@@ -34,21 +34,21 @@ class ParamState:
 
 
 @dataclass(frozen=True)
-class RngCheckpointState:
+class RngState:
     cpu: torch.Tensor
     cuda: list[torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
-class TrainerCheckpointState:
+class TrainerState:
     step: int
-    rng: RngCheckpointState
+    rng: RngState
     consumed_tokens: int | None = None
     dataloader: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
-class OptimizerCheckpointState:
+class OptimizerState:
     state: dict[str, Any]
 
 
@@ -143,7 +143,7 @@ class StateManager:
             )
         return entries
 
-    def export_optimizer_checkpoint(self) -> OptimizerCheckpointState | None:
+    def export_optimizer_state(self) -> OptimizerState | None:
         if self._runtime is None:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
@@ -151,7 +151,7 @@ class StateManager:
             state: dict[str, Any] = {self._RUNTIME_OPTIMIZER_STATE_KEY: runtime.optimizer.state_dict()}
             if runtime.scheduler is not None:
                 state[self._RUNTIME_SCHEDULER_STATE_KEY] = runtime.scheduler.state_dict()
-            return OptimizerCheckpointState(state=state)
+            return OptimizerState(state=state)
 
         for plugin in runtime.plugins:
             if not plugin.owns_optimizer:
@@ -163,10 +163,10 @@ class StateManager:
             scheduler = getattr(plugin, "scheduler", None)
             if scheduler is not None:
                 state[f"{self._SCHEDULER_STATE_PREFIX}{plugin.id.value}"] = scheduler.state_dict()
-            return OptimizerCheckpointState(state=state)
+            return OptimizerState(state=state)
         return None
 
-    def export_model_checkpoint(self) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
+    def export_model_state(self) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
         if self._runtime is None:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
@@ -187,7 +187,7 @@ class StateManager:
                 plugin.annotate_checkpoint_state(entry)
         return state, entries
 
-    def import_model_checkpoint(self, model_state: dict[str, torch.Tensor]) -> None:
+    def import_model_state(self, model_state: dict[str, torch.Tensor]) -> None:
         if self._runtime is None:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
@@ -200,7 +200,7 @@ class StateManager:
             param = self.get_param_tensor(name)
             param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
 
-    def import_optimizer_checkpoint(self, state: OptimizerCheckpointState) -> None:
+    def import_optimizer_state(self, state: OptimizerState) -> None:
         if self._runtime is None:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
@@ -231,22 +231,22 @@ class StateManager:
             return
         raise ValueError("no optimizer state found")
 
-    def export_trainer_checkpoint(self) -> TrainerCheckpointState:
+    def export_trainer_state(self) -> TrainerState:
         if self._runtime is None:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
-        rng_state = RngCheckpointState(
+        rng_state = RngState(
             cpu=torch.get_rng_state(),
             cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         )
-        return TrainerCheckpointState(
+        return TrainerState(
             step=runtime.state.step,
             consumed_tokens=runtime.state.metadata.get("consumed_tokens"),
             dataloader=runtime.state.metadata.get("dataloader"),
             rng=rng_state,
         )
 
-    def import_trainer_checkpoint(self, state: TrainerCheckpointState) -> None:
+    def import_trainer_state(self, state: TrainerState) -> None:
         if self._runtime is None:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
