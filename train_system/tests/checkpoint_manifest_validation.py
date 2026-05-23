@@ -14,11 +14,11 @@ from train_system.runtime import RuntimeCore
 from train_system.state import load_sharded_checkpoint, save_sharded_checkpoint
 
 
-def _build_core(seed: int = 1234, hidden_size: int = 32) -> RuntimeCore:
+def _build_core(seed: int = 1234, hidden_size: int = 32, grad_accum_steps: int = 1) -> RuntimeCore:
     torch.manual_seed(seed)
     model = TinyModel(hidden_size=hidden_size)
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
-    core = RuntimeCore(model=model, optimizer=optimizer)
+    core = RuntimeCore(model=model, optimizer=optimizer, grad_accum_steps=grad_accum_steps)
     core.setup()
     return core
 
@@ -116,12 +116,32 @@ def test_eval_only_manifest_load_succeeds() -> None:
         )
 
 
+def test_microbatch_idx_roundtrip_succeeds() -> None:
+    checkpoint_dir = Path(tempfile.mkdtemp(prefix="manifest_validation_microbatch_"))
+    core = _build_core(grad_accum_steps=2)
+    batch = torch.randn(8, 32)
+    core.run_train_step(batch)
+    if core.state.microbatch_idx != 1:
+        raise AssertionError(f"expected saved microbatch_idx=1, got {core.state.microbatch_idx}")
+    save_sharded_checkpoint(core, checkpoint_dir)
+
+    restored_core = _build_core(grad_accum_steps=2)
+    load_sharded_checkpoint(restored_core, checkpoint_dir)
+    if restored_core.state.step != core.state.step:
+        raise AssertionError(f"expected restored step={core.state.step}, got {restored_core.state.step}")
+    if restored_core.state.microbatch_idx != core.state.microbatch_idx:
+        raise AssertionError(
+            f"expected restored microbatch_idx={core.state.microbatch_idx}, got {restored_core.state.microbatch_idx}"
+        )
+
+
 def main() -> None:
     test_missing_artifacts_field_fails()
     test_world_size_mismatch_fails()
     test_optimizer_source_mapping_mismatch_fails()
     test_duplicate_artifact_fails()
     test_eval_only_manifest_load_succeeds()
+    test_microbatch_idx_roundtrip_succeeds()
     print("PASS")
 
 

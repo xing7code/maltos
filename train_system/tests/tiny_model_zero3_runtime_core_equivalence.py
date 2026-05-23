@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--disable-prefetch", action="store_true")
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     return parser.parse_args()
 
 
@@ -77,6 +78,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     zero_model.load_state_dict(baseline_model.state_dict())
 
     local_batch_size = args.global_batch_size // args.world_size
+    if local_batch_size % args.grad_accum_steps != 0:
+        raise ValueError("local batch size must be divisible by grad_accum_steps")
     local_batch = full_batch.narrow(0, rank * local_batch_size, local_batch_size).contiguous()
 
     baseline_optimizer = torch.optim.SGD(baseline_model.parameters(), lr=_LR)
@@ -91,9 +94,14 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         model=zero_model,
         optimizer=None,
         plugins=[zero3],
+        grad_accum_steps=args.grad_accum_steps,
     )
     core.setup()
-    local_loss = core.run_train_step(local_batch)
+    micro_batch_size = local_batch_size // args.grad_accum_steps
+    local_loss = torch.zeros((), dtype=local_batch.dtype, device=local_batch.device)
+    for micro_idx in range(args.grad_accum_steps):
+        micro_batch = local_batch.narrow(0, micro_idx * micro_batch_size, micro_batch_size).contiguous()
+        local_loss = local_loss + core.run_train_step(micro_batch).detach()
     baseline_optimizer.step()
 
     avg_loss = local_loss.detach().clone()

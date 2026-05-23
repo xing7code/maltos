@@ -77,9 +77,15 @@ class Zero1Plugin(RuntimePlugin):
 
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
-            self._reset_buckets()
+            assert self.runtime is not None
+            self._reset_buckets(
+                grad_accum_start=bool(self.runtime.state.metadata.get("accum_start", True)),
+                grad_accum_end=bool(self.runtime.state.metadata.get("should_sync_grad", True)),
+            )
         elif phase == RuntimePhase.POST_BACKWARD:
-            self._wait_grad_sync()
+            assert self.runtime is not None
+            if bool(self.runtime.state.metadata.get("should_sync_grad", True)):
+                self._wait_grad_sync()
         elif phase == RuntimePhase.POST_STEP:
             self._gather_updated_params()
         elif phase == RuntimePhase.POST_LOAD:
@@ -135,7 +141,7 @@ class Zero1Plugin(RuntimePlugin):
             )
             offset += padded_size
 
-        self._reset_buckets()
+        self._reset_buckets(grad_accum_start=True, grad_accum_end=True)
         self._add_param_hooks()
 
     def _add_param_hooks(self) -> None:
@@ -197,9 +203,12 @@ class Zero1Plugin(RuntimePlugin):
                 raise RuntimeError("ZeRO1 bucket handle is None after backward")
             bucket.handle.wait()
 
-    def _reset_buckets(self) -> None:
+    def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
+        assert self.grad_buffer is not None
+        if grad_accum_start:
+            self.grad_buffer.zero_()
         for bucket in self.buckets:
-            bucket.pending = len(bucket.params)
+            bucket.pending = len(bucket.params) if grad_accum_end else 0
             bucket.handle = None
 
     def _sync_local_params_from_data_buffer(self) -> None:

@@ -89,11 +89,17 @@ class Zero3Plugin(RuntimePlugin):
 
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
-            self._reset_buckets()
+            assert self.runtime is not None
+            self._reset_buckets(
+                grad_accum_start=bool(self.runtime.state.metadata.get("accum_start", True)),
+                grad_accum_end=bool(self.runtime.state.metadata.get("should_sync_grad", True)),
+            )
             if self.enable_prefetch and self.buckets:
                 self._prefetch_bucket(self.buckets[0], direction="forward")
         elif phase == RuntimePhase.POST_BACKWARD:
-            self._wait_all_grad_sync()
+            assert self.runtime is not None
+            if bool(self.runtime.state.metadata.get("should_sync_grad", True)):
+                self._wait_all_grad_sync()
 
     def _prepare_buckets(self, model: nn.Module) -> None:
         visited: set[str] = set()
@@ -131,7 +137,7 @@ class Zero3Plugin(RuntimePlugin):
             if index + 1 < len(self.buckets):
                 bucket.next_bucket = self.buckets[index + 1]
 
-        self._reset_buckets()
+        self._reset_buckets(grad_accum_start=True, grad_accum_end=True)
         self._add_hooks()
         for bucket in self.buckets:
             self._free_full_params(bucket)
@@ -208,7 +214,6 @@ class Zero3Plugin(RuntimePlugin):
     def _make_attach_grad_hook(self, bucket: _Bucket):
         def hook(grad: torch.Tensor) -> torch.Tensor:
             if not bucket.attached:
-                bucket.grad_buffer.zero_()
                 offset = 0
                 for param, numel, shape in zip(bucket.params, bucket.param_numels, bucket.param_shapes):
                     param.grad = bucket.grad_buffer[offset : offset + numel].view(shape)
@@ -364,10 +369,12 @@ class Zero3Plugin(RuntimePlugin):
             bucket.grad_handle.wait()
             self._free_full_params(bucket)
 
-    def _reset_buckets(self) -> None:
+    def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
         self._materialized_buffers.clear()
         for bucket in self.buckets:
-            bucket.pending = len(bucket.params)
+            if grad_accum_start:
+                bucket.grad_buffer.zero_()
+            bucket.pending = len(bucket.params) if grad_accum_end else 0
             bucket.attached = False
             bucket.grad_handle = None
             bucket.fwd_handle = None

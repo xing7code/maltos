@@ -67,7 +67,9 @@ def parse_args() -> argparse.Namespace:
             "tp_sp_zero2",
             "tp_sp_zero3",
             "tp_sp_zero3_bf16_clip",
+            "tp_sp_zero3_bf16_clip_accum2",
             "tp_zero3_bf16_clip",
+            "tp_zero3_bf16_clip_accum2",
         ),
         required=True,
     )
@@ -174,7 +176,7 @@ def _make_plugins(case: str):
                 lr=_LR,
             )
         ], 3
-    if case == "tp_sp_zero3_bf16_clip":
+    if case in {"tp_sp_zero3_bf16_clip", "tp_sp_zero3_bf16_clip_accum2"}:
         return plugins + [
             Zero3Plugin(
                 wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
@@ -184,7 +186,7 @@ def _make_plugins(case: str):
             PrecisionPlugin(compute_dtype=torch.bfloat16),
             GradClipPlugin(max_norm=1.0),
         ], 3
-    if case == "tp_zero3_bf16_clip":
+    if case in {"tp_zero3_bf16_clip", "tp_zero3_bf16_clip_accum2"}:
         return [
             TensorParallelPlugin(),
             Zero3Plugin(
@@ -213,7 +215,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     dp_idx, tp_idx = _mesh_indices(rank, args.tp_size)
     baseline_model, full_tokens = _build_reference(args.seed, args.global_batch_size, args.seq_len)
-    if args.case in {"tp_bf16", "tp_zero3_bf16_clip"}:
+    if args.case in {"tp_bf16", "tp_zero3_bf16_clip", "tp_zero3_bf16_clip_accum2"}:
         sharded_model = TinyTransformerTp(**_MODEL_KWARGS)
     else:
         sharded_model = TinyTransformerTpSp(**_MODEL_KWARGS)
@@ -227,12 +229,15 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_train_loss = baseline_model((full_tokens, full_tokens.clone()))
     baseline_train_loss.backward()
 
-    if args.case in {"tp_bf16", "tp_sp_zero3_bf16_clip", "tp_zero3_bf16_clip"} and not _supports_bf16_autocast():
+    if args.case in {"tp_bf16", "tp_sp_zero3_bf16_clip", "tp_sp_zero3_bf16_clip_accum2", "tp_zero3_bf16_clip", "tp_zero3_bf16_clip_accum2"} and not _supports_bf16_autocast():
         if rank == 0:
             print("SKIP: bf16 autocast is not supported on this runtime")
         dist.destroy_process_group()
         return
 
+    grad_accum_steps = 2 if args.case in {"tp_zero3_bf16_clip_accum2", "tp_sp_zero3_bf16_clip_accum2"} else 1
+    if local_batch_size % grad_accum_steps != 0:
+        raise ValueError("local batch size must be divisible by grad_accum_steps")
     plugins, zero_stage = _make_plugins(args.case)
     has_plugin_optimizer_owner = any(plugin.owns_optimizer for plugin in plugins)
     core = RuntimeCore(
@@ -243,12 +248,13 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         if zero_stage == 0 and not has_plugin_optimizer_owner
         else None,
         plugins=plugins,
+        grad_accum_steps=grad_accum_steps,
     )
     core.setup()
     if zero_stage == 0 and not has_plugin_optimizer_owner:
         core.optimizer = torch.optim.SGD(core.model.parameters(), lr=_LR)
 
-    if args.case in {"tp_bf16", "tp_zero3_bf16_clip"}:
+    if args.case in {"tp_bf16", "tp_zero3_bf16_clip", "tp_zero3_bf16_clip_accum2"}:
         bf16_ok = 1
         bf16_error = ""
         try:
@@ -266,7 +272,14 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
             dist.destroy_process_group()
             return
 
-    sharded_train_loss = core.run_train_step((local_tokens, local_tokens.clone()))
+    if grad_accum_steps == 1:
+        sharded_train_loss = core.run_train_step((local_tokens, local_tokens.clone()))
+    else:
+        micro_batch_size = local_batch_size // grad_accum_steps
+        sharded_train_loss = torch.zeros((), dtype=torch.float32, device=local_tokens.device)
+        for micro_idx in range(grad_accum_steps):
+            micro_tokens = local_tokens.narrow(0, micro_idx * micro_batch_size, micro_batch_size).contiguous()
+            sharded_train_loss = sharded_train_loss + core.run_train_step((micro_tokens, micro_tokens.clone())).detach()
     baseline_optimizer.step()
 
     dp_group = core.get_group(MeshAxis.DP)
@@ -291,7 +304,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         print(f"RuntimeCore loss : {avg_loss.item():.6f}")
         loss_atol = _LOSS_ATOL
         step_atol = _STEP_ATOL
-        if args.case in {"tp_bf16", "tp_sp_zero3_bf16_clip", "tp_zero3_bf16_clip"}:
+        if args.case in {"tp_bf16", "tp_sp_zero3_bf16_clip", "tp_sp_zero3_bf16_clip_accum2", "tp_zero3_bf16_clip", "tp_zero3_bf16_clip_accum2"}:
             loss_atol = 5e-2
             step_atol = 5e-2
         print(f"Loss diff        : {loss_diff:.2e}  (atol={loss_atol:.2e})")

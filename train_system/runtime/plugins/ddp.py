@@ -23,6 +23,8 @@ class DataParallelPlugin(RuntimePlugin):
         if phase != RuntimePhase.POST_BACKWARD:
             return
         assert self.runtime is not None
+        if not bool(self.runtime.state.metadata.get("should_sync_grad", True)):
+            return
         dp_group = self.runtime.get_group(MeshAxis.DP)
         if dp_group is None:
             return
@@ -65,13 +67,14 @@ class _Bucket:
             view = self.flat_buffer[offset : offset + param.numel()].view_as(param)
             self.param_views.append(view)
             offset += param.numel()
-        self.reset()
+        self.reset(grad_accum_start=True, grad_accum_end=True)
 
-    def reset(self) -> None:
+    def reset(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
         assert self.flat_buffer is not None
-        self.pending = len(self.params)
+        self.pending = len(self.params) if grad_accum_end else 0
         self.handle = None
-        self.flat_buffer.zero_()
+        if grad_accum_start:
+            self.flat_buffer.zero_()
         for param, view in zip(self.params, self.param_views):
             param.grad = view
 
@@ -111,9 +114,13 @@ class BucketDataParallelPlugin(RuntimePlugin):
 
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
+            should_sync = bool(self.runtime.state.metadata.get("should_sync_grad", True))
+            accum_start = bool(self.runtime.state.metadata.get("accum_start", True))
             for bucket in self.buckets:
-                bucket.reset()
+                bucket.reset(grad_accum_start=accum_start, grad_accum_end=should_sync)
         elif phase == RuntimePhase.POST_BACKWARD:
+            if not bool(self.runtime.state.metadata.get("should_sync_grad", True)):
+                return
             for bucket in self.buckets:
                 if bucket.handle is None:
                     raise RuntimeError(f"bucket with {len(bucket.params)} params was never synchronized")

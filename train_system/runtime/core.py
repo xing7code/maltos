@@ -59,8 +59,11 @@ class RuntimeCore:
     group_manager: ProcessGroupManager | None = None
     state_manager: StateManager = field(default_factory=StateManager)
     state: RuntimeState = field(default_factory=RuntimeState)
+    grad_accum_steps: int = 1
 
     def __post_init__(self) -> None:
+        if self.grad_accum_steps < 1:
+            raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
         self._validate_mesh_and_plan()
         if self.group_manager is None:
             self.group_manager = ProcessGroupManager.from_mesh(self.mesh)
@@ -79,6 +82,12 @@ class RuntimeCore:
 
     def run_train_step(self, batch: Any) -> torch.Tensor:
         self.state.batch = batch
+        accum_idx = self.state.microbatch_idx
+        should_step = ((accum_idx + 1) % self.grad_accum_steps) == 0
+        accum_start = accum_idx == 0
+        self.state.metadata["should_sync_grad"] = should_step
+        self.state.metadata["should_step_optimizer"] = should_step
+        self.state.metadata["accum_start"] = accum_start
         self._run_phase(RuntimePhase.PRE_MICROBATCH)
         self._run_phase(RuntimePhase.PRE_FORWARD)
         outputs = self.model(batch)
@@ -88,12 +97,16 @@ class RuntimeCore:
         self._run_phase(RuntimePhase.PRE_BACKWARD)
         if self.state.loss is None:
             raise TypeError("RuntimeCore expects model(batch) to return a Tensor loss during training.")
+        if self.grad_accum_steps > 1:
+            self.state.loss = self.state.loss / self.grad_accum_steps
         self.state.loss.backward()
         self._run_phase(RuntimePhase.POST_BACKWARD)
-        self._run_phase(RuntimePhase.PRE_STEP)
-        self.optimizer_step()
-        self._run_phase(RuntimePhase.POST_STEP)
-        self.state.step += 1
+        if should_step:
+            self._run_phase(RuntimePhase.PRE_STEP)
+            self.optimizer_step()
+            self._run_phase(RuntimePhase.POST_STEP)
+            self.state.step += 1
+        self.state.microbatch_idx = (accum_idx + 1) % self.grad_accum_steps
         return self.state.loss
 
     def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:

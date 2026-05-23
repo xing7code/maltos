@@ -43,6 +43,7 @@ class RngState:
 class TrainerState:
     step: int
     rng: RngState
+    microbatch_idx: int = 0
     consumed_tokens: int | None = None
     dataloader: dict[str, Any] | None = None
     plugin_states: dict[str, dict[str, Any]] | None = None
@@ -247,6 +248,7 @@ class StateManager:
                 plugin_states[plugin.id.value] = state
         return TrainerState(
             step=runtime.state.step,
+            microbatch_idx=runtime.state.microbatch_idx,
             consumed_tokens=runtime.state.metadata.get("consumed_tokens"),
             dataloader=runtime.state.metadata.get("dataloader"),
             rng=rng_state,
@@ -258,6 +260,7 @@ class StateManager:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
         runtime.state.step = state.step
+        runtime.state.microbatch_idx = state.microbatch_idx
         runtime.state.metadata["consumed_tokens"] = state.consumed_tokens
         runtime.state.metadata["dataloader"] = state.dataloader
         torch.set_rng_state(state.rng.cpu)

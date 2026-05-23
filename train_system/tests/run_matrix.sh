@@ -34,5 +34,7 @@ done
 echo "=== tp+sp+zero3+bf16+clip checkpoint resume ==="
 "${PYTHON_BIN}" train_system/tests/tiny_transformer_tp_sp_zero3_bf16_clip_checkpoint_resume.py
 
-echo "=== matrix PASS ==="
+echo "=== tp+sp+zero3+bf16+clip+accum2 mid-step checkpoint resume ==="
+"${PYTHON_BIN}" train_system/tests/tiny_transformer_tp_sp_zero3_bf16_clip_accum2_midstep_resume.py
 
+echo "=== matrix PASS ==="

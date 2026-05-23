@@ -276,12 +276,69 @@ def test_trainer_state_plugin_states_roundtrip() -> None:
     )
     core.setup()
     echo.value = 7
+    core.state.microbatch_idx = 1
     trainer_state = core.state_manager.export_trainer_state()
     assert trainer_state.plugin_states is not None
     assert trainer_state.plugin_states["profiler"]["value"] == 7
+    assert trainer_state.microbatch_idx == 1
     echo.value = 0
+    core.state.microbatch_idx = 0
     core.state_manager.import_trainer_state(trainer_state)
     assert echo.value == 7
+    assert core.state.microbatch_idx == 1
+
+
+def test_grad_accumulation_runtime_step_cadence() -> None:
+    model = LossModel()
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        grad_accum_steps=2,
+    )
+    core.setup()
+    w0 = model.proj.weight.detach().clone()
+    core.run_train_step(torch.ones(2, 4))
+    w1 = model.proj.weight.detach().clone()
+    assert core.state.step == 0
+    assert torch.allclose(w0, w1)
+    assert core.state.metadata["should_step_optimizer"] is False
+    core.run_train_step(torch.ones(2, 4))
+    w2 = model.proj.weight.detach().clone()
+    assert core.state.step == 1
+    assert not torch.allclose(w1, w2)
+    assert core.state.metadata["should_step_optimizer"] is True
+
+
+def test_grad_accumulation_resume_boundary_cadence() -> None:
+    model = LossModel()
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        grad_accum_steps=2,
+    )
+    core.setup()
+    core.run_train_step(torch.ones(2, 4))
+    trainer_state = core.state_manager.export_trainer_state()
+    resumed_model = LossModel()
+    resumed = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=resumed_model,
+        optimizer=torch.optim.SGD(resumed_model.parameters(), lr=0.01),
+        grad_accum_steps=2,
+    )
+    resumed.setup()
+    resumed.state_manager.import_trainer_state(trainer_state)
+    resumed.run_train_step(torch.ones(2, 4))
+    assert resumed.state.metadata["should_step_optimizer"] is True
+    assert resumed.state.step == 1
+    resumed.run_train_step(torch.ones(2, 4))
+    assert resumed.state.metadata["should_step_optimizer"] is False
+    assert resumed.state.step == 1
 
 
 def main() -> None:
@@ -295,6 +352,8 @@ def main() -> None:
     test_precision_plugin_metrics_and_clip()
     test_precision_plugin_fp16_requires_cuda()
     test_trainer_state_plugin_states_roundtrip()
+    test_grad_accumulation_runtime_step_cadence()
+    test_grad_accumulation_resume_boundary_cadence()
     print("runtime core smoke ok")
 
 
