@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
+    from train_system.data import StatefulDataLoaderProtocol
     from train_system.runtime.core import RuntimeCore
 
 
@@ -62,6 +63,7 @@ class StateManager:
     _runtime_params: dict[str, nn.Parameter] = field(default_factory=dict, repr=False)
     _runtime_status: dict[str, RuntimeParamStatus] = field(default_factory=dict, repr=False)
     _runtime: "RuntimeCore | None" = field(default=None, init=False, repr=False)
+    _dataloader: "StatefulDataLoaderProtocol | None" = field(default=None, init=False, repr=False)
 
     _OPTIMIZER_STATE_PREFIX = "__optimizer_state__."
     _RUNTIME_OPTIMIZER_STATE_KEY = f"{_OPTIMIZER_STATE_PREFIX}runtime"
@@ -90,6 +92,15 @@ class StateManager:
 
     def bind(self, runtime: "RuntimeCore") -> None:
         self._runtime = runtime
+
+    @property
+    def runtime(self) -> "RuntimeCore":
+        if self._runtime is None:
+            raise RuntimeError("StateManager is not bound to RuntimeCore")
+        return self._runtime
+
+    def bind_dataloader(self, dataloader: "StatefulDataLoaderProtocol | None") -> None:
+        self._dataloader = dataloader
 
     def update_param_state(
         self,
@@ -246,11 +257,12 @@ class StateManager:
             state = plugin.export_plugin_state()
             if state:
                 plugin_states[plugin.id.value] = state
+        dataloader_state = self._export_dataloader_state()
         return TrainerState(
             step=runtime.state.step,
             microbatch_idx=runtime.state.microbatch_idx,
-            consumed_tokens=runtime.state.metadata.get("consumed_tokens"),
-            dataloader=runtime.state.metadata.get("dataloader"),
+            consumed_tokens=None if dataloader_state is None else int(dataloader_state["consumed_tokens"]),
+            dataloader=dataloader_state,
             rng=rng_state,
             plugin_states=plugin_states if plugin_states else None,
         )
@@ -261,13 +273,23 @@ class StateManager:
         runtime = self._runtime
         runtime.state.step = state.step
         runtime.state.microbatch_idx = state.microbatch_idx
-        runtime.state.metadata["consumed_tokens"] = state.consumed_tokens
-        runtime.state.metadata["dataloader"] = state.dataloader
         torch.set_rng_state(state.rng.cpu)
         if state.rng.cuda is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state.rng.cuda)
+        if self._dataloader is not None and state.dataloader is not None:
+            self._dataloader.load_state_dict(state.dataloader)
         if state.plugin_states is not None:
             for plugin in runtime.plugins:
                 plugin_state = state.plugin_states.get(plugin.id.value)
                 if isinstance(plugin_state, dict):
                     plugin.import_plugin_state(plugin_state)
+
+    def _export_dataloader_state(self) -> dict[str, Any] | None:
+        if self._dataloader is None:
+            return None
+        state = self._dataloader.state_dict()
+        if is_dataclass(state) and not isinstance(state, type):
+            return asdict(state)
+        if isinstance(state, dict):
+            return dict(state)
+        raise TypeError(f"dataloader state must be a dataclass or dict, got {type(state)!r}")

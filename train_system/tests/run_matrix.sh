@@ -16,6 +16,12 @@ echo "=== checkpoint manifest validation ==="
 echo "=== runtime optimizer checkpoint resume ==="
 "${PYTHON_BIN}" train_system/tests/tiny_model_runtime_optimizer_checkpoint_resume.py
 
+echo "=== simple dataloader checkpoint resume ==="
+"${PYTHON_BIN}" train_system/tests/simple_dataloader_checkpoint_resume.py
+
+echo "=== pretraining dataloader checkpoint resume ==="
+"${PYTHON_BIN}" train_system/tests/pretraining_dataloader_resume.py
+
 echo "=== zero3 checkpoint resume ==="
 "${PYTHON_BIN}" train_system/tests/tiny_model_zero3_checkpoint_resume.py
 
@@ -36,5 +42,8 @@ echo "=== tp+sp+zero3+bf16+clip checkpoint resume ==="
 
 echo "=== tp+sp+zero3+bf16+clip+accum2 mid-step checkpoint resume ==="
 "${PYTHON_BIN}" train_system/tests/tiny_transformer_tp_sp_zero3_bf16_clip_accum2_midstep_resume.py
+
+echo "=== pretraining loader + tp+sp+zero3+bf16+clip+accum2 checkpoint resume ==="
+"${PYTHON_BIN}" train_system/tests/pretraining_loader_tp_sp_zero3_bf16_clip_accum2_resume.py
 
 echo "=== matrix PASS ==="

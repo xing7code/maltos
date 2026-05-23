@@ -28,7 +28,7 @@ def _save_base_checkpoint() -> tuple[Path, RuntimeCore]:
     core = _build_core()
     batch = torch.randn(8, 32)
     core.run_train_step(batch)
-    save_sharded_checkpoint(core, checkpoint_dir)
+    save_sharded_checkpoint(core.state_manager, checkpoint_dir)
     return checkpoint_dir, core
 
 
@@ -61,7 +61,7 @@ def test_missing_artifacts_field_fails() -> None:
     _write_manifest(checkpoint_dir, manifest)
 
     _expect_value_error(
-        lambda: load_sharded_checkpoint(_build_core(), checkpoint_dir),
+        lambda: load_sharded_checkpoint(_build_core().state_manager, checkpoint_dir),
         "manifest missing artifacts field",
     )
 
@@ -73,7 +73,7 @@ def test_world_size_mismatch_fails() -> None:
     _write_manifest(checkpoint_dir, manifest)
 
     _expect_value_error(
-        lambda: load_sharded_checkpoint(_build_core(), checkpoint_dir),
+        lambda: load_sharded_checkpoint(_build_core().state_manager, checkpoint_dir),
         "checkpoint world_size mismatch",
     )
 
@@ -84,7 +84,7 @@ def test_optimizer_source_mapping_mismatch_fails() -> None:
     runtime.optimizer_state_source_rank = lambda _rank: 1  # type: ignore[method-assign]
 
     _expect_value_error(
-        lambda: load_sharded_checkpoint(runtime, checkpoint_dir),
+        lambda: load_sharded_checkpoint(runtime.state_manager, checkpoint_dir),
         "optimizer source mapping mismatch",
     )
 
@@ -97,7 +97,7 @@ def test_duplicate_artifact_fails() -> None:
     _write_manifest(checkpoint_dir, manifest)
 
     _expect_value_error(
-        lambda: load_sharded_checkpoint(_build_core(), checkpoint_dir),
+        lambda: load_sharded_checkpoint(_build_core().state_manager, checkpoint_dir),
         "duplicate artifact",
     )
 
@@ -109,7 +109,7 @@ def test_eval_only_manifest_load_succeeds() -> None:
     _write_manifest(checkpoint_dir, manifest)
 
     restored_core = _build_core()
-    load_sharded_checkpoint(restored_core, checkpoint_dir)
+    load_sharded_checkpoint(restored_core.state_manager, checkpoint_dir)
     if restored_core.state.step != saved_core.state.step:
         raise AssertionError(
             f"expected restored step={saved_core.state.step}, got {restored_core.state.step}"
@@ -123,10 +123,10 @@ def test_microbatch_idx_roundtrip_succeeds() -> None:
     core.run_train_step(batch)
     if core.state.microbatch_idx != 1:
         raise AssertionError(f"expected saved microbatch_idx=1, got {core.state.microbatch_idx}")
-    save_sharded_checkpoint(core, checkpoint_dir)
+    save_sharded_checkpoint(core.state_manager, checkpoint_dir)
 
     restored_core = _build_core(grad_accum_steps=2)
-    load_sharded_checkpoint(restored_core, checkpoint_dir)
+    load_sharded_checkpoint(restored_core.state_manager, checkpoint_dir)
     if restored_core.state.step != core.state.step:
         raise AssertionError(f"expected restored step={core.state.step}, got {restored_core.state.step}")
     if restored_core.state.microbatch_idx != core.state.microbatch_idx:

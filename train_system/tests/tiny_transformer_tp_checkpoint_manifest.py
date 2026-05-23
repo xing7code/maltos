@@ -58,7 +58,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         plugins=[TensorParallelPlugin()],
     )
     core.setup()
-    save_sharded_checkpoint(core, args.checkpoint_dir)
+    save_sharded_checkpoint(core.state_manager, args.checkpoint_dir)
 
     if rank == 0:
         with open(os.path.join(args.checkpoint_dir, "manifest.json"), encoding="utf-8") as f:

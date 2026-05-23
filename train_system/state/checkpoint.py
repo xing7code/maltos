@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -11,11 +11,9 @@ from train_system.state.state import (
     OptimizerState,
     ParamState,
     RngState,
+    StateManager,
     TrainerState,
 )
-
-if TYPE_CHECKING:
-    from train_system.runtime.core import RuntimeCore
 
 
 @dataclass(frozen=True)
@@ -41,14 +39,15 @@ class CheckpointArtifact:
     source_rank: int | None = None
 
 
-def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
+def save_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> None:
+    runtime = state_manager.runtime
     checkpoint_dir = Path(path)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    model_state, rank_entries = runtime.state_manager.export_model_state()
-    optimizer_state = runtime.state_manager.export_optimizer_state()
+    model_state, rank_entries = state_manager.export_model_state()
+    optimizer_state = state_manager.export_optimizer_state()
     optim_state = optimizer_state.state if optimizer_state is not None else None
     model_path = checkpoint_dir / f"model_rank_{rank}.pt"
     torch.save(model_state, model_path)
@@ -69,7 +68,7 @@ def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
             )
         )
     trainer_path = checkpoint_dir / f"trainer_rank_{rank}.pt"
-    torch.save(asdict(runtime.state_manager.export_trainer_state()), trainer_path)
+    torch.save(asdict(state_manager.export_trainer_state()), trainer_path)
     local_artifacts.append(asdict(CheckpointArtifact(kind="trainer", rank=rank, path=trainer_path.name)))
 
     gathered_metadata: list[list[dict] | None] = [None for _ in range(world_size)]
@@ -107,7 +106,8 @@ def save_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
         dist.barrier()
 
 
-def load_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
+def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> None:
+    runtime = state_manager.runtime
     checkpoint_dir = Path(path)
     rank = dist.get_rank() if dist.is_initialized() else 0
     manifest = _load_manifest(checkpoint_dir)
@@ -130,11 +130,11 @@ def load_sharded_checkpoint(runtime: "RuntimeCore", path: str | Path) -> None:
         if optimizer_artifact is not None
         else None
     )
-    runtime.state_manager.import_model_state(model_state)
+    state_manager.import_model_state(model_state)
     if optim_state is not None:
-        runtime.state_manager.import_optimizer_state(OptimizerState(state=optim_state))
+        state_manager.import_optimizer_state(OptimizerState(state=optim_state))
     if trainer_state is not None:
-        runtime.state_manager.import_trainer_state(
+        state_manager.import_trainer_state(
             TrainerState(
                 step=int(trainer_state.get("step", 0)),
                 microbatch_idx=int(trainer_state.get("microbatch_idx", 0)),
@@ -199,7 +199,7 @@ def _find_artifact(
     return None
 
 
-def _validate_manifest_for_runtime(manifest: CheckpointManifest, runtime: "RuntimeCore") -> None:
+def _validate_manifest_for_runtime(manifest: CheckpointManifest, runtime) -> None:
     runtime_world_size = dist.get_world_size() if dist.is_initialized() else 1
     runtime_rank = dist.get_rank() if dist.is_initialized() else 0
     if manifest.world_size != runtime_world_size:

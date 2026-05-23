@@ -192,10 +192,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     second_local = _local_tokens(second_tokens, dp_idx, args.dp_size)
 
     continuous_core.run_train_step((first_local, first_local.clone()))
-    save_sharded_checkpoint(continuous_core, args.checkpoint_dir)
+    save_sharded_checkpoint(continuous_core.state_manager, args.checkpoint_dir)
     continuous_second_loss = continuous_core.run_train_step((second_local, second_local.clone()))
 
-    load_sharded_checkpoint(restored_core, args.checkpoint_dir)
+    load_sharded_checkpoint(restored_core.state_manager, args.checkpoint_dir)
     restored_second_loss = restored_core.run_train_step((second_local, second_local.clone()))
 
     dp_group = continuous_core.get_group(MeshAxis.DP)

@@ -60,15 +60,13 @@ def main() -> None:
     continuous_model = _build_model(args.seed, args.hidden_size)
     continuous_core = _build_core(continuous_model)
     continuous_core.run_train_step(first_batch)
-    continuous_core.state.metadata["consumed_tokens"] = args.batch_size * args.hidden_size
-    continuous_core.state.metadata["dataloader"] = {"cursor": args.batch_size}
-    save_sharded_checkpoint(continuous_core, checkpoint_dir)
+    save_sharded_checkpoint(continuous_core.state_manager, checkpoint_dir)
     second_batch = torch.randn(args.batch_size, args.hidden_size)
     continuous_core.run_train_step(second_batch)
 
     restored_model = _build_model(args.seed, args.hidden_size)
     restored_core = _build_core(restored_model)
-    load_sharded_checkpoint(restored_core, checkpoint_dir)
+    load_sharded_checkpoint(restored_core.state_manager, checkpoint_dir)
     restored_second_batch = torch.randn(args.batch_size, args.hidden_size)
     restored_core.run_train_step(restored_second_batch)
 
@@ -90,10 +88,6 @@ def main() -> None:
         raise AssertionError("Runtime RNG checkpoint resume failed")
     if restored_core.state.step != 2:
         raise AssertionError(f"Runtime step restore failed: step={restored_core.state.step}")
-    if restored_core.state.metadata.get("consumed_tokens") != args.batch_size * args.hidden_size:
-        raise AssertionError("Runtime consumed_tokens restore failed")
-    if restored_core.state.metadata.get("dataloader") != {"cursor": args.batch_size}:
-        raise AssertionError("Runtime dataloader metadata restore failed")
     print("PASS")
 
 

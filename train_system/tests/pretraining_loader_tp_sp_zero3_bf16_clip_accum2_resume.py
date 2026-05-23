@@ -1,16 +1,17 @@
-"""Mid-step resume test for TP+SP+ZeRO3+bf16+grad-clip with grad accumulation."""
+"""Resume test for pretraining loader + TP/SP + ZeRO3 + bf16 + grad clip + accumulation."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import tempfile
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from train_system.data import PretrainingDataLoader, TokenShardDataset
 from train_system.examples import TinyTransformer, TinyTransformerTpSp
 from train_system.parallel import ParallelPlan
 from train_system.parallel.specs import TpSpShardAxis
@@ -45,9 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dp-size", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=2)
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
-    parser.add_argument("--master-port", type=int, default=29539)
+    parser.add_argument("--master-port", type=int, default=29540)
     parser.add_argument("--backend", type=str, default="gloo")
-    parser.add_argument("--global-batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
@@ -68,17 +68,32 @@ def _supports_bf16_autocast() -> bool:
         return False
 
 
-def _build_reference(seed: int, batch_size: int, seq_len: int) -> tuple[TinyTransformer, torch.Tensor, torch.Tensor]:
+def _build_reference(seed: int) -> TinyTransformer:
     torch.manual_seed(seed)
-    tokens_a = torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len))
-    tokens_b = torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len))
-    model = TinyTransformer(**_MODEL_KWARGS)
-    return model, tokens_a, tokens_b
+    return TinyTransformer(**_MODEL_KWARGS)
 
 
-def _local_tokens(full_tokens: torch.Tensor, dp_idx: int, dp_size: int) -> torch.Tensor:
-    local_batch_size = full_tokens.size(0) // dp_size
-    return full_tokens.narrow(0, dp_idx * local_batch_size, local_batch_size).contiguous()
+def _build_loader(seq_len: int, dp_idx: int, dp_size: int, seed: int) -> PretrainingDataLoader:
+    testdata_dir = Path(__file__).parent / "testdata"
+    dataset = TokenShardDataset(
+        [
+            testdata_dir / "tokens_00000.bin",
+            testdata_dir / "tokens_00001.bin",
+        ]
+    )
+    return PretrainingDataLoader(
+        dataset,
+        seq_len=seq_len,
+        micro_batch_size=1,
+        dp_rank=dp_idx,
+        dp_world_size=dp_size,
+        seed=seed,
+    )
+
+
+def _batch_tuple(batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    input_ids = batch["input_ids"]
+    return input_ids, input_ids.clone()
 
 
 def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[torch.Tensor]:
@@ -170,9 +185,6 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     )
     if args.world_size != args.dp_size * args.tp_size:
         raise ValueError("world size must equal dp_size * tp_size")
-    if args.global_batch_size % args.dp_size != 0:
-        raise ValueError("global batch size must be divisible by dp size")
-
     if not _supports_bf16_autocast():
         if rank == 0:
             print("SKIP: bf16 autocast is not supported on this runtime")
@@ -180,89 +192,58 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         return
 
     dp_idx, _ = _mesh_indices(rank, args.tp_size)
-    baseline_model, tokens_a, tokens_b = _build_reference(args.seed, args.global_batch_size, args.seq_len)
+    baseline_model = _build_reference(args.seed)
 
     continuous_model = TinyTransformerTpSp(**_MODEL_KWARGS)
     continuous_model.load_state_dict(baseline_model.state_dict())
     continuous_core, continuous_zero3 = _build_runtime(continuous_model, args.dp_size, args.tp_size)
+    continuous_loader = _build_loader(args.seq_len, dp_idx, args.dp_size, args.seed)
+    continuous_core.state_manager.bind_dataloader(continuous_loader)
 
     restored_model = TinyTransformerTpSp(**_MODEL_KWARGS)
     restored_model.load_state_dict(baseline_model.state_dict())
     restored_core, restored_zero3 = _build_runtime(restored_model, args.dp_size, args.tp_size)
+    restored_loader = _build_loader(args.seq_len, dp_idx, args.dp_size, args.seed)
+    restored_core.state_manager.bind_dataloader(restored_loader)
 
-    local_a = _local_tokens(tokens_a, dp_idx, args.dp_size)
-    local_b = _local_tokens(tokens_b, dp_idx, args.dp_size)
-    if local_a.size(0) != 2 or local_b.size(0) != 2:
-        raise ValueError("this test expects local batch size == grad_accum_steps == 2")
-
-    # Continuous path: run first microbatch, save mid-step, then finish two full optimizer steps.
-    loss_a0_cont = continuous_core.run_train_step((local_a[0:1], local_a[0:1].clone())).detach()
+    first_batch = continuous_loader.next_batch()
+    loss0_cont = continuous_core.run_train_step(_batch_tuple(first_batch)).detach()
     if continuous_core.state.step != 0 or continuous_core.state.microbatch_idx != 1:
         raise AssertionError("continuous core must be at mid-step state before checkpoint")
-    if continuous_core.state.metadata.get("should_step_optimizer") is not False:
-        raise AssertionError("continuous core first microbatch should not step optimizer")
+    saved_loader_state = continuous_loader.state_dict()
     save_sharded_checkpoint(continuous_core.state_manager, args.checkpoint_dir)
-    if rank == 0:
-        with open(os.path.join(args.checkpoint_dir, "manifest.json"), "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-        if manifest.get("version") != 1:
-            raise AssertionError(f"unexpected manifest version: {manifest.get('version')}")
-        artifacts = manifest.get("artifacts", [])
-        optimizer_sources = manifest.get("optimizer_source_ranks", [])
-        if len(optimizer_sources) != args.world_size:
-            raise AssertionError("manifest optimizer_source_ranks length mismatch")
-        model_ranks = {item["rank"] for item in artifacts if item.get("kind") == "model"}
-        trainer_ranks = {item["rank"] for item in artifacts if item.get("kind") == "trainer"}
-        optimizer_ranks = {item["rank"] for item in artifacts if item.get("kind") == "optimizer"}
-        expected_ranks = set(range(args.world_size))
-        if model_ranks != expected_ranks:
-            raise AssertionError("manifest model artifacts are incomplete")
-        if trainer_ranks != expected_ranks:
-            raise AssertionError("manifest trainer artifacts are incomplete")
-        for source_rank in optimizer_sources:
-            if source_rank not in optimizer_ranks:
-                raise AssertionError(f"manifest missing optimizer artifact for source rank={source_rank}")
     if dist.is_initialized():
         dist.barrier()
-    loss_a1_cont = continuous_core.run_train_step((local_a[1:2], local_a[1:2].clone())).detach()
-    if continuous_core.state.step != 1 or continuous_core.state.microbatch_idx != 0:
-        raise AssertionError("continuous core must step after second microbatch")
-    loss_b0_cont = continuous_core.run_train_step((local_b[0:1], local_b[0:1].clone())).detach()
-    loss_b1_cont = continuous_core.run_train_step((local_b[1:2], local_b[1:2].clone())).detach()
 
-    # Restored path: load mid-step and run the same remaining microbatch sequence.
+    loss_pairs = []
+    for tag in ("A1", "B0", "B1"):
+        batch = continuous_loader.next_batch()
+        cont_loss = continuous_core.run_train_step(_batch_tuple(batch)).detach()
+        loss_pairs.append((tag, cont_loss, batch["input_ids"].detach().clone()))
+
     load_sharded_checkpoint(restored_core.state_manager, args.checkpoint_dir)
     if restored_core.state.step != 0 or restored_core.state.microbatch_idx != 1:
-        raise AssertionError("restored core must recover mid-step state (step=0, microbatch_idx=1)")
-    # Boundary: resume at accum boundary (idx=1 for accum=2) must step immediately.
-    loss_a1_res = restored_core.run_train_step((local_a[1:2], local_a[1:2].clone())).detach()
-    if restored_core.state.metadata.get("should_step_optimizer") is not True:
-        raise AssertionError("restored core boundary microbatch should step optimizer")
-    if restored_core.state.step != 1 or restored_core.state.microbatch_idx != 0:
-        raise AssertionError("restored core must step on first microbatch after resume")
-    # Non-boundary microbatch must not step.
-    loss_b0_res = restored_core.run_train_step((local_b[0:1], local_b[0:1].clone())).detach()
-    if restored_core.state.metadata.get("should_step_optimizer") is not False:
-        raise AssertionError("restored core non-boundary microbatch should not step optimizer")
-    loss_b1_res = restored_core.run_train_step((local_b[1:2], local_b[1:2].clone())).detach()
-    if restored_core.state.metadata.get("should_step_optimizer") is not True:
-        raise AssertionError("restored core boundary microbatch should step optimizer")
+        raise AssertionError("restored core must recover mid-step state")
+    if restored_loader.state_dict() != saved_loader_state:
+        raise AssertionError("restored dataloader did not recover saved cursor")
+
+    restored_loss_pairs = []
+    for tag in ("A1", "B0", "B1"):
+        batch = restored_loader.next_batch()
+        restored_loss = restored_core.run_train_step(_batch_tuple(batch)).detach()
+        restored_loss_pairs.append((tag, restored_loss, batch["input_ids"].detach().clone()))
 
     dp_group = continuous_core.get_group(MeshAxis.DP)
-    # Compare losses only on common suffix after checkpoint.
-    loss_pairs = [
-        ("A1", loss_a1_cont, loss_a1_res),
-        ("B0", loss_b0_cont, loss_b0_res),
-        ("B1", loss_b1_cont, loss_b1_res),
-    ]
     reduced_loss_diffs: list[tuple[str, float]] = []
-    for tag, lhs, rhs in loss_pairs:
-        lhs_v = lhs.clone()
-        rhs_v = rhs.clone()
+    batch_diffs: list[tuple[str, float]] = []
+    for (tag, cont_loss, cont_batch), (_, restored_loss, restored_batch) in zip(loss_pairs, restored_loss_pairs):
+        lhs_v = cont_loss.clone()
+        rhs_v = restored_loss.clone()
         if dp_group is not None:
             dist.all_reduce(lhs_v, op=dist.ReduceOp.AVG, group=dp_group)
             dist.all_reduce(rhs_v, op=dist.ReduceOp.AVG, group=dp_group)
         reduced_loss_diffs.append((tag, abs(lhs_v.item() - rhs_v.item())))
+        batch_diffs.append((tag, (cont_batch - restored_batch).abs().max().item()))
 
     continuous_zero3.materialize_model()
     restored_zero3.materialize_model()
@@ -274,21 +255,19 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     if rank == 0:
         worst_loss_tag, worst_loss_diff = max(reduced_loss_diffs, key=lambda item: item[1])
+        worst_batch_tag, worst_batch_diff = max(batch_diffs, key=lambda item: item[1])
         print(f"Checkpoint dir      : {args.checkpoint_dir}")
-        print(f"Mid-step resume loss: {worst_loss_diff:.2e}  ({worst_loss_tag}, atol={_LOSS_ATOL:.2e})")
-        print(f"Mid-step resume param diff: {param_diff:.2e}  ({param_name}, atol={_STEP_ATOL:.2e})")
+        print(f"Loader batch diff   : {worst_batch_diff:.2e}  ({worst_batch_tag})")
+        print(f"Resume loss diff    : {worst_loss_diff:.2e}  ({worst_loss_tag}, atol={_LOSS_ATOL:.2e})")
+        print(f"Resume param diff   : {param_diff:.2e}  ({param_name}, atol={_STEP_ATOL:.2e})")
+        if worst_batch_diff > 0.0:
+            raise AssertionError(f"pretraining dataloader resume mismatch: tag={worst_batch_tag}, diff={worst_batch_diff}")
         if worst_loss_diff > _LOSS_ATOL:
-            raise AssertionError(f"mid-step resume loss mismatch: tag={worst_loss_tag}, diff={worst_loss_diff:.2e}")
+            raise AssertionError(f"loss mismatch after resume: tag={worst_loss_tag}, diff={worst_loss_diff:.2e}")
         if param_diff > _STEP_ATOL:
-            raise AssertionError(f"mid-step resume param mismatch: {param_name} diff={param_diff:.2e}")
-        if continuous_core.state.metadata.get("loss_scale") is not None:
-            raise AssertionError("bf16 path should keep loss_scale=None")
-        if restored_core.state.metadata.get("loss_scale") is not None:
-            raise AssertionError("bf16 resume path should keep loss_scale=None")
-        if continuous_core.state.metadata.get("overflow") is not False:
-            raise AssertionError("bf16 path should keep overflow=False")
-        if restored_core.state.metadata.get("overflow") is not False:
-            raise AssertionError("bf16 resume path should keep overflow=False")
+            raise AssertionError(f"param mismatch after resume: {param_name} diff={param_diff:.2e}")
+        if loss0_cont.numel() != 1:
+            raise AssertionError("first loss should be scalar")
         print("PASS")
 
     continuous_zero3.reshard_model()
@@ -300,7 +279,7 @@ def main() -> None:
     args = parse_args()
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     if args.checkpoint_dir is None:
-        args.checkpoint_dir = tempfile.mkdtemp(prefix="tp_sp_zero3_bf16_clip_accum2_midstep_resume_")
+        args.checkpoint_dir = tempfile.mkdtemp(prefix="pretrain_tp_sp_zero3_bf16_clip_accum2_resume_")
     mp.spawn(_run_worker, args=(args,), nprocs=args.world_size, join=True)
 
 
