@@ -23,6 +23,13 @@ class GradClipPlugin(RuntimePlugin):
         if scaler is not None:
             scaler.unscale_(optimizer)
 
-        norm = torch.nn.utils.clip_grad_norm_(self.runtime.model.parameters(), self.max_norm)
+        grad_params = []
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                if param is not None and param.grad is not None:
+                    grad_params.append(param)
+        if not grad_params:
+            return
+        norm = torch.nn.utils.clip_grad_norm_(grad_params, self.max_norm)
         if self.record_grad_norm:
             self.runtime.state.metadata["grad_norm"] = float(norm.item())

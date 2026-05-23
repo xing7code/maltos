@@ -30,7 +30,11 @@ class PrecisionPlugin(RuntimePlugin):
         compute_dtype: torch.dtype | None = None,
         use_grad_scaler: bool = True,
     ) -> None:
-        super().__init__(id=PluginId.PRECISION, name="precision")
+        super().__init__(
+            id=PluginId.PRECISION,
+            name="precision",
+            runs_after={PluginId.TP, PluginId.SP, PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3},
+        )
         self.compute_dtype = compute_dtype
         self.use_grad_scaler = use_grad_scaler
 

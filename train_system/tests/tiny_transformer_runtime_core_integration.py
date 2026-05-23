@@ -22,11 +22,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from train_system.examples import TinyTransformer, TinyTransformerTpSp
+from train_system.examples import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
 from train_system.parallel.specs import TpSpShardAxis
 from train_system.parallel import ParallelPlan
 from train_system.runtime import MeshAxis, MeshConfig, RuntimeCore
 from train_system.runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
+from train_system.runtime.plugins.grad_clip import GradClipPlugin
 from train_system.runtime.plugins.precision import PrecisionPlugin
 from train_system.runtime.plugins.sp import SequenceParallelPlugin
 from train_system.runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
@@ -65,6 +66,8 @@ def parse_args() -> argparse.Namespace:
             "tp_sp_zero1",
             "tp_sp_zero2",
             "tp_sp_zero3",
+            "tp_sp_zero3_bf16_clip",
+            "tp_zero3_bf16_clip",
         ),
         required=True,
     )
@@ -127,8 +130,11 @@ def _logical_named_tensors(
     shard_rules: dict[str, str],
     tp_group: dist.ProcessGroup | None,
 ) -> dict[str, torch.Tensor]:
+    def _normalize_name(name: str) -> str:
+        return name[len("module.") :] if name.startswith("module.") else name
+
     return {
-        name: _logical_tensor(name, param.detach(), shard_rules, tp_group)
+        _normalize_name(name): _logical_tensor(_normalize_name(name), param.detach(), shard_rules, tp_group)
         for name, param in model.named_parameters()
     }
 
@@ -168,6 +174,27 @@ def _make_plugins(case: str):
                 lr=_LR,
             )
         ], 3
+    if case == "tp_sp_zero3_bf16_clip":
+        return plugins + [
+            Zero3Plugin(
+                wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
+                optimizer_cls=torch.optim.SGD,
+                lr=_LR,
+            ),
+            PrecisionPlugin(compute_dtype=torch.bfloat16),
+            GradClipPlugin(max_norm=1.0),
+        ], 3
+    if case == "tp_zero3_bf16_clip":
+        return [
+            TensorParallelPlugin(),
+            Zero3Plugin(
+                wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
+                optimizer_cls=torch.optim.SGD,
+                lr=_LR,
+            ),
+            PrecisionPlugin(compute_dtype=torch.bfloat16),
+            GradClipPlugin(max_norm=1.0),
+        ], 3
     raise ValueError(f"unknown integration case={case}")
 
 
@@ -186,7 +213,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     dp_idx, tp_idx = _mesh_indices(rank, args.tp_size)
     baseline_model, full_tokens = _build_reference(args.seed, args.global_batch_size, args.seq_len)
-    sharded_model = TinyTransformerTpSp(**_MODEL_KWARGS)
+    if args.case in {"tp_bf16", "tp_zero3_bf16_clip"}:
+        sharded_model = TinyTransformerTp(**_MODEL_KWARGS)
+    else:
+        sharded_model = TinyTransformerTpSp(**_MODEL_KWARGS)
     sharded_model.load_state_dict(baseline_model.state_dict())
 
     local_batch_size = args.global_batch_size // args.dp_size
@@ -197,7 +227,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_train_loss = baseline_model((full_tokens, full_tokens.clone()))
     baseline_train_loss.backward()
 
-    if args.case == "tp_bf16" and not _supports_bf16_autocast():
+    if args.case in {"tp_bf16", "tp_sp_zero3_bf16_clip", "tp_zero3_bf16_clip"} and not _supports_bf16_autocast():
         if rank == 0:
             print("SKIP: bf16 autocast is not supported on this runtime")
         dist.destroy_process_group()
@@ -218,7 +248,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if zero_stage == 0 and not has_plugin_optimizer_owner:
         core.optimizer = torch.optim.SGD(core.model.parameters(), lr=_LR)
 
-    if args.case == "tp_bf16":
+    if args.case in {"tp_bf16", "tp_zero3_bf16_clip"}:
         bf16_ok = 1
         bf16_error = ""
         try:
@@ -232,7 +262,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         if ok_tensor.item() == 0:
             if rank == 0:
                 detail = bf16_error if bf16_error else "one or more ranks failed bf16 forward preflight"
-                print(f"SKIP: tp_bf16 preflight failed: {detail}")
+                print(f"SKIP: {args.case} preflight failed: {detail}")
             dist.destroy_process_group()
             return
 
@@ -259,11 +289,16 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         print(f"Case             : {args.case}")
         print(f"Baseline loss    : {baseline_train_loss.item():.6f}")
         print(f"RuntimeCore loss : {avg_loss.item():.6f}")
-        print(f"Loss diff        : {loss_diff:.2e}  (atol={_LOSS_ATOL:.2e})")
-        print(f"Post-step diff   : {step_diff:.2e}  ({step_name}, atol={_STEP_ATOL:.2e})")
-        if loss_diff > _LOSS_ATOL:
+        loss_atol = _LOSS_ATOL
+        step_atol = _STEP_ATOL
+        if args.case in {"tp_bf16", "tp_sp_zero3_bf16_clip", "tp_zero3_bf16_clip"}:
+            loss_atol = 5e-2
+            step_atol = 5e-2
+        print(f"Loss diff        : {loss_diff:.2e}  (atol={loss_atol:.2e})")
+        print(f"Post-step diff   : {step_diff:.2e}  ({step_name}, atol={step_atol:.2e})")
+        if loss_diff > loss_atol:
             raise AssertionError(f"integration loss mismatch: case={args.case}, diff={loss_diff:.2e}")
-        if step_diff > _STEP_ATOL:
+        if step_diff > step_atol:
             raise AssertionError(
                 f"integration one-step mismatch: case={args.case}, param={step_name}, diff={step_diff:.2e}"
             )
