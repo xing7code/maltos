@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
+export PYTHONPATH="${PYTHONPATH:-.}"
+
+echo "=== compileall ==="
+"${PYTHON_BIN}" -m compileall train_system
+
+echo "=== smoke/runtime core ==="
+"${PYTHON_BIN}" train_system/tests/smoke_runtime_core.py
+
+echo "=== checkpoint manifest validation ==="
+"${PYTHON_BIN}" train_system/tests/checkpoint_manifest_validation.py
+
+echo "=== runtime optimizer checkpoint resume ==="
+"${PYTHON_BIN}" train_system/tests/tiny_model_runtime_optimizer_checkpoint_resume.py
+
+echo "=== zero3 checkpoint resume ==="
+"${PYTHON_BIN}" train_system/tests/tiny_model_zero3_checkpoint_resume.py
+
+echo "=== zero3 checkpoint roundtrip ==="
+"${PYTHON_BIN}" train_system/tests/tiny_model_zero3_checkpoint_roundtrip.py
+
+echo "=== tp checkpoint manifest ==="
+"${PYTHON_BIN}" train_system/tests/tiny_transformer_tp_checkpoint_manifest.py
+
+echo "=== tiny transformer integration matrix ==="
+for c in tp_sp tp_sp_ddp_sync tp_sp_ddp_async tp_sp_ddp_bucket tp_sp_zero1 tp_sp_zero2 tp_sp_zero3; do
+  echo "--- case: ${c} ---"
+  "${PYTHON_BIN}" train_system/tests/tiny_transformer_runtime_core_integration.py --case "${c}"
+done
+
+echo "=== tp+sp+zero3+bf16+clip checkpoint resume ==="
+"${PYTHON_BIN}" train_system/tests/tiny_transformer_tp_sp_zero3_bf16_clip_checkpoint_resume.py
+
+echo "=== matrix PASS ==="
+
