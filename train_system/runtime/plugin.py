@@ -14,6 +14,9 @@ if TYPE_CHECKING:
     from train_system.runtime.core import RuntimeCore, RuntimePhase
 
 
+MetricValue = float | int | str | bool | None
+
+
 @runtime_checkable
 class ParallelizableModule(Protocol):
     def parallelize_spec(self) -> TpSpParallelSpec: ...
@@ -85,3 +88,6 @@ class RuntimePlugin:
 
     def import_plugin_state(self, state: dict[str, object]) -> None:
         pass
+
+    def collect_metrics(self) -> dict[str, MetricValue]:
+        return {}

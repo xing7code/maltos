@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from train_system.runtime.core import RuntimePhase
-from train_system.runtime.plugin import PluginId, RuntimePlugin
+from train_system.runtime.plugin import MetricValue, PluginId, RuntimePlugin
 
 
 class GradClipPlugin(RuntimePlugin):
@@ -33,3 +33,11 @@ class GradClipPlugin(RuntimePlugin):
         norm = torch.nn.utils.clip_grad_norm_(grad_params, self.max_norm)
         if self.record_grad_norm:
             self.runtime.state.metadata["grad_norm"] = float(norm.item())
+
+    def collect_metrics(self) -> dict[str, MetricValue]:
+        if self.runtime is None or not self.record_grad_norm:
+            return {}
+        grad_norm = self.runtime.state.metadata.get("grad_norm")
+        if grad_norm is None:
+            return {}
+        return {"grad_norm": float(grad_norm), "max_norm": float(self.max_norm)}

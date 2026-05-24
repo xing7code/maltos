@@ -11,7 +11,7 @@ import torch.distributed as dist
 
 from train_system.parallel.plan import ParallelPlan
 from train_system.runtime.mesh import MeshAxis, MeshConfig, ProcessGroupManager
-from train_system.runtime.plugin import RuntimePlugin
+from train_system.runtime.plugin import MetricValue, RuntimePlugin
 from train_system.state.state import StateManager
 
 
@@ -142,6 +142,30 @@ class RuntimeCore:
         if scheduler is not None:
             scheduler.step()
         optimizer.zero_grad(set_to_none=True)
+
+    def collect_metrics(self) -> dict[str, MetricValue]:
+        metrics: dict[str, MetricValue] = {
+            "step": self.state.step,
+            "microbatch_idx": self.state.microbatch_idx,
+            "grad_accum_steps": self.grad_accum_steps,
+            "should_step_optimizer": bool(self.state.metadata.get("should_step_optimizer", True)),
+        }
+        if self.state.loss is not None:
+            metrics["loss"] = float(self.state.loss.detach().float().item())
+
+        optimizer, scheduler = self.get_optimizer_and_scheduler()
+        if optimizer is not None and optimizer.param_groups:
+            metrics["lr"] = float(optimizer.param_groups[0]["lr"])
+        if scheduler is not None:
+            metrics["scheduler_last_epoch"] = int(scheduler.last_epoch)
+
+        for plugin in self.plugins:
+            for key, value in plugin.collect_metrics().items():
+                metric_key = key if "/" in key else f"{plugin.id.value}/{key}"
+                if metric_key in metrics:
+                    raise ValueError(f"duplicate metric key={metric_key}")
+                metrics[metric_key] = value
+        return metrics
 
     def should_save_optimizer(self, rank_id: int) -> bool:
         return self.optimizer_state_source_rank(rank_id) == rank_id

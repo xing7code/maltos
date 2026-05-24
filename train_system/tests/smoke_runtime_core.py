@@ -70,6 +70,14 @@ class PluginStateEcho(RuntimePlugin):
             self.value = value
 
 
+class MetricsPlugin(RuntimePlugin):
+    def __init__(self) -> None:
+        super().__init__(id=PluginId.PROFILER, name="metrics_plugin")
+
+    def collect_metrics(self) -> dict[str, float | int | str | bool | None]:
+        return {"tokens_per_sec": 12.5, "enabled": True}
+
+
 def test_plugin_ordering() -> None:
     events: list[str] = []
     plugins = [
@@ -245,6 +253,30 @@ def test_precision_plugin_metrics_and_clip() -> None:
     assert isinstance(core.state.metadata["overflow"], bool)
     assert core.state.metadata["overflow"] is False
     assert core.state.metadata["loss_scale"] is None
+    metrics = core.collect_metrics()
+    assert metrics["step"] == 1
+    assert metrics["loss"] == float(core.state.loss.detach().float().item())
+    assert metrics["lr"] == 0.01
+    assert metrics["precision/loss_scale"] is None
+    assert metrics["precision/overflow"] is False
+    assert "grad_clip/grad_norm" in metrics
+    assert metrics["grad_clip/max_norm"] == 1.0
+
+
+def test_runtime_collects_plugin_metrics() -> None:
+    model = LossModel()
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        plugins=[MetricsPlugin()],
+    )
+    core.setup()
+    core.run_train_step(torch.ones(2, 4))
+    metrics = core.collect_metrics()
+    assert metrics["profiler/tokens_per_sec"] == 12.5
+    assert metrics["profiler/enabled"] is True
 
 
 def test_precision_plugin_fp16_requires_cuda() -> None:
@@ -350,6 +382,7 @@ def main() -> None:
     test_runtime_core_requires_optimizer_owner()
     test_runtime_optimizer_checkpoint_policy()
     test_precision_plugin_metrics_and_clip()
+    test_runtime_collects_plugin_metrics()
     test_precision_plugin_fp16_requires_cuda()
     test_trainer_state_plugin_states_roundtrip()
     test_grad_accumulation_runtime_step_cadence()

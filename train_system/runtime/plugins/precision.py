@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from train_system.runtime.core import RuntimePhase
-from train_system.runtime.plugin import PluginId, RuntimePlugin
+from train_system.runtime.plugin import MetricValue, PluginId, RuntimePlugin
 
 if TYPE_CHECKING:
     from train_system.runtime.core import RuntimeCore
@@ -83,6 +83,15 @@ class PrecisionPlugin(RuntimePlugin):
         scaler_state = state.get("scaler")
         if isinstance(scaler_state, dict):
             self.runtime.state.scaler.load_state_dict(scaler_state)
+
+    def collect_metrics(self) -> dict[str, MetricValue]:
+        if self.runtime is None:
+            return {}
+        return {
+            "compute_dtype": None if self.compute_dtype is None else str(self.compute_dtype),
+            "loss_scale": self.runtime.state.metadata.get("loss_scale"),
+            "overflow": bool(self.runtime.state.metadata.get("overflow", False)),
+        }
 
 
 def _validate_compute_dtype(compute_dtype: torch.dtype) -> None:
