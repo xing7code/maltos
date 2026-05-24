@@ -8,7 +8,7 @@ import torch.distributed as dist
 from train_system.data.protocols import StatefulDataLoaderProtocol
 from train_system.runtime.core import RuntimeCore
 from train_system.state.checkpoint import load_sharded_checkpoint, save_sharded_checkpoint
-from train_system.utils.metrics import MetricLogger
+from train_system.utils.metrics import MetricAggregator, MetricLogger
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,7 @@ class Trainer:
         dataloader: StatefulDataLoaderProtocol,
         config: TrainerConfig,
         logger: MetricLogger | None = None,
+        metric_aggregator: MetricAggregator | None = None,
     ) -> None:
         if config.max_steps < 0:
             raise ValueError(f"max_steps must be >= 0, got {config.max_steps}")
@@ -41,6 +42,7 @@ class Trainer:
         self.dataloader = dataloader
         self.config = config
         self.logger = logger
+        self.metric_aggregator = metric_aggregator or MetricAggregator()
 
     def setup(self) -> None:
         self.runtime.setup()
@@ -53,20 +55,22 @@ class Trainer:
             previous_step = self.runtime.state.step
             batch = self.dataloader.next_batch()
             self.runtime.run_train_step(batch)
+            self.metric_aggregator.update(self.runtime.collect_metrics())
             if self.runtime.state.step == previous_step:
                 continue
             self._maybe_log()
             self._maybe_checkpoint()
 
     def _maybe_log(self) -> None:
-        if self.logger is None:
-            return
         step = self.runtime.state.step
         if step == 0 or step % self.config.log_every != 0:
             return
+        metrics = self.metric_aggregator.flush()
+        if self.logger is None:
+            return
         if not _is_log_rank():
             return
-        self.logger.log(self.runtime.collect_metrics())
+        self.logger.log(metrics)
 
     def _maybe_checkpoint(self) -> None:
         if self.config.checkpoint_every is None:
