@@ -191,6 +191,6 @@ def _reduce_local(values: list[MetricValue], reduction: MetricReduction) -> Metr
 
 def _add_derived_metrics(metrics: dict[str, MetricValue]) -> None:
     tokens = metrics.get("train/tokens")
-    elapsed_sec = metrics.get("perf/microbatch_sec")
+    elapsed_sec = metrics.get("perf/step_sec")
     if isinstance(tokens, (float, int)) and isinstance(elapsed_sec, (float, int)) and elapsed_sec > 0:
         metrics["train/tokens_per_sec"] = float(tokens) / float(elapsed_sec)

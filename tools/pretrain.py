@@ -83,6 +83,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     _maybe_init_distributed(args)
+    device = _select_device()
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if world_size != args.dp_size * args.tp_size:
@@ -93,6 +94,8 @@ def main() -> None:
         raise ValueError("--zero-stage > 0 requires --dp-size > 1")
 
     torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
     dp_rank = rank // args.tp_size
     model = _build_model(args)
     loader = PretrainingDataLoader(
@@ -103,7 +106,7 @@ def main() -> None:
         dp_world_size=args.dp_size,
         seed=args.seed,
     )
-    runtime = _build_runtime(args, model)
+    runtime = _build_runtime(args, model, device)
     logger = _build_logger(args, rank)
     trainer = Trainer(
         runtime=runtime,
@@ -152,9 +155,9 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
     )
 
 
-def _build_runtime(args: argparse.Namespace, model: torch.nn.Module) -> RuntimeCore:
+def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: torch.device) -> RuntimeCore:
     plugins = []
-    optimizer = None
+    optimizer_factory = None
     if args.tp_size > 1:
         plugins.append(TensorParallelPlugin())
     if args.use_sp:
@@ -162,7 +165,7 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module) -> RuntimeC
     if args.zero_stage == 0:
         if args.dp_size > 1:
             plugins.append(_build_ddp(args.ddp_mode))
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        optimizer_factory = lambda module: torch.optim.AdamW(module.parameters(), lr=args.lr)
     elif args.zero_stage == 1:
         plugins.append(Zero1Plugin(optimizer_cls=torch.optim.AdamW, lr=args.lr))
     elif args.zero_stage == 2:
@@ -186,8 +189,9 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module) -> RuntimeC
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=args.zero_stage),
+        device=device,
         model=model,
-        optimizer=optimizer,
+        optimizer_factory=optimizer_factory,
         plugins=plugins,
         grad_accum_steps=args.grad_accum_steps,
     )
@@ -247,6 +251,14 @@ def _maybe_init_distributed(args: argparse.Namespace) -> None:
     os.environ.setdefault("MASTER_PORT", args.master_port)
     backend = args.backend or ("nccl" if torch.cuda.is_available() else "gloo")
     dist.init_process_group(backend=backend)
+
+
+def _select_device() -> torch.device:
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    return torch.device("cuda", local_rank)
 
 
 if __name__ == "__main__":

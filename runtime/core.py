@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from graphlib import TopologicalSorter
@@ -13,6 +14,9 @@ from parallel.plan import ParallelPlan
 from runtime.mesh import MeshAxis, MeshConfig, ProcessGroupManager
 from runtime.plugin import MetricValue, RuntimePlugin
 from state.state import StateManager
+
+OptimizerFactory = Callable[[nn.Module], torch.optim.Optimizer]
+SchedulerFactory = Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler.LRScheduler]
 
 
 class RuntimePhase(str, Enum):
@@ -53,8 +57,11 @@ class RuntimeCore:
     model: nn.Module
     mesh: MeshConfig = field(default_factory=MeshConfig)
     plan: ParallelPlan = field(default_factory=ParallelPlan)
+    device: torch.device | str | None = None
     optimizer: torch.optim.Optimizer | None = None
+    optimizer_factory: OptimizerFactory | None = None
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+    scheduler_factory: SchedulerFactory | None = None
     plugins: list[RuntimePlugin] = field(default_factory=list)
     group_manager: ProcessGroupManager | None = None
     state_manager: StateManager = field(default_factory=StateManager)
@@ -68,9 +75,11 @@ class RuntimeCore:
         if self.group_manager is None:
             self.group_manager = ProcessGroupManager.from_mesh(self.mesh)
         self.plugins = self._resolve_plugin_order(self.plugins)
-        self._validate_optimizer_owner()
 
     def setup(self) -> None:
+        if self.device is not None:
+            self.device = torch.device(self.device)
+            self.model.to(self.device)
         self.state_manager.bind(self)
         for plugin in self.plugins:
             plugin.bind(self)
@@ -79,8 +88,12 @@ class RuntimeCore:
             self.model = plugin.transform_model(self.model)
         self.state_manager.register_module(self.model)
         self._run_phase(RuntimePhase.TRANSFORM_MODEL)
+        self._build_runtime_optimizer()
+        self._validate_optimizer_owner()
 
     def run_train_step(self, batch: Any) -> torch.Tensor:
+        if self.device is not None:
+            batch = _move_to_device(batch, torch.device(self.device))
         self.state.batch = batch
         tokens = _count_batch_tokens(batch)
         if tokens is not None:
@@ -216,18 +229,44 @@ class RuntimeCore:
         return replicated_axes, sharded_axes
 
     def _validate_optimizer_owner(self) -> None:
-        owners = ["runtime"] if self.optimizer is not None else []
+        runtime_owners = [name for name, value in {
+            "runtime_optimizer": self.optimizer,
+            "runtime_optimizer_factory": self.optimizer_factory,
+        }.items() if value is not None]
+        if len(runtime_owners) > 1:
+            raise ValueError(f"RuntimeCore allows only one runtime optimizer source, got {runtime_owners}")
+        if self.scheduler_factory is not None and not runtime_owners:
+            raise ValueError("scheduler_factory requires a runtime optimizer or optimizer_factory")
+
+        owners = ["runtime"] if runtime_owners else []
         plugin_owners = [plugin.id.value for plugin in self.plugins if plugin.owns_optimizer]
         if len(plugin_owners) > 1:
             raise ValueError(f"RuntimeCore allows only one optimizer-owning plugin, got {plugin_owners}")
-        if self.optimizer is not None and plugin_owners:
+        if runtime_owners and plugin_owners:
             raise ValueError(
-                "RuntimeCore.optimizer is mutually exclusive with optimizer-owning plugins, "
-                f"got {['runtime', *plugin_owners]}"
+                "Runtime optimizer ownership is mutually exclusive with optimizer-owning plugins, "
+                f"got {runtime_owners + plugin_owners}"
             )
         owners.extend(plugin_owners)
         if len(owners) != 1:
             raise ValueError(f"RuntimeCore training requires exactly one optimizer owner, got {owners}")
+
+    def _build_runtime_optimizer(self) -> None:
+        if self.optimizer_factory is None:
+            if self.scheduler_factory is not None and self.optimizer is not None:
+                if self.scheduler is not None:
+                    raise ValueError("scheduler_factory cannot be used when scheduler is already set")
+                self.scheduler = self.scheduler_factory(self.optimizer)
+            return
+        if self.optimizer is not None:
+            raise ValueError("optimizer_factory cannot be used when optimizer is already set")
+        if self.scheduler is not None:
+            raise ValueError("optimizer_factory cannot be used with a prebuilt scheduler")
+        self.optimizer = self.optimizer_factory(self.model)
+        if self.scheduler_factory is not None:
+            self.scheduler = self.scheduler_factory(self.optimizer)
+        self.optimizer_factory = None
+        self.scheduler_factory = None
 
     def _validate_mesh_and_plan(self) -> None:
         if self.plan.zero_stage > 0 and self.mesh.dp <= 1:
@@ -270,3 +309,15 @@ def _count_batch_tokens(batch: Any) -> int | None:
     if torch.is_tensor(batch):
         return int(batch.numel())
     return None
+
+
+def _move_to_device(value: Any, device: torch.device) -> Any:
+    if torch.is_tensor(value):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: _move_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_to_device(item, device) for item in value]
+    return value

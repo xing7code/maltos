@@ -16,8 +16,6 @@ from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugin import RuntimePlugin
-from runtime.plugins.zero1 import Zero1Plugin
-from runtime.plugins.zero2 import Zero2Plugin
 
 
 class LossModel(nn.Module):
@@ -78,6 +76,20 @@ class MetricsPlugin(RuntimePlugin):
         return {"tokens_per_sec": 12.5, "enabled": True}
 
 
+class OptimizerOwnerPlugin(RuntimePlugin):
+    def __init__(self, plugin_id: PluginId) -> None:
+        super().__init__(id=plugin_id, name=f"{plugin_id.value}_owner", owns_optimizer=True)
+
+
+class ReplaceLinearPlugin(RuntimePlugin):
+    def __init__(self) -> None:
+        super().__init__(id=PluginId.PROFILER, name="replace_linear")
+
+    def transform_model(self, model: nn.Module) -> nn.Module:
+        model.proj = nn.Linear(4, 1)
+        return model
+
+
 def test_plugin_ordering() -> None:
     events: list[str] = []
     plugins = [
@@ -95,6 +107,29 @@ def test_plugin_ordering() -> None:
 
     assert [plugin.id for plugin in core.plugins] == [PluginId.TP, PluginId.CHECKPOINT, PluginId.PROFILER]
     assert [plugin.name for plugin in core.plugins] == ["custom_tensor", "checkpoint", "custom_profiler"]
+
+
+def test_optimizer_factory_runs_after_model_transform() -> None:
+    captured_param_ids: list[int] = []
+
+    def build_optimizer(model: nn.Module) -> torch.optim.Optimizer:
+        captured_param_ids.extend(id(param) for param in model.parameters())
+        return torch.optim.SGD(model.parameters(), lr=0.01)
+
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=LossModel(),
+        optimizer_factory=build_optimizer,
+        plugins=[ReplaceLinearPlugin()],
+    )
+    old_param_ids = {id(param) for param in core.model.parameters()}
+    core.setup()
+    new_param_ids = {id(param) for param in core.model.parameters()}
+
+    assert old_param_ids.isdisjoint(new_param_ids)
+    assert set(captured_param_ids) == new_param_ids
+    assert {id(param) for group in core.optimizer.param_groups for param in group["params"]} == new_param_ids
 
 
 def test_missing_required_plugin_fails() -> None:
@@ -146,14 +181,15 @@ def test_train_step_phases_and_state_manager() -> None:
 def test_duplicate_optimizer_owners_fail() -> None:
     model = LossModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=model,
+        optimizer=optimizer,
+        plugins=[OptimizerOwnerPlugin(PluginId.ZERO1)],
+    )
     try:
-        RuntimeCore(
-            mesh=MeshConfig(dp=2, tp=1, pp=1, cp=1, ep=1),
-            plan=ParallelPlan(),
-            model=model,
-            optimizer=optimizer,
-            plugins=[Zero1Plugin(optimizer_cls=torch.optim.SGD, lr=0.01)],
-        )
+        core.setup()
     except ValueError as exc:
         assert "mutually exclusive" in str(exc)
     else:
@@ -161,16 +197,17 @@ def test_duplicate_optimizer_owners_fail() -> None:
 
 
 def test_multiple_optimizer_plugin_owners_fail() -> None:
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=LossModel(),
+        plugins=[
+            OptimizerOwnerPlugin(PluginId.ZERO1),
+            OptimizerOwnerPlugin(PluginId.ZERO2),
+        ],
+    )
     try:
-        RuntimeCore(
-            mesh=MeshConfig(dp=2, tp=1, pp=1, cp=1, ep=1),
-            plan=ParallelPlan(),
-            model=LossModel(),
-            plugins=[
-                Zero1Plugin(optimizer_cls=torch.optim.SGD, lr=0.01),
-                Zero2Plugin(optimizer_cls=torch.optim.SGD, lr=0.01),
-            ],
-        )
+        core.setup()
     except ValueError as exc:
         assert "only one optimizer-owning plugin" in str(exc)
     else:
@@ -178,12 +215,13 @@ def test_multiple_optimizer_plugin_owners_fail() -> None:
 
 
 def test_runtime_core_requires_optimizer_owner() -> None:
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=LossModel(),
+    )
     try:
-        RuntimeCore(
-            mesh=MeshConfig(),
-            plan=ParallelPlan(),
-            model=LossModel(),
-        )
+        core.setup()
     except ValueError as exc:
         assert "exactly one optimizer owner" in str(exc)
     else:

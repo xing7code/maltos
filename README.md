@@ -254,7 +254,7 @@ PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
   --wandb-run-name llama-50m-dp2-tp2-sp-zero3
 ```
 
-The training script logs `loss`, `lr`, `train/tokens`, `train/tokens_per_sec`, `perf/microbatch_sec`, `perf/forward_sec`, `perf/backward_sec`, `perf/optimizer_sec`, `perf/step_sec`, and CUDA memory metrics when CUDA is available. W&B is initialized only on rank 0.
+The training script logs `loss`, `lr`, `train/tokens`, `train/tokens_per_sec`, `perf/step_sec`, and CUDA memory metrics when CUDA is available. W&B is initialized only on rank 0. Fine-grained profiling is intentionally kept out of the steady-state training path.
 
 ## Checkpointing
 
