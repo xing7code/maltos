@@ -10,6 +10,9 @@ echo "=== compileall ==="
 echo "=== smoke/runtime core ==="
 "${PYTHON_BIN}" train_system/tests/smoke_runtime_core.py
 
+echo "=== smoke/trainer loop ==="
+"${PYTHON_BIN}" train_system/tests/smoke_trainer_loop.py
+
 echo "=== checkpoint manifest validation ==="
 "${PYTHON_BIN}" train_system/tests/checkpoint_manifest_validation.py
 
