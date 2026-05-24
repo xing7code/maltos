@@ -23,6 +23,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
+from helpers import causal_lm_batch
 from parallel.specs import TpSpShardAxis
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
@@ -80,7 +81,7 @@ def _build_reference(seed: int, batch_size: int, seq_len: int) -> tuple[TinyTran
 def _baseline_loss(model: TinyTransformer, tokens: torch.Tensor) -> float:
     model.eval()
     with torch.no_grad():
-        loss = model((tokens, tokens.clone()))
+        loss = model(causal_lm_batch(tokens))
     return loss.item()
 
 
@@ -174,8 +175,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_optimizer.zero_grad(set_to_none=True)
     sharded_optimizer.zero_grad(set_to_none=True)
 
-    baseline_train_loss = baseline_model((tokens, tokens.clone()))
-    sharded_train_loss = core.model((tokens, tokens.clone()))
+    baseline_train_loss = baseline_model(causal_lm_batch(tokens))
+    sharded_train_loss = core.model(causal_lm_batch(tokens))
     baseline_train_loss.backward()
     sharded_train_loss.backward()
 

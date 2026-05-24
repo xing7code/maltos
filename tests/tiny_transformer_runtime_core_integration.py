@@ -23,6 +23,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
+from helpers import causal_lm_batch
 from parallel.specs import TpSpShardAxis
 from parallel import ParallelPlan
 from runtime import MeshAxis, MeshConfig, RuntimeCore
@@ -226,7 +227,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     baseline_optimizer = torch.optim.SGD(baseline_model.parameters(), lr=_LR)
     baseline_optimizer.zero_grad(set_to_none=True)
-    baseline_train_loss = baseline_model((full_tokens, full_tokens.clone()))
+    baseline_train_loss = baseline_model(causal_lm_batch(full_tokens))
     baseline_train_loss.backward()
 
     if args.case in {"tp_bf16", "tp_sp_zero3_bf16_clip", "tp_sp_zero3_bf16_clip_accum2", "tp_zero3_bf16_clip", "tp_zero3_bf16_clip_accum2"} and not _supports_bf16_autocast():
@@ -259,7 +260,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         bf16_error = ""
         try:
             with torch.no_grad():
-                _ = core.model((local_tokens, local_tokens.clone()))
+                _ = core.model(causal_lm_batch(local_tokens))
         except Exception as exc:
             bf16_ok = 0
             bf16_error = str(exc)
@@ -273,13 +274,13 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
             return
 
     if grad_accum_steps == 1:
-        sharded_train_loss = core.run_train_step((local_tokens, local_tokens.clone()))
+        sharded_train_loss = core.run_train_step(causal_lm_batch(local_tokens))
     else:
         micro_batch_size = local_batch_size // grad_accum_steps
         sharded_train_loss = torch.zeros((), dtype=torch.float32, device=local_tokens.device)
         for micro_idx in range(grad_accum_steps):
             micro_tokens = local_tokens.narrow(0, micro_idx * micro_batch_size, micro_batch_size).contiguous()
-            sharded_train_loss = sharded_train_loss + core.run_train_step((micro_tokens, micro_tokens.clone())).detach()
+            sharded_train_loss = sharded_train_loss + core.run_train_step(causal_lm_batch(micro_tokens)).detach()
     baseline_optimizer.step()
 
     dp_group = core.get_group(MeshAxis.DP)

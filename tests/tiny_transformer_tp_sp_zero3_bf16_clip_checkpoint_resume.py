@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from models import TinyTransformer, TinyTransformerTpSp
+from helpers import causal_lm_batch
 from parallel import ParallelPlan
 from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
@@ -191,12 +192,12 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     first_local = _local_tokens(first_tokens, dp_idx, args.dp_size)
     second_local = _local_tokens(second_tokens, dp_idx, args.dp_size)
 
-    continuous_core.run_train_step((first_local, first_local.clone()))
+    continuous_core.run_train_step(causal_lm_batch(first_local))
     save_sharded_checkpoint(continuous_core.state_manager, args.checkpoint_dir)
-    continuous_second_loss = continuous_core.run_train_step((second_local, second_local.clone()))
+    continuous_second_loss = continuous_core.run_train_step(causal_lm_batch(second_local))
 
     load_sharded_checkpoint(restored_core.state_manager, args.checkpoint_dir)
-    restored_second_loss = restored_core.run_train_step((second_local, second_local.clone()))
+    restored_second_loss = restored_core.run_train_step(causal_lm_batch(second_local))
 
     dp_group = continuous_core.get_group(MeshAxis.DP)
     continuous_loss = continuous_second_loss.detach().clone()
@@ -247,4 +248,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

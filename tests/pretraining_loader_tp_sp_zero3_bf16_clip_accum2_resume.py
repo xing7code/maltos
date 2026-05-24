@@ -92,8 +92,7 @@ def _build_loader(seq_len: int, dp_idx: int, dp_size: int, seed: int) -> Pretrai
 
 
 def _batch_tuple(batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    input_ids = batch["input_ids"]
-    return input_ids, input_ids.clone()
+    return batch["input_ids"], batch["labels"]
 
 
 def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[torch.Tensor]:

@@ -12,6 +12,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from models import TinyTransformer, TinyTransformerTpSp
+from helpers import causal_lm_batch
 from parallel import ParallelPlan
 from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
@@ -196,7 +197,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         raise ValueError("this test expects local batch size == grad_accum_steps == 2")
 
     # Continuous path: run first microbatch, save mid-step, then finish two full optimizer steps.
-    loss_a0_cont = continuous_core.run_train_step((local_a[0:1], local_a[0:1].clone())).detach()
+    loss_a0_cont = continuous_core.run_train_step(causal_lm_batch(local_a[0:1])).detach()
     if continuous_core.state.step != 0 or continuous_core.state.microbatch_idx != 1:
         raise AssertionError("continuous core must be at mid-step state before checkpoint")
     if continuous_core.state.metadata.get("should_step_optimizer") is not False:
@@ -224,27 +225,27 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
                 raise AssertionError(f"manifest missing optimizer artifact for source rank={source_rank}")
     if dist.is_initialized():
         dist.barrier()
-    loss_a1_cont = continuous_core.run_train_step((local_a[1:2], local_a[1:2].clone())).detach()
+    loss_a1_cont = continuous_core.run_train_step(causal_lm_batch(local_a[1:2])).detach()
     if continuous_core.state.step != 1 or continuous_core.state.microbatch_idx != 0:
         raise AssertionError("continuous core must step after second microbatch")
-    loss_b0_cont = continuous_core.run_train_step((local_b[0:1], local_b[0:1].clone())).detach()
-    loss_b1_cont = continuous_core.run_train_step((local_b[1:2], local_b[1:2].clone())).detach()
+    loss_b0_cont = continuous_core.run_train_step(causal_lm_batch(local_b[0:1])).detach()
+    loss_b1_cont = continuous_core.run_train_step(causal_lm_batch(local_b[1:2])).detach()
 
     # Restored path: load mid-step and run the same remaining microbatch sequence.
     load_sharded_checkpoint(restored_core.state_manager, args.checkpoint_dir)
     if restored_core.state.step != 0 or restored_core.state.microbatch_idx != 1:
         raise AssertionError("restored core must recover mid-step state (step=0, microbatch_idx=1)")
     # Boundary: resume at accum boundary (idx=1 for accum=2) must step immediately.
-    loss_a1_res = restored_core.run_train_step((local_a[1:2], local_a[1:2].clone())).detach()
+    loss_a1_res = restored_core.run_train_step(causal_lm_batch(local_a[1:2])).detach()
     if restored_core.state.metadata.get("should_step_optimizer") is not True:
         raise AssertionError("restored core boundary microbatch should step optimizer")
     if restored_core.state.step != 1 or restored_core.state.microbatch_idx != 0:
         raise AssertionError("restored core must step on first microbatch after resume")
     # Non-boundary microbatch must not step.
-    loss_b0_res = restored_core.run_train_step((local_b[0:1], local_b[0:1].clone())).detach()
+    loss_b0_res = restored_core.run_train_step(causal_lm_batch(local_b[0:1])).detach()
     if restored_core.state.metadata.get("should_step_optimizer") is not False:
         raise AssertionError("restored core non-boundary microbatch should not step optimizer")
-    loss_b1_res = restored_core.run_train_step((local_b[1:2], local_b[1:2].clone())).detach()
+    loss_b1_res = restored_core.run_train_step(causal_lm_batch(local_b[1:2])).detach()
     if restored_core.state.metadata.get("should_step_optimizer") is not True:
         raise AssertionError("restored core boundary microbatch should step optimizer")
 

@@ -3,14 +3,12 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
 from data import PretrainingDataLoader, TokenShardDataset
-from data.protocols import DataLoaderStateProtocol
 from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
@@ -25,22 +23,6 @@ from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
 from train import Trainer, TrainerConfig
 from utils.metrics import ConsoleMetricLogger, JsonlMetricLogger, MetricLogger
-
-
-class CausalLmBatchAdapter:
-    def __init__(self, loader: PretrainingDataLoader) -> None:
-        self.loader = loader
-
-    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        batch = self.loader.next_batch()
-        input_ids = batch["input_ids"]
-        return input_ids, input_ids.clone()
-
-    def state_dict(self) -> DataLoaderStateProtocol:
-        return self.loader.state_dict()
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        self.loader.load_state_dict(state)
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,7 +91,7 @@ def main() -> None:
     logger = _build_logger(args, rank)
     trainer = Trainer(
         runtime=runtime,
-        dataloader=CausalLmBatchAdapter(loader),
+        dataloader=loader,
         config=TrainerConfig(
             max_steps=args.max_steps,
             log_every=args.log_every,
