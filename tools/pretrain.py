@@ -9,12 +9,21 @@ import torch
 import torch.distributed as dist
 
 from data import PretrainingDataLoader, TokenShardDataset
-from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
+from models import (
+    LlamaConfig,
+    LlamaForCausalLM,
+    LlamaForCausalLMTp,
+    LlamaForCausalLMTpSp,
+    TinyTransformer,
+    TinyTransformerTp,
+    TinyTransformerTpSp,
+)
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
 from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
+from runtime.plugins.perf_metrics import PerfMetricsPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
@@ -22,11 +31,11 @@ from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
 from train import Trainer, TrainerConfig
-from utils.metrics import ConsoleMetricLogger, JsonlMetricLogger, MetricLogger
+from utils.metrics import ConsoleMetricLogger, JsonlMetricLogger, MetricLogger, WandbMetricLogger
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tiny Transformer pretraining recipe.")
+    parser = argparse.ArgumentParser(description="LLM pretraining recipe.")
     parser.add_argument("--data", type=str, nargs="+", required=True, help="Token shard .bin files or directories")
     parser.add_argument("--token-dtype", type=str, default="uint32", choices=("uint16", "uint32", "int64"))
     parser.add_argument("--seq-len", type=int, default=128)
@@ -36,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
 
+    parser.add_argument("--model", type=str, default="tiny", choices=("tiny", "llama"))
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--n-kv-heads", type=int, default=None)
@@ -51,9 +61,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ddp-mode", type=str, default="sync", choices=("sync", "async", "bucket"))
     parser.add_argument("--precision", type=str, default="fp32", choices=("fp32", "bf16", "fp16"))
     parser.add_argument("--grad-clip", type=float, default=None)
+    parser.add_argument("--disable-perf-metrics", action="store_true")
 
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--metrics-jsonl", type=str, default=None)
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-mode", type=str, default=None, choices=("online", "offline", "disabled"))
+    parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags")
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--checkpoint-every", type=int, default=None)
     parser.add_argument("--resume-from", type=str, default=None)
@@ -108,7 +124,21 @@ def main() -> None:
         dist.destroy_process_group()
 
 
-def _build_model(args: argparse.Namespace) -> TinyTransformer:
+def _build_model(args: argparse.Namespace) -> torch.nn.Module:
+    if args.model == "llama":
+        cls = LlamaForCausalLMTpSp if args.use_sp else LlamaForCausalLMTp if args.tp_size > 1 else LlamaForCausalLM
+        return cls(
+            LlamaConfig(
+                vocab_size=args.vocab_size,
+                hidden_size=args.dim,
+                intermediate_size=args.hidden_size,
+                num_hidden_layers=args.n_layers,
+                num_attention_heads=args.n_heads,
+                num_key_value_heads=args.n_kv_heads or args.n_heads,
+                max_position_embeddings=args.seq_len,
+                rms_norm_eps=args.eps,
+            )
+        )
     cls = TinyTransformerTpSp if args.use_sp else TinyTransformerTp if args.tp_size > 1 else TinyTransformer
     return cls(
         dim=args.dim,
@@ -122,7 +152,7 @@ def _build_model(args: argparse.Namespace) -> TinyTransformer:
     )
 
 
-def _build_runtime(args: argparse.Namespace, model: TinyTransformer) -> RuntimeCore:
+def _build_runtime(args: argparse.Namespace, model: torch.nn.Module) -> RuntimeCore:
     plugins = []
     optimizer = None
     if args.tp_size > 1:
@@ -150,6 +180,8 @@ def _build_runtime(args: argparse.Namespace, model: TinyTransformer) -> RuntimeC
         plugins.append(PrecisionPlugin(compute_dtype=compute_dtype))
     if args.grad_clip is not None:
         plugins.append(GradClipPlugin(max_norm=args.grad_clip))
+    if not args.disable_perf_metrics:
+        plugins.append(PerfMetricsPlugin())
 
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
@@ -167,12 +199,31 @@ def _build_ddp(mode: str) -> DataParallelPlugin | BucketDataParallelPlugin:
     return DataParallelPlugin(async_op=(mode == "async"))
 
 
-def _build_logger(args: argparse.Namespace, rank: int) -> MetricLogger | None:
+def _build_logger(args: argparse.Namespace, rank: int) -> list[MetricLogger] | None:
     if rank != 0:
         return None
+    loggers: list[MetricLogger] = [ConsoleMetricLogger()]
     if args.metrics_jsonl is not None:
-        return JsonlMetricLogger(args.metrics_jsonl)
-    return ConsoleMetricLogger()
+        loggers.append(JsonlMetricLogger(args.metrics_jsonl))
+    if args.wandb_project is not None:
+        loggers.append(
+            WandbMetricLogger(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                entity=args.wandb_entity,
+                mode=args.wandb_mode,
+                tags=_parse_tags(args.wandb_tags),
+                config=vars(args),
+            )
+        )
+    return loggers
+
+
+def _parse_tags(tags: str | None) -> list[str] | None:
+    if tags is None:
+        return None
+    parsed = [tag.strip() for tag in tags.split(",") if tag.strip()]
+    return parsed or None
 
 
 def _expand_data_paths(items: list[str]) -> list[Path]:

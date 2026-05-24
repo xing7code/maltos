@@ -1,4 +1,5 @@
 torch
 transformers
-datatrove
+datasets
 absl-py
+wandb

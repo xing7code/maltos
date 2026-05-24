@@ -15,7 +15,8 @@ The goal of this repo is not to hide PyTorch behind a framework. The goal is to 
 - Stateful pretraining dataloader over mmap token shards.
 - Sharded checkpoint save/load for model, optimizer, trainer, plugin, RNG, and dataloader state.
 - Metric collection from runtime/plugins, interval aggregation, and console/jsonl logging.
-- End-to-end tiny pretraining entrypoint.
+- Console, JSONL, and W&B metric logging.
+- End-to-end LLaMA/tiny pretraining recipe.
 
 This is intentionally small enough to read, but the core control flow mirrors the shape of larger pretraining systems: Megatron-style TP/SP, ZeRO/FSDP-style optimizer ownership, explicit process mesh axes, and checkpoint metadata that describes local shards.
 
@@ -95,13 +96,13 @@ The pretraining path passes dataloader batches directly through the trainer/runt
 
 ```text
 data/       Stateful tensor and token-shard dataloaders
-models/     TinyModel and TinyTransformer variants with TP/SP specs
+models/     TinyModel, TinyTransformer, and LLaMA variants with TP/SP specs
 parallel/   ParallelPlan and TP/SP sharding specs
 runtime/    RuntimeCore, ProcessMesh, plugin API, layers, plugins
 state/      StateManager and sharded checkpoint IO
 train/      Trainer loop
 utils/      Logging and metric aggregation utilities
-tools/      Dataset prep and tiny pretraining entrypoints
+tools/      Dataset prep and pretraining entrypoints
 tests/      Equivalence, checkpoint, integration, and resume tests
 docs/       Architecture notes
 ```
@@ -119,7 +120,8 @@ pip install -r requirements.txt
 Run a tiny single-process pretraining smoke using committed token shards:
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/train_tiny_pretrain.py \
+PYTHONPATH=. .venv/bin/python tools/pretrain.py \
+  --model tiny \
   --data tests/testdata \
   --vocab-size 256 \
   --dim 32 \
@@ -188,10 +190,28 @@ bash tools/data.sh
 
 ## Tiny Pretraining Recipe
 
-Single process:
+Single-process LLaMA smoke:
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/train_tiny_pretrain.py \
+PYTHONPATH=. .venv/bin/python tools/pretrain.py \
+  --model llama \
+  --data tests/testdata \
+  --vocab-size 256 \
+  --dim 32 \
+  --n-heads 4 \
+  --hidden-size 64 \
+  --n-layers 1 \
+  --seq-len 16 \
+  --micro-batch-size 1 \
+  --max-steps 20 \
+  --metrics-jsonl logs/llama_smoke.jsonl
+```
+
+Single-process real-data run:
+
+```bash
+PYTHONPATH=. .venv/bin/python tools/pretrain.py \
+  --model llama \
   --data datasets/fineweb_500m \
   --vocab-size 151936 \
   --dim 512 \
@@ -204,13 +224,16 @@ PYTHONPATH=. .venv/bin/python tools/train_tiny_pretrain.py \
   --max-steps 1000 \
   --checkpoint-dir checkpoints/tiny \
   --checkpoint-every 100 \
-  --metrics-jsonl logs/tiny.jsonl
+  --metrics-jsonl logs/llama.jsonl \
+  --wandb-project llm-train-systems \
+  --wandb-run-name llama-single-gpu-smoke
 ```
 
 Distributed example with TP/SP/ZeRO-3:
 
 ```bash
-PYTHONPATH=. torchrun --nproc_per_node=4 tools/train_tiny_pretrain.py \
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+  --model llama \
   --data datasets/fineweb_500m \
   --dp-size 2 \
   --tp-size 2 \
@@ -226,8 +249,12 @@ PYTHONPATH=. torchrun --nproc_per_node=4 tools/train_tiny_pretrain.py \
   --seq-len 1024 \
   --micro-batch-size 1 \
   --grad-accum-steps 8 \
-  --max-steps 1000
+  --max-steps 1000 \
+  --wandb-project llm-train-systems \
+  --wandb-run-name llama-50m-dp2-tp2-sp-zero3
 ```
+
+The training script logs `loss`, `lr`, `train/tokens`, `train/tokens_per_sec`, `perf/microbatch_sec`, `perf/forward_sec`, `perf/backward_sec`, `perf/optimizer_sec`, `perf/step_sec`, and CUDA memory metrics when CUDA is available. W&B is initialized only on rank 0.
 
 ## Checkpointing
 
@@ -247,7 +274,7 @@ The manifest records rank-local model shards, optimizer source ranks, and artifa
 Resume:
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/train_tiny_pretrain.py \
+PYTHONPATH=. .venv/bin/python tools/pretrain.py \
   --data datasets/fineweb_500m \
   --resume-from checkpoints/tiny/step_00000100 \
   --max-steps 200
