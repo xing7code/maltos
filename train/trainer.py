@@ -27,7 +27,7 @@ class Trainer:
         runtime: RuntimeCore,
         dataloader: StatefulDataLoaderProtocol,
         config: TrainerConfig,
-        logger: MetricLogger | None = None,
+        logger: MetricLogger | list[MetricLogger] | None = None,
         metric_aggregator: MetricAggregator | None = None,
     ) -> None:
         if config.max_steps < 0:
@@ -41,7 +41,7 @@ class Trainer:
         self.runtime = runtime
         self.dataloader = dataloader
         self.config = config
-        self.logger = logger
+        self.loggers = _normalize_loggers(logger)
         self.metric_aggregator = metric_aggregator or MetricAggregator()
 
     def setup(self) -> None:
@@ -55,7 +55,8 @@ class Trainer:
             previous_step = self.runtime.state.step
             batch = self.dataloader.next_batch()
             self.runtime.run_train_step(batch)
-            self.metric_aggregator.update(self.runtime.collect_metrics())
+            metrics = self.runtime.collect_metrics()
+            self.metric_aggregator.update(metrics)
             if self.runtime.state.step == previous_step:
                 continue
             self._maybe_log()
@@ -66,11 +67,12 @@ class Trainer:
         if step == 0 or step % self.config.log_every != 0:
             return
         metrics = self.metric_aggregator.flush()
-        if self.logger is None:
+        if not self.loggers:
             return
         if not _is_log_rank():
             return
-        self.logger.log(metrics)
+        for logger in self.loggers:
+            logger.log(metrics)
 
     def _maybe_checkpoint(self) -> None:
         if self.config.checkpoint_every is None:
@@ -88,3 +90,11 @@ def _checkpoint_step_dir(checkpoint_dir: str | Path, step: int) -> Path:
 
 def _is_log_rank() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def _normalize_loggers(logger: MetricLogger | list[MetricLogger] | None) -> list[MetricLogger]:
+    if logger is None:
+        return []
+    if isinstance(logger, list):
+        return logger
+    return [logger]

@@ -82,6 +82,9 @@ class RuntimeCore:
 
     def run_train_step(self, batch: Any) -> torch.Tensor:
         self.state.batch = batch
+        tokens = _count_batch_tokens(batch)
+        if tokens is not None:
+            self.state.metadata["tokens"] = tokens
         accum_idx = self.state.microbatch_idx
         should_step = ((accum_idx + 1) % self.grad_accum_steps) == 0
         accum_start = accum_idx == 0
@@ -152,6 +155,9 @@ class RuntimeCore:
         }
         if self.state.loss is not None:
             metrics["loss"] = float(self.state.loss.detach().float().item())
+        tokens = self.state.metadata.get("tokens")
+        if tokens is not None:
+            metrics["train/tokens"] = int(tokens)
 
         optimizer, scheduler = self.get_optimizer_and_scheduler()
         if optimizer is not None and optimizer.param_groups:
@@ -252,3 +258,15 @@ class RuntimeCore:
                     sorter.add(before_name, plugin.id)
         order = [plugin_id for plugin_id in sorter.static_order() if plugin_id in plugin_by_id]
         return [plugin_by_id[plugin_id] for plugin_id in order]
+
+
+def _count_batch_tokens(batch: Any) -> int | None:
+    if isinstance(batch, dict):
+        input_ids = batch.get("input_ids")
+        if torch.is_tensor(input_ids):
+            return int(input_ids.numel())
+    if isinstance(batch, (tuple, list)) and batch and torch.is_tensor(batch[0]):
+        return int(batch[0].numel())
+    if torch.is_tensor(batch):
+        return int(batch.numel())
+    return None

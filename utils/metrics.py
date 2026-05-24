@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
 import torch.distributed as dist
@@ -52,10 +52,12 @@ class MetricAggregator:
             for key, values in self._values.items()
         }
         self._values.clear()
-        return {
+        metrics = {
             key: self.syncer.reduce_value(value, _rule_for_key(key, self.rules).distributed)
             for key, value in local_metrics.items()
         }
+        _add_derived_metrics(metrics)
+        return metrics
 
     def has_values(self) -> bool:
         return bool(self._values)
@@ -104,6 +106,34 @@ class JsonlMetricLogger:
             f.write(json.dumps(metrics, sort_keys=True) + "\n")
 
 
+class WandbMetricLogger:
+    def __init__(
+        self,
+        *,
+        project: str,
+        name: str | None = None,
+        entity: str | None = None,
+        mode: str | None = None,
+        tags: list[str] | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        import wandb
+
+        self.wandb = wandb
+        self.run = wandb.init(
+            project=project,
+            name=name,
+            entity=entity,
+            mode=mode,
+            tags=tags,
+            config=config,
+        )
+
+    def log(self, metrics: dict[str, MetricValue]) -> None:
+        step = metrics.get("step")
+        self.wandb.log(metrics, step=int(step) if isinstance(step, int) else None)
+
+
 def _format_metrics(metrics: dict[str, MetricValue]) -> str:
     parts = []
     for key in sorted(metrics):
@@ -126,6 +156,8 @@ def _rule_for_key(key: str, rules: dict[str, MetricRule]) -> MetricRule:
         return MetricRule(MetricReduction.LAST, MetricReduction.RANK0)
     if key == "should_step_optimizer":
         return MetricRule(MetricReduction.LAST, MetricReduction.RANK0)
+    if key.endswith("_sec"):
+        return MetricRule(MetricReduction.SUM, MetricReduction.MAX)
     if key.endswith("/overflow"):
         return MetricRule(MetricReduction.ANY, MetricReduction.ANY)
     if key.endswith("/grad_norm") or "memory" in key:
@@ -155,3 +187,10 @@ def _reduce_local(values: list[MetricValue], reduction: MetricReduction) -> Metr
     if reduction == MetricReduction.MAX:
         return max(numeric_values)
     raise ValueError(f"unsupported local metric reduction={reduction.value}")
+
+
+def _add_derived_metrics(metrics: dict[str, MetricValue]) -> None:
+    tokens = metrics.get("train/tokens")
+    elapsed_sec = metrics.get("perf/microbatch_sec")
+    if isinstance(tokens, (float, int)) and isinstance(elapsed_sec, (float, int)) and elapsed_sec > 0:
+        metrics["train/tokens_per_sec"] = float(tokens) / float(elapsed_sec)
