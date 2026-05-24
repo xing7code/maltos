@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from train_system.examples import TinyTransformer, TinyTransformerTpSp
+from train_system.models import TinyTransformer, TinyTransformerTpSp
 from train_system.parallel import ParallelPlan
 from train_system.parallel.specs import TpSpShardAxis
 from train_system.runtime import MeshAxis, MeshConfig, RuntimeCore

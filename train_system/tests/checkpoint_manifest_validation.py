@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import torch
 
-from train_system.examples import TinyModel
+from train_system.models import TinyModel
 from train_system.runtime import RuntimeCore
 from train_system.state import load_sharded_checkpoint, save_sharded_checkpoint
 
