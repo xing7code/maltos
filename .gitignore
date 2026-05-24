@@ -1,7 +1,10 @@
 datasets/
 logs/
+checkpoints/
 .venv/
 __pycache__/
 *.pyc
 *.pyo
+*.pt
+*.pth
 .DS_Store

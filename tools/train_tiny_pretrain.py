@@ -9,22 +9,22 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from train_system.data import PretrainingDataLoader, TokenShardDataset
-from train_system.data.protocols import DataLoaderStateProtocol
-from train_system.models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
-from train_system.parallel import ParallelPlan
-from train_system.runtime import MeshConfig, RuntimeCore
-from train_system.runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
-from train_system.runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
-from train_system.runtime.plugins.grad_clip import GradClipPlugin
-from train_system.runtime.plugins.precision import PrecisionPlugin
-from train_system.runtime.plugins.sp import SequenceParallelPlugin
-from train_system.runtime.plugins.tp import TensorParallelPlugin
-from train_system.runtime.plugins.zero1 import Zero1Plugin
-from train_system.runtime.plugins.zero2 import Zero2Plugin
-from train_system.runtime.plugins.zero3 import Zero3Plugin
-from train_system.train import Trainer, TrainerConfig
-from train_system.utils.metrics import ConsoleMetricLogger, JsonlMetricLogger, MetricLogger
+from data import PretrainingDataLoader, TokenShardDataset
+from data.protocols import DataLoaderStateProtocol
+from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
+from parallel import ParallelPlan
+from runtime import MeshConfig, RuntimeCore
+from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
+from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
+from runtime.plugins.grad_clip import GradClipPlugin
+from runtime.plugins.precision import PrecisionPlugin
+from runtime.plugins.sp import SequenceParallelPlugin
+from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.zero1 import Zero1Plugin
+from runtime.plugins.zero2 import Zero2Plugin
+from runtime.plugins.zero3 import Zero3Plugin
+from train import Trainer, TrainerConfig
+from utils.metrics import ConsoleMetricLogger, JsonlMetricLogger, MetricLogger
 
 
 class CausalLmBatchAdapter:
