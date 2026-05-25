@@ -338,6 +338,7 @@ def _print_run_summary(
     global_batch_tokens = args.micro_batch_size * args.seq_len * args.dp_size * args.grad_accum_steps
     total_train_tokens = global_batch_tokens * args.max_steps
     plugin_names = [plugin.name for plugin in runtime.plugins]
+    flops_per_token = runtime.state.static_metrics.get("perf/flops_per_token")
     print("=== pretrain run ===")
     print(f"config={args.config}")
     print(f"model={args.model} initial_trainable_params={initial_trainable_params:,}")
@@ -354,6 +355,10 @@ def _print_run_summary(
         f"micro_batch_size={args.micro_batch_size} seq_len={args.seq_len}"
     )
     print(f"tokens_per_step={global_batch_tokens:,} target_tokens={total_train_tokens:,}")
+    print(
+        "performance="
+        f"flops_per_token={_format_optional_number(flops_per_token)}"
+    )
     print(f"data_shards={len(data_paths)} first_data={data_paths[0]}")
     print(
         "logging="
@@ -368,6 +373,14 @@ def _print_run_summary(
 
 def _count_trainable_params(model: torch.nn.Module) -> int:
     return sum(param.numel() for param in model.parameters() if param.requires_grad)
+
+
+def _format_optional_number(value: object) -> str:
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    if isinstance(value, int):
+        return str(value)
+    return "None"
 
 
 def _expand_data_paths(items: list[str]) -> list[Path]:

@@ -230,9 +230,15 @@ PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
 ```
 
 The script prints a resolved run summary on rank 0, including model size,
-mesh, plugins, batch tokens, target tokens, logging, and checkpoint settings.
+mesh, plugins, batch tokens, target tokens, estimated FLOPs/token, logging,
+and checkpoint settings.
 
-The training script logs `loss`, `lr`, `train/tokens`, `train/tokens_per_sec`, `perf/step_sec`, and CUDA memory metrics when CUDA is available. W&B is initialized only on rank 0. Fine-grained profiling is intentionally kept out of the steady-state training path.
+The training script logs `loss`, `lr`, `train/tokens`, `train/tokens_per_sec`,
+`perf/step_sec`, estimated `perf/tflops_per_gpu`, and CUDA memory metrics when
+CUDA is available. W&B is initialized only on rank 0. Fine-grained profiling is
+intentionally kept out of the steady-state training path. MFU is a reporting
+layer concern and can be computed offline from `perf/tflops_per_gpu` and a
+declared hardware peak.
 
 ## Checkpointing
 

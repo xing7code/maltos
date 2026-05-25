@@ -12,7 +12,7 @@ import torch.distributed as dist
 
 from parallel.plan import ParallelPlan
 from runtime.mesh import MeshAxis, MeshConfig, ProcessGroupManager
-from runtime.plugin import MetricValue, RuntimePlugin
+from runtime.plugin import FlopsEstimatableModule, MetricValue, RuntimePlugin
 from state.state import StateManager
 
 OptimizerFactory = Callable[[nn.Module], torch.optim.Optimizer]
@@ -49,6 +49,7 @@ class RuntimeState:
     batch: Any = None
     outputs: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    static_metrics: dict[str, MetricValue] = field(default_factory=dict)
     scaler: torch.amp.GradScaler | None = None
 
 
@@ -88,6 +89,7 @@ class RuntimeCore:
             self.model = plugin.transform_model(self.model)
         self.state_manager.register_module(self.model)
         self._run_phase(RuntimePhase.TRANSFORM_MODEL)
+        self._populate_static_model_metrics()
         self._build_runtime_optimizer()
         self._validate_optimizer_owner()
 
@@ -166,6 +168,7 @@ class RuntimeCore:
             "grad_accum_steps": self.grad_accum_steps,
             "should_step_optimizer": bool(self.state.metadata.get("should_step_optimizer", True)),
         }
+        metrics.update(self.state.static_metrics)
         if self.state.loss is not None:
             metrics["loss"] = float(self.state.loss.detach().float().item())
         tokens = self.state.metadata.get("tokens")
@@ -267,6 +270,11 @@ class RuntimeCore:
             self.scheduler = self.scheduler_factory(self.optimizer)
         self.optimizer_factory = None
         self.scheduler_factory = None
+
+    def _populate_static_model_metrics(self) -> None:
+        self.state.static_metrics["perf/world_size"] = self.mesh.world_size
+        if isinstance(self.model, FlopsEstimatableModule):
+            self.state.static_metrics["perf/flops_per_token"] = float(self.model.flops_per_token())
 
     def _validate_mesh_and_plan(self) -> None:
         if self.plan.zero_stage > 0 and self.mesh.dp <= 1:

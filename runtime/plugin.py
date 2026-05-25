@@ -22,6 +22,11 @@ class ParallelizableModule(Protocol):
     def parallelize_spec(self) -> TpSpParallelSpec: ...
 
 
+@runtime_checkable
+class FlopsEstimatableModule(Protocol):
+    def flops_per_token(self) -> float: ...
+
+
 class PluginId(str, Enum):
     PRECISION = "precision"
     GRAD_CLIP = "grad_clip"

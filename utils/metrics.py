@@ -194,3 +194,13 @@ def _add_derived_metrics(metrics: dict[str, MetricValue]) -> None:
     elapsed_sec = metrics.get("perf/step_sec")
     if isinstance(tokens, (float, int)) and isinstance(elapsed_sec, (float, int)) and elapsed_sec > 0:
         metrics["train/tokens_per_sec"] = float(tokens) / float(elapsed_sec)
+    tokens_per_sec = metrics.get("train/tokens_per_sec")
+    flops_per_token = metrics.get("perf/flops_per_token")
+    world_size = metrics.get("perf/world_size")
+    if (
+        isinstance(tokens_per_sec, (float, int))
+        and isinstance(flops_per_token, (float, int))
+        and isinstance(world_size, (float, int))
+        and world_size > 0
+    ):
+        metrics["perf/tflops_per_gpu"] = float(tokens_per_sec) * float(flops_per_token) / float(world_size) / 1e12

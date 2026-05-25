@@ -88,9 +88,14 @@ PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
 - `train/tokens`
 - `train/tokens_per_sec`
 - `perf/step_sec`
+- `perf/tflops_per_gpu`
 - `grad_clip/grad_norm`
 - `memory/max_allocated_gb`
 - `precision/overflow`
+
+MFU is intentionally not computed in the training path. Interpret
+`perf/tflops_per_gpu` offline against the theoretical peak you want to use in
+the experiment report.
 
 ## Scale-Up
 

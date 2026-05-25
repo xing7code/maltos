@@ -161,6 +161,19 @@ class LlamaForCausalLM(nn.Module):
             ignore_index=-100,
         )
 
+    def flops_per_token(self) -> float:
+        hidden = self.config.hidden_size
+        intermediate = self.config.intermediate_size
+        seq_len = self.config.max_position_embeddings
+        vocab = self.config.vocab_size
+        qkv_proj = 6 * hidden * hidden
+        out_proj = 2 * hidden * hidden
+        mlp = 6 * hidden * intermediate
+        attention = 4 * seq_len * hidden
+        logits = 2 * hidden * vocab
+        forward_flops = self.config.num_hidden_layers * (qkv_proj + out_proj + mlp + attention) + logits
+        return float(3 * forward_flops)
+
 
 class LlamaForCausalLMTp(LlamaForCausalLM):
     def parallelize_spec(self) -> TpSpParallelSpec:

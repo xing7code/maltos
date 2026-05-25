@@ -23,6 +23,11 @@ class _AutocastModelWrapper(nn.Module):
         with torch.autocast(device_type=self.device_type, dtype=self.compute_dtype):
             return self.module(*args, **kwargs)
 
+    def flops_per_token(self) -> float:
+        if not hasattr(self.module, "flops_per_token"):
+            raise AttributeError("wrapped module does not define flops_per_token")
+        return float(self.module.flops_per_token())
+
 
 class PrecisionPlugin(RuntimePlugin):
     def __init__(
