@@ -26,7 +26,8 @@ PYTHONPATH=. python tools/prepare_token_shards.py \
   --config sample-10BT \
   --split train \
   --column text \
-  --tokenizer-name-or-path Qwen/Qwen2.5-7B \
+  --tokenizer-name-or-path NousResearch/Llama-2-7b-hf \
+  --expected-vocab-size 32000 \
   --output-dir datasets/fineweb_10m \
   --max-tokens 10000000 \
   --tokens-per-shard 5000000 \
@@ -107,7 +108,8 @@ PYTHONPATH=. python tools/prepare_token_shards.py \
   --config sample-10BT \
   --split train \
   --column text \
-  --tokenizer-name-or-path Qwen/Qwen2.5-7B \
+  --tokenizer-name-or-path NousResearch/Llama-2-7b-hf \
+  --expected-vocab-size 32000 \
   --output-dir datasets/fineweb_50m \
   --max-tokens 50000000 \
   --tokens-per-shard 10000000 \

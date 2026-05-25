@@ -175,7 +175,8 @@ PYTHONPATH=. .venv/bin/python tools/prepare_token_shards.py \
   --config sample-10BT \
   --split train \
   --column text \
-  --tokenizer-name-or-path Qwen/Qwen2.5-7B \
+  --tokenizer-name-or-path NousResearch/Llama-2-7b-hf \
+  --expected-vocab-size 32000 \
   --output-dir datasets/fineweb_500m \
   --max-tokens 500000000 \
   --tokens-per-shard 100000000 \

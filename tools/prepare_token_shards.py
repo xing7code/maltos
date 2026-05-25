@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--tokens-per-shard", type=int, default=100_000_000)
     parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--expected-vocab-size", type=int, default=None)
     parser.add_argument("--eos-token", type=str, default=None)
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -40,7 +41,15 @@ def main() -> None:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path, use_fast=True)
+    tokenizer_vocab_size = len(tokenizer)
+    if args.expected_vocab_size is not None and tokenizer_vocab_size != args.expected_vocab_size:
+        raise ValueError(
+            "tokenizer vocab size mismatch: "
+            f"tokenizer={args.tokenizer_name_or_path} vocab={tokenizer_vocab_size}, "
+            f"expected={args.expected_vocab_size}"
+        )
     eos_id = tokenizer.convert_tokens_to_ids(args.eos_token) if args.eos_token is not None else tokenizer.eos_token_id
+    print(f"tokenizer={args.tokenizer_name_or_path} vocab_size={tokenizer_vocab_size} eos_id={eos_id}")
 
     dataset = load_dataset(args.dataset, name=args.config, split=args.split, streaming=args.streaming)
     if args.streaming:
