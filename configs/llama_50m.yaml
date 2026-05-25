@@ -1,0 +1,45 @@
+seed: 42
+
+data:
+  paths:
+    - data/fineweb10bt-50m
+  seq_len: 1024
+  micro_batch_size: 1
+
+model:
+  type: llama
+  vocab_size: 32000
+  hidden_size: 512
+  intermediate_size: 2048
+  num_layers: 8
+  num_heads: 8
+  num_kv_heads: 8
+  rms_norm_eps: 1.0e-5
+
+parallel:
+  dp_size: 2
+  tp_size: 2
+  use_sp: true
+  zero_stage: 3
+
+training:
+  max_steps: 1000
+  grad_accum_steps: 8
+  lr: 3.0e-4
+  precision: bf16
+  grad_clip: 1.0
+
+logging:
+  log_every: 1
+  metrics_jsonl: logs/llama_50m.jsonl
+  wandb_project: llm-train-systems
+  wandb_run_name: llama-50m-dp2-tp2-sp-zero3
+  wandb_tags:
+    - llama
+    - 50m-tokens
+    - scaleup
+
+checkpoint:
+  dir: checkpoints/llama_50m
+  every: 100
+  resume_from: null

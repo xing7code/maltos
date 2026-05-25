@@ -3,3 +3,4 @@ transformers
 datasets
 absl-py
 wandb
+PyYAML

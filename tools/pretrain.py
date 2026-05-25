@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import yaml
 
 from data import PretrainingDataLoader, TokenShardDataset
 from models import (
@@ -36,7 +38,8 @@ from utils.metrics import ConsoleMetricLogger, JsonlMetricLogger, MetricLogger, 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LLM pretraining recipe.")
-    parser.add_argument("--data", type=str, nargs="+", required=True, help="Token shard .bin files or directories")
+    parser.add_argument("--config", type=str, default=None, help="YAML training recipe")
+    parser.add_argument("--data", type=str, nargs="+", default=None, help="Token shard .bin files or directories")
     parser.add_argument("--token-dtype", type=str, default="uint32", choices=("uint16", "uint32", "int64"))
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--micro-batch-size", type=int, default=1)
@@ -57,11 +60,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--zero-stage", type=int, default=0, choices=(0, 1, 2, 3))
-    parser.add_argument("--use-sp", action="store_true")
-    parser.add_argument("--ddp-mode", type=str, default="sync", choices=("sync", "async", "bucket"))
+    parser.add_argument("--use-sp", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--ddp-mode", type=str, default=None, choices=("sync", "async", "bucket"))
     parser.add_argument("--precision", type=str, default="fp32", choices=("fp32", "bf16", "fp16"))
     parser.add_argument("--grad-clip", type=float, default=None)
-    parser.add_argument("--disable-perf-metrics", action="store_true")
+    parser.add_argument("--disable-perf-metrics", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--metrics-jsonl", type=str, default=None)
@@ -77,7 +80,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", type=str, default=None)
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=str, default="29550")
-    return parser.parse_args()
+    config_path = _preparse_config_path()
+    if config_path is not None:
+        parser.set_defaults(**_load_config_defaults(config_path))
+    args = parser.parse_args()
+    if args.data is None:
+        raise ValueError("--data is required unless provided by --config")
+    return args
 
 
 def main() -> None:
@@ -92,14 +101,18 @@ def main() -> None:
         raise ValueError("--use-sp requires --tp-size > 1")
     if args.zero_stage > 0 and args.dp_size <= 1:
         raise ValueError("--zero-stage > 0 requires --dp-size > 1")
+    if args.zero_stage > 0 and args.ddp_mode is not None:
+        raise ValueError("--ddp-mode is only valid when --zero-stage is 0")
 
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     dp_rank = rank // args.tp_size
+    data_paths = _expand_data_paths(args.data)
     model = _build_model(args)
+    initial_trainable_params = _count_trainable_params(model)
     loader = PretrainingDataLoader(
-        TokenShardDataset(_expand_data_paths(args.data), dtype=np.dtype(args.token_dtype)),
+        TokenShardDataset(data_paths, dtype=np.dtype(args.token_dtype)),
         seq_len=args.seq_len,
         micro_batch_size=args.micro_batch_size,
         dp_rank=dp_rank,
@@ -121,6 +134,15 @@ def main() -> None:
         logger=logger,
     )
     trainer.setup()
+    _print_run_summary(
+        args=args,
+        runtime=runtime,
+        initial_trainable_params=initial_trainable_params,
+        data_paths=data_paths,
+        device=device,
+        world_size=world_size,
+        rank=rank,
+    )
     trainer.fit()
     if dist.is_initialized():
         dist.barrier()
@@ -164,7 +186,7 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         plugins.append(SequenceParallelPlugin())
     if args.zero_stage == 0:
         if args.dp_size > 1:
-            plugins.append(_build_ddp(args.ddp_mode))
+            plugins.append(_build_ddp(args.ddp_mode or "sync"))
         optimizer_factory = lambda module: torch.optim.AdamW(module.parameters(), lr=args.lr)
     elif args.zero_stage == 1:
         plugins.append(Zero1Plugin(optimizer_cls=torch.optim.AdamW, lr=args.lr))
@@ -209,7 +231,7 @@ def _build_logger(args: argparse.Namespace, rank: int) -> list[MetricLogger] | N
     loggers: list[MetricLogger] = [ConsoleMetricLogger()]
     if args.metrics_jsonl is not None:
         loggers.append(JsonlMetricLogger(args.metrics_jsonl))
-    if args.wandb_project is not None:
+    if args.wandb_project is not None and args.wandb_mode != "disabled":
         loggers.append(
             WandbMetricLogger(
                 project=args.wandb_project,
@@ -223,11 +245,129 @@ def _build_logger(args: argparse.Namespace, rank: int) -> list[MetricLogger] | N
     return loggers
 
 
-def _parse_tags(tags: str | None) -> list[str] | None:
+def _preparse_config_path() -> str | None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=str, default=None)
+    args, _ = parser.parse_known_args()
+    return args.config
+
+
+def _load_config_defaults(path: str) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"config must be a YAML mapping, got {type(raw)!r}")
+    defaults: dict[str, Any] = {"config": path}
+    for section, values in raw.items():
+        if not isinstance(values, dict):
+            defaults[section] = values
+            continue
+        for key, value in values.items():
+            defaults[_config_key_to_arg_dest(section, key)] = value
+    return defaults
+
+
+def _config_key_to_arg_dest(section: str, key: str) -> str:
+    aliases = {
+        ("data", "paths"): "data",
+        ("data", "seq_len"): "seq_len",
+        ("data", "micro_batch_size"): "micro_batch_size",
+        ("model", "type"): "model",
+        ("model", "hidden_size"): "dim",
+        ("model", "dim"): "dim",
+        ("model", "intermediate_size"): "hidden_size",
+        ("model", "num_layers"): "n_layers",
+        ("model", "n_layers"): "n_layers",
+        ("model", "num_heads"): "n_heads",
+        ("model", "n_heads"): "n_heads",
+        ("model", "num_kv_heads"): "n_kv_heads",
+        ("model", "n_kv_heads"): "n_kv_heads",
+        ("model", "vocab_size"): "vocab_size",
+        ("model", "rms_norm_eps"): "eps",
+        ("model", "eps"): "eps",
+        ("parallel", "dp_size"): "dp_size",
+        ("parallel", "tp_size"): "tp_size",
+        ("parallel", "use_sp"): "use_sp",
+        ("parallel", "zero_stage"): "zero_stage",
+        ("parallel", "ddp_mode"): "ddp_mode",
+        ("training", "max_steps"): "max_steps",
+        ("training", "grad_accum_steps"): "grad_accum_steps",
+        ("training", "lr"): "lr",
+        ("training", "precision"): "precision",
+        ("training", "grad_clip"): "grad_clip",
+        ("training", "disable_perf_metrics"): "disable_perf_metrics",
+        ("logging", "log_every"): "log_every",
+        ("logging", "metrics_jsonl"): "metrics_jsonl",
+        ("logging", "wandb_project"): "wandb_project",
+        ("logging", "wandb_run_name"): "wandb_run_name",
+        ("logging", "wandb_entity"): "wandb_entity",
+        ("logging", "wandb_mode"): "wandb_mode",
+        ("logging", "wandb_tags"): "wandb_tags",
+        ("checkpoint", "dir"): "checkpoint_dir",
+        ("checkpoint", "checkpoint_dir"): "checkpoint_dir",
+        ("checkpoint", "every"): "checkpoint_every",
+        ("checkpoint", "checkpoint_every"): "checkpoint_every",
+        ("checkpoint", "resume_from"): "resume_from",
+    }
+    return aliases.get((section, key), key)
+
+
+def _parse_tags(tags: str | list[str] | None) -> list[str] | None:
     if tags is None:
         return None
+    if isinstance(tags, list):
+        parsed = [str(tag).strip() for tag in tags if str(tag).strip()]
+        return parsed or None
     parsed = [tag.strip() for tag in tags.split(",") if tag.strip()]
     return parsed or None
+
+
+def _print_run_summary(
+    *,
+    args: argparse.Namespace,
+    runtime: RuntimeCore,
+    initial_trainable_params: int,
+    data_paths: list[Path],
+    device: torch.device,
+    world_size: int,
+    rank: int,
+) -> None:
+    if rank != 0:
+        return
+    local_trainable_params = _count_trainable_params(runtime.model)
+    global_batch_tokens = args.micro_batch_size * args.seq_len * args.dp_size * args.grad_accum_steps
+    total_train_tokens = global_batch_tokens * args.max_steps
+    plugin_names = [plugin.name for plugin in runtime.plugins]
+    print("=== pretrain run ===")
+    print(f"config={args.config}")
+    print(f"model={args.model} initial_trainable_params={initial_trainable_params:,}")
+    print(f"runtime_local_trainable_params={local_trainable_params:,}")
+    print(
+        "mesh="
+        f"dp={args.dp_size} tp={args.tp_size} pp=1 cp=1 "
+        f"world_size={world_size} device={device}"
+    )
+    print(f"plugins={plugin_names}")
+    print(
+        "training="
+        f"precision={args.precision} lr={args.lr} grad_accum_steps={args.grad_accum_steps} "
+        f"micro_batch_size={args.micro_batch_size} seq_len={args.seq_len}"
+    )
+    print(f"tokens_per_step={global_batch_tokens:,} target_tokens={total_train_tokens:,}")
+    print(f"data_shards={len(data_paths)} first_data={data_paths[0]}")
+    print(
+        "logging="
+        f"log_every={args.log_every} jsonl={args.metrics_jsonl} "
+        f"wandb_project={args.wandb_project} wandb_mode={args.wandb_mode}"
+    )
+    print(
+        "checkpoint="
+        f"dir={args.checkpoint_dir} every={args.checkpoint_every} resume_from={args.resume_from}"
+    )
+
+
+def _count_trainable_params(model: torch.nn.Module) -> int:
+    return sum(param.numel() for param in model.parameters() if param.requires_grad)
 
 
 def _expand_data_paths(items: list[str]) -> list[Path]:

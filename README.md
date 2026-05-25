@@ -207,52 +207,30 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
   --metrics-jsonl logs/llama_smoke.jsonl
 ```
 
-Single-process real-data run:
+YAML recipes are supported for real runs:
 
 ```bash
 PYTHONPATH=. .venv/bin/python tools/pretrain.py \
-  --model llama \
-  --data datasets/fineweb_500m \
-  --vocab-size 151936 \
-  --dim 512 \
-  --n-heads 8 \
-  --hidden-size 2048 \
-  --n-layers 8 \
-  --seq-len 1024 \
-  --micro-batch-size 1 \
-  --grad-accum-steps 8 \
-  --max-steps 1000 \
-  --checkpoint-dir checkpoints/tiny \
-  --checkpoint-every 100 \
-  --metrics-jsonl logs/llama.jsonl \
-  --wandb-project llm-train-systems \
-  --wandb-run-name llama-single-gpu-smoke
+  --config configs/llama_10m.yaml \
+  --data datasets/fineweb_10m \
+  --dp-size 1 \
+  --tp-size 1 \
+  --no-use-sp \
+  --zero-stage 0 \
+  --max-steps 200 \
+  --wandb-run-name llama-10m-single
 ```
 
 Distributed example with TP/SP/ZeRO-3:
 
 ```bash
 PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
-  --model llama \
-  --data datasets/fineweb_500m \
-  --dp-size 2 \
-  --tp-size 2 \
-  --use-sp \
-  --zero-stage 3 \
-  --precision bf16 \
-  --grad-clip 1.0 \
-  --vocab-size 151936 \
-  --dim 512 \
-  --n-heads 8 \
-  --hidden-size 2048 \
-  --n-layers 8 \
-  --seq-len 1024 \
-  --micro-batch-size 1 \
-  --grad-accum-steps 8 \
-  --max-steps 1000 \
-  --wandb-project llm-train-systems \
-  --wandb-run-name llama-50m-dp2-tp2-sp-zero3
+  --config configs/llama_50m.yaml \
+  --data datasets/fineweb_50m
 ```
+
+The script prints a resolved run summary on rank 0, including model size,
+mesh, plugins, batch tokens, target tokens, logging, and checkpoint settings.
 
 The training script logs `loss`, `lr`, `train/tokens`, `train/tokens_per_sec`, `perf/step_sec`, and CUDA memory metrics when CUDA is available. W&B is initialized only on rank 0. Fine-grained profiling is intentionally kept out of the steady-state training path.
 
@@ -293,4 +271,4 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
 
 - Pipeline parallel, context parallel, and expert parallel are planned but not implemented yet.
 - The tiny transformer is intentionally small and readable; it is not a production model implementation.
-- The training script uses argparse flags for now. YAML config can be added once recipe complexity warrants it.
+- YAML recipes cover the main experiment settings; CLI flags can override any recipe field for quick sweeps.

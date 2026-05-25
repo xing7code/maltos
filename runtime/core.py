@@ -170,7 +170,7 @@ class RuntimeCore:
             metrics["loss"] = float(self.state.loss.detach().float().item())
         tokens = self.state.metadata.get("tokens")
         if tokens is not None:
-            metrics["train/tokens"] = int(tokens)
+            metrics["train/tokens"] = _global_token_contribution(int(tokens), self.mesh)
 
         optimizer, scheduler = self.get_optimizer_and_scheduler()
         if optimizer is not None and optimizer.param_groups:
@@ -321,3 +321,8 @@ def _move_to_device(value: Any, device: torch.device) -> Any:
     if isinstance(value, list):
         return [_move_to_device(item, device) for item in value]
     return value
+
+
+def _global_token_contribution(local_tokens: int, mesh: MeshConfig) -> float:
+    replicated_ranks = mesh.tp * mesh.pp * mesh.cp
+    return float(local_tokens) / float(replicated_ranks)
