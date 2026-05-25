@@ -38,6 +38,7 @@ logging:
     - llama
     - 10m-tokens
     - smoke
+  wandb_checkpoint_every: null
 
 checkpoint:
   dir: checkpoints/llama_10m

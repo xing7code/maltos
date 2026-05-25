@@ -38,6 +38,7 @@ logging:
     - llama
     - 50m-tokens
     - scaleup
+  wandb_checkpoint_every: null
 
 checkpoint:
   dir: checkpoints/llama_50m

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -134,6 +136,59 @@ class WandbMetricLogger:
         self.wandb.log(metrics, step=int(step) if isinstance(step, int) else None)
 
 
+class WandbCheckpointUploader:
+    def __init__(
+        self,
+        logger: WandbMetricLogger,
+        *,
+        every_steps: int,
+        artifact_prefix: str | None = None,
+    ) -> None:
+        if every_steps < 1:
+            raise ValueError(f"every_steps must be >= 1, got {every_steps}")
+        self.logger = logger
+        self.every_steps = every_steps
+        self.artifact_prefix = _sanitize_artifact_name(artifact_prefix or logger.run.name or logger.run.id)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._future: concurrent.futures.Future[None] | None = None
+
+    def upload_checkpoint(self, checkpoint_dir: str | Path, step: int) -> None:
+        if step % self.every_steps != 0:
+            return
+        self._check_previous_upload()
+        if self._future is not None and not self._future.done():
+            print(f"warning: previous W&B checkpoint upload still running; skip step={step}")
+            return
+        path = Path(checkpoint_dir)
+        self._future = self.executor.submit(self._upload, path, step)
+
+    def close(self) -> None:
+        self._check_previous_upload(wait=True)
+        self.executor.shutdown(wait=True)
+
+    def _check_previous_upload(self, wait: bool = False) -> None:
+        if self._future is None:
+            return
+        if wait:
+            concurrent.futures.wait([self._future])
+        if self._future.done():
+            exc = self._future.exception()
+            if exc is not None:
+                print(f"warning: W&B checkpoint upload failed: {exc}")
+
+    def _upload(self, checkpoint_dir: Path, step: int) -> None:
+        artifact = self.logger.wandb.Artifact(
+            name=f"{self.artifact_prefix}-step-{step:08d}",
+            type="checkpoint",
+            metadata={"step": step, "path": str(checkpoint_dir)},
+        )
+        artifact.add_dir(str(checkpoint_dir))
+        self.logger.run.log_artifact(
+            artifact,
+            aliases=["latest", f"step_{step}"],
+        )
+
+
 def _format_metrics(metrics: dict[str, MetricValue]) -> str:
     parts = []
     for key in sorted(metrics):
@@ -143,6 +198,11 @@ def _format_metrics(metrics: dict[str, MetricValue]) -> str:
         else:
             parts.append(f"{key}={value}")
     return " ".join(parts)
+
+
+def _sanitize_artifact_name(name: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-._")
+    return sanitized or "checkpoint"
 
 
 def _rule_for_key(key: str, rules: dict[str, MetricRule]) -> MetricRule:

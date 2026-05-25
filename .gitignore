@@ -1,6 +1,7 @@
 datasets/
 logs/
 checkpoints/
+wandb/
 .venv/
 __pycache__/
 *.pyc

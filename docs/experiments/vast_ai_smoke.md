@@ -78,6 +78,7 @@ PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
   --max-steps 500 \
   --log-every 10 \
   --checkpoint-dir checkpoints/llama_10m_dp2_tp2_zero3 \
+  --wandb-checkpoint-every 100 \
   --metrics-jsonl logs/llama_10m_dp2_tp2_zero3.jsonl \
   --wandb-run-name llama-10m-dp2-tp2-sp-zero3
 ```
@@ -97,6 +98,9 @@ PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
 MFU is intentionally not computed in the training path. Interpret
 `perf/tflops_per_gpu` offline against the theoretical peak you want to use in
 the experiment report.
+
+`--wandb-checkpoint-every` uploads selected local checkpoint step directories as
+W&B Artifacts. It must be a multiple of `--checkpoint-every`.
 
 ## Scale-Up
 

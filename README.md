@@ -241,6 +241,11 @@ intentionally kept out of the steady-state training path. MFU is a reporting
 layer concern and can be computed offline from `perf/tflops_per_gpu` and a
 declared hardware peak.
 
+W&B checkpoint artifacts can be enabled by setting `--wandb-checkpoint-every N`.
+`N` must be a multiple of `--checkpoint-every`; local checkpointing remains the
+source of truth, and rank 0 uploads selected checkpoint directories
+asynchronously as W&B Artifacts.
+
 ## Checkpointing
 
 Each checkpoint step is a directory:

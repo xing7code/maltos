@@ -33,7 +33,13 @@ from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
 from train import Trainer, TrainerConfig
-from utils.metrics import ConsoleMetricLogger, JsonlMetricLogger, MetricLogger, WandbMetricLogger
+from utils.metrics import (
+    ConsoleMetricLogger,
+    JsonlMetricLogger,
+    MetricLogger,
+    WandbCheckpointUploader,
+    WandbMetricLogger,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-entity", type=str, default=None)
     parser.add_argument("--wandb-mode", type=str, default=None, choices=("online", "offline", "disabled"))
     parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags")
+    parser.add_argument("--wandb-checkpoint-every", type=int, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--checkpoint-every", type=int, default=None)
     parser.add_argument("--resume-from", type=str, default=None)
@@ -103,6 +110,15 @@ def main() -> None:
         raise ValueError("--zero-stage > 0 requires --dp-size > 1")
     if args.zero_stage > 0 and args.ddp_mode is not None:
         raise ValueError("--ddp-mode is only valid when --zero-stage is 0")
+    if args.wandb_checkpoint_every is not None:
+        if args.wandb_checkpoint_every < 1:
+            raise ValueError("--wandb-checkpoint-every must be >= 1")
+        if args.checkpoint_every is None:
+            raise ValueError("--wandb-checkpoint-every requires --checkpoint-every")
+        if args.wandb_checkpoint_every % args.checkpoint_every != 0:
+            raise ValueError("--wandb-checkpoint-every must be a multiple of --checkpoint-every")
+        if args.wandb_project is None or args.wandb_mode == "disabled":
+            raise ValueError("--wandb-checkpoint-every requires enabled W&B logging")
 
     torch.manual_seed(args.seed)
     if device.type == "cuda":
@@ -120,7 +136,7 @@ def main() -> None:
         seed=args.seed,
     )
     runtime = _build_runtime(args, model, device)
-    logger = _build_logger(args, rank)
+    logger, checkpoint_uploader = _build_logging(args, rank)
     trainer = Trainer(
         runtime=runtime,
         dataloader=loader,
@@ -132,6 +148,7 @@ def main() -> None:
             resume_from=args.resume_from,
         ),
         logger=logger,
+        checkpoint_uploader=checkpoint_uploader,
     )
     trainer.setup()
     _print_run_summary(
@@ -225,24 +242,33 @@ def _build_ddp(mode: str) -> DataParallelPlugin | BucketDataParallelPlugin:
     return DataParallelPlugin(async_op=(mode == "async"))
 
 
-def _build_logger(args: argparse.Namespace, rank: int) -> list[MetricLogger] | None:
+def _build_logging(args: argparse.Namespace, rank: int) -> tuple[list[MetricLogger] | None, WandbCheckpointUploader | None]:
     if rank != 0:
-        return None
+        return None, None
     loggers: list[MetricLogger] = [ConsoleMetricLogger()]
+    wandb_logger: WandbMetricLogger | None = None
     if args.metrics_jsonl is not None:
         loggers.append(JsonlMetricLogger(args.metrics_jsonl))
     if args.wandb_project is not None and args.wandb_mode != "disabled":
-        loggers.append(
-            WandbMetricLogger(
-                project=args.wandb_project,
-                name=args.wandb_run_name,
-                entity=args.wandb_entity,
-                mode=args.wandb_mode,
-                tags=_parse_tags(args.wandb_tags),
-                config=vars(args),
-            )
+        wandb_logger = WandbMetricLogger(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            entity=args.wandb_entity,
+            mode=args.wandb_mode,
+            tags=_parse_tags(args.wandb_tags),
+            config=vars(args),
         )
-    return loggers
+        loggers.append(wandb_logger)
+    checkpoint_uploader = None
+    if args.wandb_checkpoint_every is not None:
+        if wandb_logger is None:
+            raise ValueError("--wandb-checkpoint-every requires enabled W&B logging")
+        checkpoint_uploader = WandbCheckpointUploader(
+            wandb_logger,
+            every_steps=args.wandb_checkpoint_every,
+            artifact_prefix=args.wandb_run_name,
+        )
+    return loggers, checkpoint_uploader
 
 
 def _preparse_config_path() -> str | None:
@@ -303,6 +329,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("logging", "wandb_entity"): "wandb_entity",
         ("logging", "wandb_mode"): "wandb_mode",
         ("logging", "wandb_tags"): "wandb_tags",
+        ("logging", "wandb_checkpoint_every"): "wandb_checkpoint_every",
         ("checkpoint", "dir"): "checkpoint_dir",
         ("checkpoint", "checkpoint_dir"): "checkpoint_dir",
         ("checkpoint", "every"): "checkpoint_every",
@@ -363,7 +390,8 @@ def _print_run_summary(
     print(
         "logging="
         f"log_every={args.log_every} jsonl={args.metrics_jsonl} "
-        f"wandb_project={args.wandb_project} wandb_mode={args.wandb_mode}"
+        f"wandb_project={args.wandb_project} wandb_mode={args.wandb_mode} "
+        f"wandb_checkpoint_every={args.wandb_checkpoint_every}"
     )
     print(
         "checkpoint="

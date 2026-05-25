@@ -39,6 +39,20 @@ class CaptureLogger(MetricLogger):
         self.records.append(dict(metrics))
 
 
+class CaptureCheckpointUploader:
+    def __init__(self, every_steps: int) -> None:
+        self.every_steps = every_steps
+        self.uploads: list[tuple[Path, int]] = []
+        self.closed = False
+
+    def upload_checkpoint(self, checkpoint_dir: str | Path, step: int) -> None:
+        if step % self.every_steps == 0:
+            self.uploads.append((Path(checkpoint_dir), step))
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _make_runtime(seed: int = 1234) -> RuntimeCore:
     torch.manual_seed(seed)
     model = LossModel()
@@ -201,11 +215,31 @@ def test_trainer_checkpoint_resume_matches_continuous() -> None:
                 raise AssertionError(f"param mismatch for {name}: max_diff={(actual - expected).abs().max().item()}")
 
 
+def test_trainer_checkpoint_uploader_follows_upload_cadence() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        checkpoint_dir = Path(tmp) / "ckpts"
+        uploader = CaptureCheckpointUploader(every_steps=2)
+        runtime = _make_runtime()
+        trainer = Trainer(
+            runtime=runtime,
+            dataloader=_make_loader(),
+            config=TrainerConfig(max_steps=4, checkpoint_every=1, checkpoint_dir=checkpoint_dir),
+            checkpoint_uploader=uploader,
+        )
+        trainer.setup()
+        trainer.fit()
+
+        assert uploader.closed
+        assert [step for _, step in uploader.uploads] == [2, 4]
+        assert [path.name for path, _ in uploader.uploads] == ["step_00000002", "step_00000004"]
+
+
 def main() -> None:
     test_trainer_logs_optimizer_steps()
     test_trainer_aggregates_metrics_over_log_interval()
     test_trainer_collects_each_microbatch_metric()
     test_trainer_checkpoint_resume_matches_continuous()
+    test_trainer_checkpoint_uploader_follows_upload_cadence()
     print("trainer loop smoke ok")
 
 

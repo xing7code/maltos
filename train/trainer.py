@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import torch.distributed as dist
 
@@ -9,6 +10,11 @@ from data.protocols import StatefulDataLoaderProtocol
 from runtime.core import RuntimeCore
 from state.checkpoint import load_sharded_checkpoint, save_sharded_checkpoint
 from utils.metrics import MetricAggregator, MetricLogger
+
+
+class CheckpointUploader(Protocol):
+    def upload_checkpoint(self, checkpoint_dir: str | Path, step: int) -> None: ...
+    def close(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -29,6 +35,7 @@ class Trainer:
         config: TrainerConfig,
         logger: MetricLogger | list[MetricLogger] | None = None,
         metric_aggregator: MetricAggregator | None = None,
+        checkpoint_uploader: CheckpointUploader | None = None,
     ) -> None:
         if config.max_steps < 0:
             raise ValueError(f"max_steps must be >= 0, got {config.max_steps}")
@@ -43,6 +50,7 @@ class Trainer:
         self.config = config
         self.loggers = _normalize_loggers(logger)
         self.metric_aggregator = metric_aggregator or MetricAggregator()
+        self.checkpoint_uploader = checkpoint_uploader
 
     def setup(self) -> None:
         self.runtime.setup()
@@ -51,16 +59,20 @@ class Trainer:
             load_sharded_checkpoint(self.runtime.state_manager, self.config.resume_from)
 
     def fit(self) -> None:
-        while self.runtime.state.step < self.config.max_steps:
-            previous_step = self.runtime.state.step
-            batch = self.dataloader.next_batch()
-            self.runtime.run_train_step(batch)
-            metrics = self.runtime.collect_metrics()
-            self.metric_aggregator.update(metrics)
-            if self.runtime.state.step == previous_step:
-                continue
-            self._maybe_log()
-            self._maybe_checkpoint()
+        try:
+            while self.runtime.state.step < self.config.max_steps:
+                previous_step = self.runtime.state.step
+                batch = self.dataloader.next_batch()
+                self.runtime.run_train_step(batch)
+                metrics = self.runtime.collect_metrics()
+                self.metric_aggregator.update(metrics)
+                if self.runtime.state.step == previous_step:
+                    continue
+                self._maybe_log()
+                self._maybe_checkpoint()
+        finally:
+            if self.checkpoint_uploader is not None:
+                self.checkpoint_uploader.close()
 
     def _maybe_log(self) -> None:
         step = self.runtime.state.step
@@ -81,7 +93,10 @@ class Trainer:
         if step == 0 or step % self.config.checkpoint_every != 0:
             return
         assert self.config.checkpoint_dir is not None
-        save_sharded_checkpoint(self.runtime.state_manager, _checkpoint_step_dir(self.config.checkpoint_dir, step))
+        checkpoint_dir = _checkpoint_step_dir(self.config.checkpoint_dir, step)
+        save_sharded_checkpoint(self.runtime.state_manager, checkpoint_dir)
+        if self.checkpoint_uploader is not None and _is_log_rank():
+            self.checkpoint_uploader.upload_checkpoint(checkpoint_dir, step)
 
 
 def _checkpoint_step_dir(checkpoint_dir: str | Path, step: int) -> Path:
