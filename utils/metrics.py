@@ -189,10 +189,11 @@ class WandbCheckpointUploader:
             metadata={"step": step, "path": str(checkpoint_dir)},
         )
         artifact.add_dir(str(checkpoint_dir))
-        self.logger.run.log_artifact(
+        logged_artifact = self.logger.run.log_artifact(
             artifact,
             aliases=["latest", f"step_{step}"],
         )
+        logged_artifact.wait()
 
 
 def _format_metrics(metrics: dict[str, MetricValue]) -> str:
