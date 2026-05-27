@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", required=True, type=int, nargs="+", help="Checkpoint steps to upload")
     parser.add_argument("--project", required=True, type=str, help="W&B project")
     parser.add_argument("--entity", type=str, default=None, help="W&B entity/team")
+    parser.add_argument("--run-id", type=str, default=None, help="Existing W&B run id to attach artifacts to")
+    parser.add_argument("--resume", type=str, default="allow", choices=("allow", "must", "never", "auto"))
     parser.add_argument("--run-name", type=str, default=None, help="Temporary W&B run name for the upload")
     parser.add_argument("--artifact-prefix", type=str, default=None, help="Artifact name prefix. Defaults to checkpoint root name")
     parser.add_argument("--artifact-type", type=str, default="checkpoint")
@@ -43,12 +45,18 @@ def main() -> None:
     import wandb
 
     artifact_prefix = _sanitize_artifact_name(args.artifact_prefix or checkpoint_root.name)
-    run = wandb.init(
-        project=args.project,
-        entity=args.entity,
-        name=args.run_name or f"upload-{artifact_prefix}",
-        job_type="checkpoint-upload",
-    )
+    init_kwargs = {
+        "project": args.project,
+        "entity": args.entity,
+        "name": args.run_name or f"upload-{artifact_prefix}",
+        "job_type": "checkpoint-upload",
+    }
+    if args.run_id is not None:
+        init_kwargs["id"] = args.run_id
+        init_kwargs["resume"] = args.resume
+        if args.run_name is None:
+            init_kwargs.pop("name")
+    run = wandb.init(**init_kwargs)
     try:
         for step in args.steps:
             checkpoint_dir = checkpoint_root / f"step_{step:08d}"
