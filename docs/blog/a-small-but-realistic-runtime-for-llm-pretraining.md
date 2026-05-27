@@ -20,7 +20,7 @@ to validate system behavior, not to train a useful language model.
 
 repo: [xing7code/llm-train-systems](https://github.com/xing7code/llm-train-systems)
 
-experiment tracking: [W&B run](https://wandb.ai/xing7-org/llm-train-systems/runs/oxqveqbo)
+experiment tracking: [W&B report](https://api.wandb.ai/links/xing7-org/f2s88x30)
 
 ## Design Goals
 
@@ -482,9 +482,12 @@ RTX 4090 GPUs with `dp=2`, `tp=2`, sequence parallelism enabled, ZeRO3,
 BF16 compute, gradient accumulation of 8, and gradient clipping. The final
 logged loss was about 0.56. Throughput stayed around 4.2k-4.4k tokens/sec, with
 about 1.33GB reserved memory per GPU. The low memory footprint is expected for a
-small model under TP plus ZeRO3 sharding; the point of the run is not to fill a
-4090, but to prove that the composed runtime path can train, checkpoint,
-resume, and export metrics on real tokenized data.
+small model under TP plus ZeRO3 sharding. The throughput number is global, not
+per GPU, and per-GPU throughput is lower than the single-GPU baseline because
+this model is too small to amortize TP all-gather/reduce-scatter overhead. That
+is expected. The point of the run is not to fill a 4090, but to prove that the
+composed runtime path can train, checkpoint, resume, and export metrics on real
+tokenized data.
 
 ## Lessons
 
