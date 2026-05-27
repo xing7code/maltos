@@ -109,23 +109,7 @@ Each plugin declares a stable plugin id and optional dependency constraints. The
 runtime resolves the plugin order with a small topological sort before executing
 phase hooks.
 
-```mermaid
-flowchart TD
-    Precision[precision]
-    TP[tensor_parallel]
-    SP[sequence_parallel]
-    DDP[bucket_ddp]
-    Z3[zero3]
-    Clip[grad_clip]
-    Perf[perf_metrics]
-
-    TP --> SP
-    TP --> Z3
-    SP --> Z3
-    DDP --> Clip
-    Z3 --> Clip
-    Precision --> Perf
-```
+<img src="assets/plugin-dependencies.svg" alt="Plugin dependency graph" width="100%">
 
 This is intentionally stricter than relying on construction order. It makes
 plugin composition explicit and catches invalid runtime configurations early.
@@ -368,13 +352,16 @@ Single 4090 summary:
 
 Small single-GPU run:
 
-![Single-GPU small loss](assets/wandb-small-loss.png)
-
-![Single-GPU small throughput](assets/wandb-small-tokens-per-sec.png)
-
-![Single-GPU small TFLOPS](assets/wandb-small-tflops.png)
-
-![Single-GPU small memory](assets/wandb-small-memory.png)
+<table>
+<tr>
+<td><img src="assets/wandb-small-loss.png" alt="Single-GPU small loss"></td>
+<td><img src="assets/wandb-small-tokens-per-sec.png" alt="Single-GPU small throughput"></td>
+</tr>
+<tr>
+<td><img src="assets/wandb-small-tflops.png" alt="Single-GPU small TFLOPS"></td>
+<td><img src="assets/wandb-small-memory.png" alt="Single-GPU small memory"></td>
+</tr>
+</table>
 
 The small configuration has low absolute TFLOPS because the workload is too
 small to saturate a 4090.
@@ -388,13 +375,16 @@ under-utilization of such a small workload on a 4090.
 
 Bigger single-GPU run:
 
-![Single-GPU bigger loss](assets/wandb-bigger-loss.png)
-
-![Single-GPU bigger throughput](assets/wandb-bigger-tokens-per-sec.png)
-
-![Single-GPU bigger TFLOPS](assets/wandb-bigger-tflops.png)
-
-![Single-GPU bigger memory](assets/wandb-bigger-memory.png)
+<table>
+<tr>
+<td><img src="assets/wandb-bigger-loss.png" alt="Single-GPU bigger loss"></td>
+<td><img src="assets/wandb-bigger-tokens-per-sec.png" alt="Single-GPU bigger throughput"></td>
+</tr>
+<tr>
+<td><img src="assets/wandb-bigger-tflops.png" alt="Single-GPU bigger TFLOPS"></td>
+<td><img src="assets/wandb-bigger-memory.png" alt="Single-GPU bigger memory"></td>
+</tr>
+</table>
 
 Increasing the sequence length and model size raises reported TFLOPS from
 roughly 0.8 to 4.5-4.8 while keeping tokens/sec stable. This is the expected
@@ -405,13 +395,16 @@ training. With `log_every=10`, the first printed resumed step was 210, as
 expected. The first step after resume can be slightly slower due to load and
 warmup effects, but steady-state throughput returned to the previous range.
 
-![Single-GPU small resume loss](assets/wandb-small-resume-loss.png)
-
-![Single-GPU small resume throughput](assets/wandb-small-resume-tokens-per-sec.png)
-
-![Single-GPU small resume TFLOPS](assets/wandb-small-resume-tflops.png)
-
-![Single-GPU small resume memory](assets/wandb-small-resume-memory.png)
+<table>
+<tr>
+<td><img src="assets/wandb-small-resume-loss.png" alt="Single-GPU small resume loss"></td>
+<td><img src="assets/wandb-small-resume-tokens-per-sec.png" alt="Single-GPU small resume throughput"></td>
+</tr>
+<tr>
+<td><img src="assets/wandb-small-resume-tflops.png" alt="Single-GPU small resume TFLOPS"></td>
+<td><img src="assets/wandb-small-resume-memory.png" alt="Single-GPU small resume memory"></td>
+</tr>
+</table>
 
 This validates that the checkpoint includes more than parameters: optimizer
 state, trainer step, and dataloader cursor all need to resume together.
