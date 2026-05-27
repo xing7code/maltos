@@ -416,13 +416,53 @@ on real tokenized data.
 
 ### Distributed Results
 
-TODO: Fill after 2-GPU and 4-GPU experiments.
+The 2-GPU runs validate two different distributed paths. TP+SP exercises
+model-parallel transformation and sequence activation sharding. Bucketed DDP
+exercises data-parallel gradient reduction.
 
 | Run | Topology | Loss Trend | Tokens / Sec | Step Time | Memory | Checkpoint / Resume |
 |---|---|---|---:|---:|---:|---|
-| TP/SP | `tp=2, sp=true` | TODO | TODO | TODO | TODO | TODO |
-| bucketed DDP | `dp=2, ddp=bucket` | TODO | TODO | TODO | TODO | TODO |
+| TP/SP | `tp=2, sp=true` | 2.48 -> ~1.67 | ~2.3k-2.7k | ~7.6s-9.0s | ~1.0GB reserved | resumed 200 -> 250 |
+| bucketed DDP | `dp=2, ddp=bucket` | 2.46 -> ~1.63 | ~5.6k-5.9k | ~6.9s-7.2s | ~1.07GB reserved | resumed 200 -> 250 |
 | ZeRO3 composed | `dp=2, tp=2, sp=true, zero=3` | TODO | TODO | TODO | TODO | TODO |
+
+TP+SP run:
+
+<table>
+<tr>
+<td><img src="assets/wandb-tp2-sp-loss.png" alt="TP2 SP loss"></td>
+<td><img src="assets/wandb-tp2-sp-tokens-per-sec.png" alt="TP2 SP throughput"></td>
+</tr>
+<tr>
+<td><img src="assets/wandb-tp2-sp-tflops.png" alt="TP2 SP TFLOPS"></td>
+<td><img src="assets/wandb-tp2-sp-memory.png" alt="TP2 SP memory"></td>
+</tr>
+</table>
+
+The TP+SP run is slower than the single-GPU baseline because this model is too
+small for tensor-parallel communication to pay off. That is expected. The point
+of this run is correctness: the model-parallel plugins transform the model,
+loss decreases normally, token accounting is not double-counted across TP
+ranks, and checkpoint/resume works.
+
+Bucketed DDP run:
+
+<table>
+<tr>
+<td><img src="assets/wandb-dp2-bucket-loss.png" alt="DP2 bucket DDP loss"></td>
+<td><img src="assets/wandb-dp2-bucket-tokens-per-sec.png" alt="DP2 bucket DDP throughput"></td>
+</tr>
+<tr>
+<td><img src="assets/wandb-dp2-bucket-tflops.png" alt="DP2 bucket DDP TFLOPS"></td>
+<td><img src="assets/wandb-dp2-bucket-memory.png" alt="DP2 bucket DDP memory"></td>
+</tr>
+</table>
+
+Bucketed DDP increases the global tokens per optimizer step from 2,048 to 4,096
+by adding a second data-parallel replica. Throughput improves over the
+single-GPU baseline, while memory stays close to the single-GPU run because DDP
+replicates parameters rather than sharding them. This run validates the
+bucketed gradient-reduction path.
 
 The most important distributed run is the 4-GPU ZeRO3 composition. It exercises
 the parts of the system that are hardest to fake: process-group topology,

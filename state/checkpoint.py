@@ -14,6 +14,7 @@ from state.state import (
     StateManager,
     TrainerState,
 )
+from utils.distributed import distributed_barrier
 
 
 @dataclass(frozen=True)
@@ -102,8 +103,7 @@ def save_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> No
         with open(checkpoint_dir / "manifest.json", "w", encoding="utf-8") as f:
             json.dump(asdict(manifest), f, indent=2)
 
-    if dist.is_initialized():
-        dist.barrier()
+    distributed_barrier()
 
 
 def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> None:
@@ -151,8 +151,7 @@ def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> No
     from runtime.core import RuntimePhase
 
     runtime._run_phase(RuntimePhase.POST_LOAD)
-    if dist.is_initialized():
-        dist.barrier()
+    distributed_barrier()
 
 
 def _load_manifest(checkpoint_dir: Path) -> CheckpointManifest:

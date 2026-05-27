@@ -40,6 +40,7 @@ from utils.metrics import (
     WandbCheckpointUploader,
     WandbMetricLogger,
 )
+from utils.distributed import distributed_barrier
 
 
 def parse_args() -> argparse.Namespace:
@@ -162,7 +163,7 @@ def main() -> None:
     )
     trainer.fit()
     if dist.is_initialized():
-        dist.barrier()
+        distributed_barrier()
         dist.destroy_process_group()
 
 
