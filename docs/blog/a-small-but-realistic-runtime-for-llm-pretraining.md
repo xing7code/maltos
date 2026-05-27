@@ -18,9 +18,9 @@ This post describes the design of that runtime and the first set of real
 training experiments. The experiments are intentionally small. They are meant
 to validate system behavior, not to train a useful language model.
 
-repo: https://github.com/xing7code/llm-train-systems
->
-> TODO: Add W&B report link once the 2-GPU and 4-GPU runs are complete.
+repo: [xing7code/llm-train-systems](https://github.com/xing7code/llm-train-systems)
+
+experiment tracking: [W&B run](https://wandb.ai/xing7-org/llm-train-systems/runs/oxqveqbo)
 
 ## Design Goals
 
@@ -314,8 +314,6 @@ The single-GPU runs used two LLaMA-style model sizes:
 | small | 38.7M | 6 | 384 | 6 | 1,536 | 512 |
 | bigger | 66.3M | 8 | 512 | 8 | 2,048 | 1024 |
 
-TODO: Add public repo link and W&B Report link.
-
 ### Runs
 
 | Run | Hardware | Topology | Data | Seq Len | Purpose |
@@ -325,9 +323,7 @@ TODO: Add public repo link and W&B Report link.
 | resume | 1x4090 | restore from step 200 | 10M | 512 | validate model/optimizer/data resume |
 | TP/SP | 2xGPU | `tp=2, sp=true` | 10M | 1024 | validate model-parallel execution |
 | bucketed DDP | 2xGPU | `dp=2, ddp=bucket` | 10M | 1024 | validate bucketed gradient reduction |
-| ZeRO3 composed | 4xGPU | `dp=2, tp=2, sp=true, zero=3` | 10M/50M | 1024 | validate composed sharding |
-
-TODO: Update hardware names after the final 2-GPU and 4-GPU runs.
+| ZeRO3 composed | 4x4090 | `dp=2, tp=2, sp=true, zero=3` | 50M | 1024 | validate composed sharding |
 
 ### Results Summary
 
@@ -424,7 +420,7 @@ exercises data-parallel gradient reduction.
 |---|---|---|---:|---:|---:|---|
 | TP/SP | `tp=2, sp=true` | 2.48 -> ~1.67 | ~2.3k-2.7k | ~7.6s-9.0s | ~1.0GB reserved | resumed 200 -> 250 |
 | bucketed DDP | `dp=2, ddp=bucket` | 2.46 -> ~1.63 | ~5.6k-5.9k | ~6.9s-7.2s | ~1.07GB reserved | resumed 200 -> 250 |
-| ZeRO3 composed | `dp=2, tp=2, sp=true, zero=3` | TODO | TODO | TODO | TODO | TODO |
+| ZeRO3 composed | `dp=2, tp=2, sp=true, zero=3` | ~1.16 -> ~0.56 | ~4.2k-4.4k | ~3.8s | ~1.33GB reserved | resumed 2500 -> 3100 |
 
 TP+SP run:
 
@@ -467,6 +463,28 @@ bucketed gradient-reduction path.
 The most important distributed run is the 4-GPU ZeRO3 composition. It exercises
 the parts of the system that are hardest to fake: process-group topology,
 parameter sharding, optimizer ownership, distributed checkpointing, and resume.
+
+4-GPU ZeRO3 composed run:
+
+<table>
+<tr>
+<td><img src="assets/wandb-4gpu-zero3-loss.png" alt="4GPU ZeRO3 loss"></td>
+<td><img src="assets/wandb-4gpu-zero3-tokens-per-sec.png" alt="4GPU ZeRO3 throughput"></td>
+</tr>
+<tr>
+<td><img src="assets/wandb-4gpu-zero3-tflops.png" alt="4GPU ZeRO3 TFLOPS"></td>
+<td><img src="assets/wandb-4gpu-zero3-memory.png" alt="4GPU ZeRO3 memory"></td>
+</tr>
+</table>
+
+This run trained for 3,100 optimizer steps, or about 50.8M tokens. It used four
+RTX 4090 GPUs with `dp=2`, `tp=2`, sequence parallelism enabled, ZeRO3,
+BF16 compute, gradient accumulation of 8, and gradient clipping. The final
+logged loss was about 0.56. Throughput stayed around 4.2k-4.4k tokens/sec, with
+about 1.33GB reserved memory per GPU. The low memory footprint is expected for a
+small model under TP plus ZeRO3 sharding; the point of the run is not to fill a
+4090, but to prove that the composed runtime path can train, checkpoint,
+resume, and export metrics on real tokenized data.
 
 ## Lessons
 
