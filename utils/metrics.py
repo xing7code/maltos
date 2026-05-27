@@ -72,12 +72,12 @@ class DistributedMetricSync:
         if value is None:
             return None
         if reduction == MetricReduction.ANY:
-            tensor = torch.tensor(int(bool(value)), dtype=torch.int64)
+            tensor = torch.tensor(int(bool(value)), dtype=torch.int64, device=_distributed_metric_device())
             dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
             return bool(tensor.item())
         if not isinstance(value, (float, int, bool)):
             return value
-        tensor = torch.tensor(float(value), dtype=torch.float64)
+        tensor = torch.tensor(float(value), dtype=torch.float64, device=_distributed_metric_device())
         if reduction == MetricReduction.MEAN:
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
             tensor /= dist.get_world_size()
@@ -91,6 +91,12 @@ class DistributedMetricSync:
         if reduction == MetricReduction.LAST:
             return value
         raise ValueError(f"unsupported distributed metric reduction={reduction.value}")
+
+
+def _distributed_metric_device() -> torch.device:
+    if dist.is_initialized() and dist.get_backend() == "nccl":
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
 
 
 class ConsoleMetricLogger:
