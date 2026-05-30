@@ -4,6 +4,10 @@ A compact pretraining runtime for experimenting with modern large-model training
 
 The goal of this repo is not to hide PyTorch behind a framework. The goal is to make the moving pieces of a pretraining system explicit: process meshes, runtime phases, composable parallel plugins, sharded checkpointing, dataloader state, metric aggregation, and a trainer loop that can run real token shards.
 
+Technical writeup: [A Small but Realistic Runtime for LLM Pretraining](docs/blog/a-small-but-realistic-runtime-for-llm-pretraining.md)
+
+Experiment tracking: [W&B report](https://api.wandb.ai/links/xing7-org/f2s88x30)
+
 ## What Works
 
 - Runtime plugin system with dependency ordering and phase hooks.
@@ -19,6 +23,26 @@ The goal of this repo is not to hide PyTorch behind a framework. The goal is to 
 - End-to-end LLaMA/tiny pretraining recipe.
 
 This is intentionally small enough to read, but the core control flow mirrors the shape of larger pretraining systems: Megatron-style TP/SP, ZeRO/FSDP-style optimizer ownership, explicit process mesh axes, and checkpoint metadata that describes local shards.
+
+## Support Matrix
+
+| Area | Status |
+|---|---|
+| Single-process training | Supported |
+| Sync / async / bucketed DDP | Supported |
+| Tensor parallelism | Supported |
+| Sequence parallelism | Supported |
+| ZeRO-1 / ZeRO-2 / ZeRO-3 style sharding | Supported |
+| BF16 / FP16 precision hooks | Supported |
+| Gradient accumulation / clipping | Supported |
+| Stateful token-shard dataloader | Supported |
+| Sharded checkpoint save/load | Supported |
+| W&B metric logging and checkpoint artifacts | Supported |
+| Pipeline parallelism | Planned |
+| Context parallelism | Planned |
+| Expert parallelism | Planned |
+| Activation checkpointing | Planned |
+| FlashAttention-specific kernels | Planned |
 
 ## System Flow
 
@@ -98,7 +122,7 @@ The pretraining path passes dataloader batches directly through the trainer/runt
 data/       Stateful tensor and token-shard dataloaders
 models/     TinyModel, TinyTransformer, and LLaMA variants with TP/SP specs
 parallel/   ParallelPlan and TP/SP sharding specs
-runtime/    RuntimeCore, ProcessMesh, plugin API, layers, plugins
+runtime/    RuntimeCore, MeshConfig/group management, plugin API, layers, plugins
 state/      StateManager and sharded checkpoint IO
 train/      Trainer loop
 utils/      Logging and metric aggregation utilities
@@ -246,6 +270,17 @@ W&B checkpoint artifacts can be enabled by setting `--wandb-checkpoint-every N`.
 source of truth, and rank 0 uploads selected checkpoint directories
 asynchronously as W&B Artifacts.
 
+Existing checkpoints can also be uploaded manually:
+
+```bash
+PYTHONPATH=. .venv/bin/python tools/upload_wandb_checkpoint.py \
+  --checkpoint-dir checkpoints/llama_50m_dp2_tp2_sp_zero3 \
+  --steps 500 1000 1500 2000 2500 \
+  --project llm-train-systems \
+  --entity xing7-org \
+  --artifact-prefix llama-50m-dp2-tp2-sp-zero3-main
+```
+
 ## Checkpointing
 
 Each checkpoint step is a directory:
@@ -282,5 +317,7 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
 ## Current Limitations
 
 - Pipeline parallel, context parallel, and expert parallel are planned but not implemented yet.
-- The tiny transformer is intentionally small and readable; it is not a production model implementation.
+- Activation checkpointing and FlashAttention-specific kernels are not implemented yet.
+- The current implementation prioritizes clarity and correctness over Megatron-level throughput optimization.
+- The tiny transformer is intentionally small and readable; the LLaMA path is more realistic but still minimal.
 - YAML recipes cover the main experiment settings; CLI flags can override any recipe field for quick sweeps.

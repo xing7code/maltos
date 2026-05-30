@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run CPU smoke tests
+        env:
+          PYTHONPATH: .
+        run: |
+          python tests/smoke_runtime_core.py
+          python tests/smoke_trainer_loop.py
+
+      - name: Run tiny pretraining smoke
+        env:
+          PYTHONPATH: .
+        run: |
+          python tools/pretrain.py \
+            --model tiny \
+            --data tests/testdata \
+            --vocab-size 256 \
+            --dim 32 \
+            --n-heads 4 \
+            --hidden-size 64 \
+            --n-layers 1 \
+            --seq-len 16 \
+            --micro-batch-size 1 \
+            --max-steps 2 \
+            --log-every 1
