@@ -31,9 +31,11 @@ def _build_model(seed: int, hidden_size: int) -> TinyModel:
 
 
 def _build_core(model: TinyModel) -> RuntimeCore:
-    optimizer = torch.optim.AdamW(model.parameters(), lr=_LR, weight_decay=0.0)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
-    core = RuntimeCore(model=model, optimizer=optimizer, scheduler=scheduler)
+    core = RuntimeCore(
+        model=model,
+        optimizer_factory=lambda params: torch.optim.AdamW(params, lr=_LR, weight_decay=0.0),
+        scheduler_factory=lambda optimizer: torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5),
+    )
     core.setup()
     return core
 

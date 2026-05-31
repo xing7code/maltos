@@ -47,12 +47,12 @@ def _build_model(seed: int, hidden_size: int) -> TinyModel:
 
 
 def _build_core(model: TinyModel, world_size: int) -> tuple[RuntimeCore, Zero3Plugin]:
-    zero3 = Zero3Plugin(enable_prefetch=True, optimizer_cls=torch.optim.AdamW, lr=_LR, weight_decay=0.0)
+    zero3 = Zero3Plugin(enable_prefetch=True)
     core = RuntimeCore(
         mesh=MeshConfig(dp=world_size, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=3),
         model=model,
-        optimizer=None,
+        optimizer_factory=lambda params: torch.optim.AdamW(params, lr=_LR, weight_decay=0.0),
         plugins=[zero3],
     )
     core.setup()

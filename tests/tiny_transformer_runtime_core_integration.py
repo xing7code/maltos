@@ -166,23 +166,19 @@ def _make_plugins(case: str):
     if case == "tp_sp_ddp_bucket":
         return plugins + [BucketDataParallelPlugin(bucket_mb_size=0)], 0
     if case == "tp_sp_zero1":
-        return plugins + [Zero1Plugin(bucket_mb_size=0, optimizer_cls=torch.optim.SGD, lr=_LR)], 1
+        return plugins + [Zero1Plugin(bucket_mb_size=0)], 1
     if case == "tp_sp_zero2":
-        return plugins + [Zero2Plugin(bucket_mb_size=0, optimizer_cls=torch.optim.SGD, lr=_LR)], 2
+        return plugins + [Zero2Plugin(bucket_mb_size=0)], 2
     if case == "tp_sp_zero3":
         return plugins + [
             Zero3Plugin(
                 wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
-                optimizer_cls=torch.optim.SGD,
-                lr=_LR,
             )
         ], 3
     if case in {"tp_sp_zero3_bf16_clip", "tp_sp_zero3_bf16_clip_accum2"}:
         return plugins + [
             Zero3Plugin(
                 wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
-                optimizer_cls=torch.optim.SGD,
-                lr=_LR,
             ),
             PrecisionPlugin(compute_dtype=torch.bfloat16),
             GradClipPlugin(max_norm=1.0),
@@ -192,8 +188,6 @@ def _make_plugins(case: str):
             TensorParallelPlugin(),
             Zero3Plugin(
                 wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
-                optimizer_cls=torch.optim.SGD,
-                lr=_LR,
             ),
             PrecisionPlugin(compute_dtype=torch.bfloat16),
             GradClipPlugin(max_norm=1.0),
@@ -240,20 +234,15 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if local_batch_size % grad_accum_steps != 0:
         raise ValueError("local batch size must be divisible by grad_accum_steps")
     plugins, zero_stage = _make_plugins(args.case)
-    has_plugin_optimizer_owner = any(plugin.owns_optimizer for plugin in plugins)
     core = RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=zero_stage),
         model=sharded_model,
-        optimizer=torch.optim.SGD(sharded_model.parameters(), lr=0.0)
-        if zero_stage == 0 and not has_plugin_optimizer_owner
-        else None,
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=plugins,
         grad_accum_steps=grad_accum_steps,
     )
     core.setup()
-    if zero_stage == 0 and not has_plugin_optimizer_owner:
-        core.optimizer = torch.optim.SGD(core.model.parameters(), lr=_LR)
 
     if args.case in {"tp_bf16", "tp_zero3_bf16_clip", "tp_zero3_bf16_clip_accum2"}:
         bf16_ok = 1

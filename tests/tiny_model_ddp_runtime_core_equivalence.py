@@ -127,7 +127,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         mesh=MeshConfig(dp=args.world_size, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(),
         model=ddp_model,
-        optimizer=_NoOpOptimizer(ddp_model.parameters()),
+        optimizer_factory=lambda params: _NoOpOptimizer(params),
         plugins=plugins,
     )
     core.setup()

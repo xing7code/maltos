@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr-schedule", type=str, default="constant", choices=("constant", "linear", "cosine"))
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--min-lr", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--model", type=str, default="tiny", choices=("tiny", "llama"))
@@ -213,7 +217,8 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
 
 def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: torch.device) -> RuntimeCore:
     plugins = []
-    optimizer_factory = None
+    optimizer_factory = lambda params: torch.optim.AdamW(params, lr=args.lr)
+    scheduler_factory = _build_scheduler_factory(args)
     if args.tp_size > 1:
         plugins.append(TensorParallelPlugin())
     if args.use_sp:
@@ -221,17 +226,14 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
     if args.zero_stage == 0:
         if args.dp_size > 1:
             plugins.append(_build_ddp(args.ddp_mode or "sync"))
-        optimizer_factory = lambda module: torch.optim.AdamW(module.parameters(), lr=args.lr)
     elif args.zero_stage == 1:
-        plugins.append(Zero1Plugin(optimizer_cls=torch.optim.AdamW, lr=args.lr))
+        plugins.append(Zero1Plugin())
     elif args.zero_stage == 2:
-        plugins.append(Zero2Plugin(optimizer_cls=torch.optim.AdamW, lr=args.lr))
+        plugins.append(Zero2Plugin())
     else:
         plugins.append(
             Zero3Plugin(
                 wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
-                optimizer_cls=torch.optim.AdamW,
-                lr=args.lr,
             )
         )
     compute_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
@@ -248,6 +250,7 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         device=device,
         model=model,
         optimizer_factory=optimizer_factory,
+        scheduler_factory=scheduler_factory,
         plugins=plugins,
         grad_accum_steps=args.grad_accum_steps,
     )
@@ -257,6 +260,34 @@ def _build_ddp(mode: str) -> DataParallelPlugin | BucketDataParallelPlugin:
     if mode == "bucket":
         return BucketDataParallelPlugin()
     return DataParallelPlugin(async_op=(mode == "async"))
+
+
+def _build_scheduler_factory(args: argparse.Namespace):
+    if args.warmup_steps < 0:
+        raise ValueError("--warmup-steps must be >= 0")
+    if args.min_lr < 0:
+        raise ValueError("--min-lr must be >= 0")
+    if args.min_lr > args.lr:
+        raise ValueError("--min-lr must be <= --lr")
+    if args.lr_schedule == "constant" and args.warmup_steps == 0:
+        return None
+
+    min_lr_ratio = args.min_lr / args.lr if args.lr > 0 else 0.0
+
+    def lr_multiplier(step: int) -> float:
+        if args.warmup_steps > 0 and step < args.warmup_steps:
+            return max(0.0, step / args.warmup_steps)
+        if args.lr_schedule == "constant":
+            return 1.0
+        decay_steps = max(1, args.max_steps - args.warmup_steps)
+        progress = min(1.0, max(0.0, (step - args.warmup_steps) / decay_steps))
+        if args.lr_schedule == "linear":
+            return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - progress)
+        if args.lr_schedule == "cosine":
+            return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(progress * math.pi))
+        raise ValueError(f"unknown lr_schedule={args.lr_schedule}")
+
+    return lambda optimizer: torch.optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
 
 
 def _build_logging(args: argparse.Namespace, rank: int) -> tuple[list[MetricLogger] | None, WandbCheckpointUploader | None]:
@@ -340,6 +371,9 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("training", "max_steps"): "max_steps",
         ("training", "grad_accum_steps"): "grad_accum_steps",
         ("training", "lr"): "lr",
+        ("training", "lr_schedule"): "lr_schedule",
+        ("training", "warmup_steps"): "warmup_steps",
+        ("training", "min_lr"): "min_lr",
         ("training", "precision"): "precision",
         ("training", "grad_clip"): "grad_clip",
         ("training", "disable_perf_metrics"): "disable_perf_metrics",
@@ -406,7 +440,8 @@ def _print_run_summary(
     print(f"plugins={plugin_names}")
     print(
         "training="
-        f"precision={args.precision} lr={args.lr} grad_accum_steps={args.grad_accum_steps} "
+        f"precision={args.precision} lr={args.lr} lr_schedule={args.lr_schedule} "
+        f"warmup_steps={args.warmup_steps} min_lr={args.min_lr} grad_accum_steps={args.grad_accum_steps} "
         f"micro_batch_size={args.micro_batch_size} seq_len={args.seq_len}"
     )
     print(

@@ -87,12 +87,12 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_loss = baseline_model(full_batch)
     baseline_loss.backward()
 
-    zero3 = Zero3Plugin(enable_prefetch=not args.disable_prefetch, optimizer_cls=torch.optim.SGD, lr=_LR)
+    zero3 = Zero3Plugin(enable_prefetch=not args.disable_prefetch)
     core = RuntimeCore(
         mesh=MeshConfig(dp=args.world_size, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=3),
         model=zero_model,
-        optimizer=None,
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=[zero3],
         grad_accum_steps=args.grad_accum_steps,
     )

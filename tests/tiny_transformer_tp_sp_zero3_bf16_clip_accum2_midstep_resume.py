@@ -141,14 +141,12 @@ def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tup
 def _build_runtime(model: TinyTransformerTpSp, dp_size: int, tp_size: int) -> tuple[RuntimeCore, Zero3Plugin]:
     zero3 = Zero3Plugin(
         wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
-        optimizer_cls=torch.optim.SGD,
-        lr=_LR,
     )
     core = RuntimeCore(
         mesh=MeshConfig(dp=dp_size, tp=tp_size, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=3),
         model=model,
-        optimizer=None,
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=[
             TensorParallelPlugin(),
             SequenceParallelPlugin(),

@@ -40,8 +40,10 @@ def parse_args() -> argparse.Namespace:
 def _build_core(seed: int) -> RuntimeCore:
     torch.manual_seed(seed)
     model = TinyTransformer(**_MODEL_KWARGS)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=_LR, weight_decay=0.0)
-    core = RuntimeCore(model=model, optimizer=optimizer)
+    core = RuntimeCore(
+        model=model,
+        optimizer_factory=lambda params: torch.optim.AdamW(params, lr=_LR, weight_decay=0.0),
+    )
     core.setup()
     return core
 

@@ -90,14 +90,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         mesh=MeshConfig(dp=args.world_size, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=2),
         model=zero_model,
-        optimizer=None,
-        plugins=[
-            Zero2Plugin(
-                bucket_mb_size=args.bucket_mb_size,
-                optimizer_cls=torch.optim.SGD,
-                lr=_LR,
-            )
-        ],
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
+        plugins=[Zero2Plugin(bucket_mb_size=args.bucket_mb_size)],
         grad_accum_steps=args.grad_accum_steps,
     )
     core.setup()

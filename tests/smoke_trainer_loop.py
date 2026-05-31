@@ -60,7 +60,7 @@ def _make_runtime(seed: int = 1234) -> RuntimeCore:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=0.01),
     )
 
 
@@ -151,7 +151,7 @@ def test_trainer_collects_each_microbatch_metric() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=0.0),
         grad_accum_steps=2,
     )
     logger = CaptureLogger()

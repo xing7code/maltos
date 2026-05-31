@@ -17,8 +17,11 @@ from state import load_sharded_checkpoint, save_sharded_checkpoint
 def _build_core(seed: int = 1234, hidden_size: int = 32, grad_accum_steps: int = 1) -> RuntimeCore:
     torch.manual_seed(seed)
     model = TinyModel(hidden_size=hidden_size)
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
-    core = RuntimeCore(model=model, optimizer=optimizer, grad_accum_steps=grad_accum_steps)
+    core = RuntimeCore(
+        model=model,
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=1e-2),
+        grad_accum_steps=grad_accum_steps,
+    )
     core.setup()
     return core
 

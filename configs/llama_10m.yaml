@@ -29,6 +29,9 @@ training:
   max_steps: 250
   grad_accum_steps: 4
   lr: 3.0e-4
+  lr_schedule: cosine
+  warmup_steps: 20
+  min_lr: 3.0e-5
   precision: bf16
   grad_clip: 1.0
 

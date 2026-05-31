@@ -162,7 +162,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         mesh=MeshConfig(dp=1, tp=args.tp_size, pp=1, cp=1, ep=1),
         plan=ParallelPlan(),
         model=sharded_model,
-        optimizer=torch.optim.SGD(sharded_model.parameters(), lr=0.0),
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=0.0),
         plugins=plugins,
     )
     core.setup()

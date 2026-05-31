@@ -268,6 +268,16 @@ initialized only on rank 0. Fine-grained profiling is intentionally kept out of
 the steady-state training path. MFU is a reporting layer concern and can be
 computed offline from `perf/tflops_per_gpu` and a declared hardware peak.
 
+Training recipes support constant, linear, and cosine LR schedules:
+
+```yaml
+training:
+  lr: 3.0e-4
+  lr_schedule: cosine
+  warmup_steps: 100
+  min_lr: 3.0e-5
+```
+
 The LLaMA path supports block-level activation checkpointing:
 
 ```bash

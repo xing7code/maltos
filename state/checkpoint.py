@@ -52,9 +52,9 @@ def save_sharded_checkpoint(
         _check_min_free_space(checkpoint_dir.parent, min_free_gb)
     tmp_dir = checkpoint_dir.with_name(f"{checkpoint_dir.name}.tmp")
     rank = dist.get_rank() if dist.is_initialized() else 0
-    if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
-        raise FileExistsError(f"checkpoint already exists: {checkpoint_dir}")
     if rank == 0:
+        if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
+            raise FileExistsError(f"checkpoint already exists: {checkpoint_dir}")
         if checkpoint_dir.exists():
             checkpoint_dir.rmdir()
         if tmp_dir.exists():

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from graphlib import TopologicalSorter
@@ -15,7 +15,7 @@ from runtime.mesh import MeshAxis, MeshConfig, ProcessGroupManager
 from runtime.plugin import FlopsEstimatableModule, MetricValue, RuntimePlugin
 from state.state import StateManager
 
-OptimizerFactory = Callable[[nn.Module], torch.optim.Optimizer]
+OptimizerFactory = Callable[[Iterable[nn.Parameter]], torch.optim.Optimizer]
 SchedulerFactory = Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler.LRScheduler]
 
 
@@ -59,15 +59,15 @@ class RuntimeCore:
     mesh: MeshConfig = field(default_factory=MeshConfig)
     plan: ParallelPlan = field(default_factory=ParallelPlan)
     device: torch.device | str | None = None
-    optimizer: torch.optim.Optimizer | None = None
     optimizer_factory: OptimizerFactory | None = None
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
     scheduler_factory: SchedulerFactory | None = None
     plugins: list[RuntimePlugin] = field(default_factory=list)
     group_manager: ProcessGroupManager | None = None
     state_manager: StateManager = field(default_factory=StateManager)
     state: RuntimeState = field(default_factory=RuntimeState)
     grad_accum_steps: int = 1
+    optimizer: torch.optim.Optimizer | None = field(default=None, init=False)
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
@@ -90,7 +90,7 @@ class RuntimeCore:
         self.state_manager.register_module(self.model)
         self._run_phase(RuntimePhase.TRANSFORM_MODEL)
         self._populate_static_model_metrics()
-        self._build_runtime_optimizer()
+        self._maybe_build_runtime_optimizer()
         self._validate_optimizer_owner()
 
     def run_train_step(self, batch: Any) -> torch.Tensor:
@@ -140,6 +140,19 @@ class RuntimeCore:
             if plugin.owns_optimizer:
                 return getattr(plugin, "optimizer", None), getattr(plugin, "scheduler", None)
         return None, None
+
+    def create_optimizer(self, params: Iterable[nn.Parameter]) -> torch.optim.Optimizer:
+        if self.optimizer_factory is None:
+            raise ValueError("optimizer_factory is required to create an optimizer")
+        return self.optimizer_factory(params)
+
+    def create_scheduler(
+        self,
+        optimizer: torch.optim.Optimizer,
+    ) -> torch.optim.lr_scheduler.LRScheduler | None:
+        if self.scheduler_factory is None:
+            return None
+        return self.scheduler_factory(optimizer)
 
     def optimizer_step(self) -> None:
         optimizer, scheduler = self.get_optimizer_and_scheduler()
@@ -193,11 +206,11 @@ class RuntimeCore:
         return self.optimizer_state_source_rank(rank_id) == rank_id
 
     def optimizer_state_source_rank(self, rank_id: int) -> int:
-        if self.optimizer is None:
+        if self._plugin_owns_optimizer():
             for plugin in self.plugins:
                 if plugin.owns_optimizer:
                     return plugin.optimizer_state_source_rank(rank_id)
-            return rank_id
+            raise RuntimeError("optimizer ownership invariant violated: no optimizer-owning plugin found")
 
         replicated_axes, sharded_axes = self._runtime_optimizer_mesh_axes()
         dp_idx, pp_idx, cp_idx, tp_idx = self.mesh.rank_coordinates(rank_id)
@@ -232,16 +245,7 @@ class RuntimeCore:
         return replicated_axes, sharded_axes
 
     def _validate_optimizer_owner(self) -> None:
-        runtime_owners = [name for name, value in {
-            "runtime_optimizer": self.optimizer,
-            "runtime_optimizer_factory": self.optimizer_factory,
-        }.items() if value is not None]
-        if len(runtime_owners) > 1:
-            raise ValueError(f"RuntimeCore allows only one runtime optimizer source, got {runtime_owners}")
-        if self.scheduler_factory is not None and not runtime_owners:
-            raise ValueError("scheduler_factory requires a runtime optimizer or optimizer_factory")
-
-        owners = ["runtime"] if runtime_owners else []
+        runtime_owners = ["runtime"] if self.optimizer is not None else []
         plugin_owners = [plugin.id.value for plugin in self.plugins if plugin.owns_optimizer]
         if len(plugin_owners) > 1:
             raise ValueError(f"RuntimeCore allows only one optimizer-owning plugin, got {plugin_owners}")
@@ -250,26 +254,12 @@ class RuntimeCore:
                 "Runtime optimizer ownership is mutually exclusive with optimizer-owning plugins, "
                 f"got {runtime_owners + plugin_owners}"
             )
-        owners.extend(plugin_owners)
-        if len(owners) != 1:
-            raise ValueError(f"RuntimeCore training requires exactly one optimizer owner, got {owners}")
 
-    def _build_runtime_optimizer(self) -> None:
-        if self.optimizer_factory is None:
-            if self.scheduler_factory is not None and self.optimizer is not None:
-                if self.scheduler is not None:
-                    raise ValueError("scheduler_factory cannot be used when scheduler is already set")
-                self.scheduler = self.scheduler_factory(self.optimizer)
+    def _maybe_build_runtime_optimizer(self) -> None:
+        if self._plugin_owns_optimizer():
             return
-        if self.optimizer is not None:
-            raise ValueError("optimizer_factory cannot be used when optimizer is already set")
-        if self.scheduler is not None:
-            raise ValueError("optimizer_factory cannot be used with a prebuilt scheduler")
-        self.optimizer = self.optimizer_factory(self.model)
-        if self.scheduler_factory is not None:
-            self.scheduler = self.scheduler_factory(self.optimizer)
-        self.optimizer_factory = None
-        self.scheduler_factory = None
+        self.optimizer = self.create_optimizer(self.model.parameters())
+        self.scheduler = self.create_scheduler(self.optimizer)
 
     def _populate_static_model_metrics(self) -> None:
         self.state.static_metrics["perf/world_size"] = self.mesh.world_size

@@ -80,6 +80,14 @@ class MetricsPlugin(RuntimePlugin):
 class OptimizerOwnerPlugin(RuntimePlugin):
     def __init__(self, plugin_id: PluginId) -> None:
         super().__init__(id=plugin_id, name=f"{plugin_id.value}_owner", owns_optimizer=True)
+        self.optimizer: torch.optim.Optimizer | None = None
+        self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+
+    def transform_model(self, model: nn.Module) -> nn.Module:
+        assert self.runtime is not None
+        self.optimizer = self.runtime.create_optimizer(model.parameters())
+        self.scheduler = self.runtime.create_scheduler(self.optimizer)
+        return model
 
 
 class ReplaceLinearPlugin(RuntimePlugin):
@@ -89,6 +97,10 @@ class ReplaceLinearPlugin(RuntimePlugin):
     def transform_model(self, model: nn.Module) -> nn.Module:
         model.proj = nn.Linear(4, 1)
         return model
+
+
+def _sgd_factory(lr: float = 0.01):
+    return lambda params: torch.optim.SGD(params, lr=lr)
 
 
 def test_plugin_ordering() -> None:
@@ -101,8 +113,8 @@ def test_plugin_ordering() -> None:
     core = RuntimeCore(
         mesh=MeshConfig(),
         plan=ParallelPlan(),
-        model=(model := LossModel()),
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        model=LossModel(),
+        optimizer_factory=_sgd_factory(),
         plugins=plugins,
     )
 
@@ -113,9 +125,10 @@ def test_plugin_ordering() -> None:
 def test_optimizer_factory_runs_after_model_transform() -> None:
     captured_param_ids: list[int] = []
 
-    def build_optimizer(model: nn.Module) -> torch.optim.Optimizer:
-        captured_param_ids.extend(id(param) for param in model.parameters())
-        return torch.optim.SGD(model.parameters(), lr=0.01)
+    def build_optimizer(params) -> torch.optim.Optimizer:
+        params = list(params)
+        captured_param_ids.extend(id(param) for param in params)
+        return torch.optim.SGD(params, lr=0.01)
 
     core = RuntimeCore(
         mesh=MeshConfig(),
@@ -133,13 +146,32 @@ def test_optimizer_factory_runs_after_model_transform() -> None:
     assert {id(param) for group in core.optimizer.param_groups for param in group["params"]} == new_param_ids
 
 
+def test_scheduler_factory_supports_plugin_owned_optimizer() -> None:
+    plugin = OptimizerOwnerPlugin(PluginId.ZERO1)
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=LossModel(),
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=0.01),
+        scheduler_factory=lambda optimizer: torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5),
+        plugins=[plugin],
+    )
+    core.setup()
+    assert plugin.optimizer is not None
+    assert plugin.scheduler is not None
+    assert core.get_optimizer_and_scheduler() == (plugin.optimizer, plugin.scheduler)
+    core.run_train_step(torch.randn(2, 4))
+    assert plugin.scheduler.last_epoch == 1
+    assert plugin.optimizer.param_groups[0]["lr"] == 0.005
+
+
 def test_missing_required_plugin_fails() -> None:
     try:
         RuntimeCore(
             mesh=MeshConfig(),
             plan=ParallelPlan(),
-            model=(model := LossModel()),
-            optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+            model=LossModel(),
+            optimizer_factory=_sgd_factory(),
             plugins=[RecordingPlugin(PluginId.SP, [], requires={PluginId.TP})],
         )
     except ValueError as exc:
@@ -151,12 +183,11 @@ def test_missing_required_plugin_fails() -> None:
 def test_train_step_phases_and_state_manager() -> None:
     events: list[str] = []
     model = LossModel()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     core = RuntimeCore(
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer=optimizer,
+        optimizer_factory=_sgd_factory(),
         plugins=[RecordingPlugin(PluginId.PROFILER, events, name="recorder")],
     )
     core.setup()
@@ -177,24 +208,6 @@ def test_train_step_phases_and_state_manager() -> None:
         "recorder:pre_step",
         "recorder:post_step",
     ]
-
-
-def test_duplicate_optimizer_owners_fail() -> None:
-    model = LossModel()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    core = RuntimeCore(
-        mesh=MeshConfig(),
-        plan=ParallelPlan(),
-        model=model,
-        optimizer=optimizer,
-        plugins=[OptimizerOwnerPlugin(PluginId.ZERO1)],
-    )
-    try:
-        core.setup()
-    except ValueError as exc:
-        assert "mutually exclusive" in str(exc)
-    else:
-        raise AssertionError("RuntimeCore accepted both runtime and plugin-owned optimizers")
 
 
 def test_multiple_optimizer_plugin_owners_fail() -> None:
@@ -224,7 +237,7 @@ def test_runtime_core_requires_optimizer_owner() -> None:
     try:
         core.setup()
     except ValueError as exc:
-        assert "exactly one optimizer owner" in str(exc)
+        assert "requires optimizer_factory" in str(exc)
     else:
         raise AssertionError("RuntimeCore accepted a config without an optimizer owner")
 
@@ -235,7 +248,7 @@ def test_runtime_optimizer_checkpoint_policy() -> None:
         mesh=MeshConfig(dp=2, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(),
         model=dp_model,
-        optimizer=torch.optim.SGD(dp_model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
         plugins=[DataParallelPlugin()],
     )
     for plugin in dp_core.plugins:
@@ -249,7 +262,7 @@ def test_runtime_optimizer_checkpoint_policy() -> None:
         mesh=MeshConfig(dp=1, tp=2, pp=1, cp=1, ep=1),
         plan=ParallelPlan(),
         model=tp_model,
-        optimizer=torch.optim.SGD(tp_model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
         plugins=[TensorParallelPlugin()],
     )
     for plugin in tp_core.plugins:
@@ -264,7 +277,7 @@ def test_runtime_optimizer_checkpoint_policy() -> None:
         mesh=MeshConfig(dp=2, tp=2, pp=1, cp=1, ep=1),
         plan=ParallelPlan(),
         model=tp_dp_model,
-        optimizer=torch.optim.SGD(tp_dp_model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
         plugins=[TensorParallelPlugin(), DataParallelPlugin()],
     )
     for plugin in tp_dp_core.plugins:
@@ -283,7 +296,7 @@ def test_precision_plugin_metrics_and_clip() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
         plugins=[PrecisionPlugin(compute_dtype=None), GradClipPlugin(max_norm=1.0)],
     )
     core.setup()
@@ -308,7 +321,7 @@ def test_runtime_collects_plugin_metrics() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
         plugins=[MetricsPlugin()],
     )
     core.setup()
@@ -324,7 +337,7 @@ def test_precision_plugin_fp16_requires_cuda() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
         plugins=[PrecisionPlugin(compute_dtype=torch.float16)],
     )
     try:
@@ -342,7 +355,7 @@ def test_trainer_state_plugin_states_roundtrip() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
         plugins=[echo],
     )
     core.setup()
@@ -365,7 +378,7 @@ def test_grad_accumulation_runtime_step_cadence() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
         grad_accum_steps=2,
     )
     core.setup()
@@ -388,7 +401,7 @@ def test_grad_accumulation_resume_boundary_cadence() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
         grad_accum_steps=2,
     )
     core.setup()
@@ -399,7 +412,7 @@ def test_grad_accumulation_resume_boundary_cadence() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=resumed_model,
-        optimizer=torch.optim.SGD(resumed_model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
         grad_accum_steps=2,
     )
     resumed.setup()
@@ -430,7 +443,7 @@ def test_llama_activation_checkpointing_train_step() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        optimizer_factory=_sgd_factory(),
     )
     batch = {
         "input_ids": torch.randint(0, 32, (2, 8)),
@@ -477,9 +490,10 @@ def test_llama_sdpa_auto_matches_eager_attention() -> None:
 
 def main() -> None:
     test_plugin_ordering()
+    test_optimizer_factory_runs_after_model_transform()
+    test_scheduler_factory_supports_plugin_owned_optimizer()
     test_missing_required_plugin_fails()
     test_train_step_phases_and_state_manager()
-    test_duplicate_optimizer_owners_fail()
     test_multiple_optimizer_plugin_owners_fail()
     test_runtime_core_requires_optimizer_owner()
     test_runtime_optimizer_checkpoint_policy()

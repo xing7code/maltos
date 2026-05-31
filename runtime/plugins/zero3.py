@@ -60,14 +60,10 @@ class Zero3Plugin(RuntimePlugin):
         self,
         wrap_cls: set[type[nn.Module]] | None = None,
         enable_prefetch: bool = True,
-        optimizer_cls: type[torch.optim.Optimizer] = torch.optim.AdamW,
-        **optimizer_kwargs,
     ):
         super().__init__(id=PluginId.ZERO3, name="zero3", owns_optimizer=True)
         self.wrap_cls = wrap_cls or {nn.Linear}
         self.enable_prefetch = enable_prefetch
-        self.optimizer_cls = optimizer_cls
-        self.optimizer_kwargs = optimizer_kwargs
         self.dp_group: dist.ProcessGroup | None = None
         self.world_size = 1
         self.rank = 0
@@ -75,6 +71,7 @@ class Zero3Plugin(RuntimePlugin):
         self.data_buffers: list[torch.Tensor] = []
         self._materialized_buffers: list[torch.Tensor] = []
         self.optimizer: torch.optim.Optimizer | None = None
+        self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
@@ -84,7 +81,8 @@ class Zero3Plugin(RuntimePlugin):
         self.world_size = dist.get_world_size(self.dp_group)
         self.rank = dist.get_rank(self.dp_group)
         self._prepare_buckets(model)
-        self.optimizer = self.optimizer_cls([bucket.local_param for bucket in self.buckets], **self.optimizer_kwargs)
+        self.optimizer = self.runtime.create_optimizer([bucket.local_param for bucket in self.buckets])
+        self.scheduler = self.runtime.create_scheduler(self.optimizer)
         return model
 
     def on_phase(self, phase: RuntimePhase) -> None:
