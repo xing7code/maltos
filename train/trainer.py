@@ -87,6 +87,7 @@ class Trainer:
                 self._maybe_log()
                 self._maybe_checkpoint()
         finally:
+            self.runtime.close()
             if self.checkpoint_uploader is not None:
                 self.checkpoint_uploader.close()
 

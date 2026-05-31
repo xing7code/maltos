@@ -32,6 +32,7 @@ from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.perf_metrics import PerfMetricsPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
+from runtime.plugins.torch_profiler import TorchProfilerPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
@@ -87,6 +88,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", type=str, default="fp32", choices=("fp32", "bf16", "fp16"))
     parser.add_argument("--grad-clip", type=float, default=None)
     parser.add_argument("--disable-perf-metrics", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch-profiler", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch-profiler-dir", type=str, default="traces/pretrain")
+    parser.add_argument("--torch-profiler-wait", type=int, default=1)
+    parser.add_argument("--torch-profiler-warmup", type=int, default=1)
+    parser.add_argument("--torch-profiler-active", type=int, default=3)
+    parser.add_argument("--torch-profiler-repeat", type=int, default=1)
+    parser.add_argument("--torch-profiler-record-shapes", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch-profiler-profile-memory", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch-profiler-with-stack", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch-profiler-with-flops", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch-profiler-rank0-only", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--metrics-jsonl", type=str, default=None)
@@ -197,6 +209,7 @@ def main() -> None:
     if args.dry_run:
         if rank == 0:
             print("dry_run=true")
+        runtime.close()
         if dist.is_initialized():
             distributed_barrier()
             dist.destroy_process_group()
@@ -268,6 +281,21 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         plugins.append(GradClipPlugin(max_norm=args.grad_clip))
     if not args.disable_perf_metrics:
         plugins.append(PerfMetricsPlugin())
+    if args.torch_profiler:
+        plugins.append(
+            TorchProfilerPlugin(
+                trace_dir=args.torch_profiler_dir,
+                wait=args.torch_profiler_wait,
+                warmup=args.torch_profiler_warmup,
+                active=args.torch_profiler_active,
+                repeat=args.torch_profiler_repeat,
+                record_shapes=args.torch_profiler_record_shapes,
+                profile_memory=args.torch_profiler_profile_memory,
+                with_stack=args.torch_profiler_with_stack,
+                with_flops=args.torch_profiler_with_flops,
+                rank0_only=args.torch_profiler_rank0_only,
+            )
+        )
 
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
@@ -428,6 +456,17 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("training", "precision"): "precision",
         ("training", "grad_clip"): "grad_clip",
         ("training", "disable_perf_metrics"): "disable_perf_metrics",
+        ("profiling", "torch_profiler"): "torch_profiler",
+        ("profiling", "torch_profiler_dir"): "torch_profiler_dir",
+        ("profiling", "torch_profiler_wait"): "torch_profiler_wait",
+        ("profiling", "torch_profiler_warmup"): "torch_profiler_warmup",
+        ("profiling", "torch_profiler_active"): "torch_profiler_active",
+        ("profiling", "torch_profiler_repeat"): "torch_profiler_repeat",
+        ("profiling", "torch_profiler_record_shapes"): "torch_profiler_record_shapes",
+        ("profiling", "torch_profiler_profile_memory"): "torch_profiler_profile_memory",
+        ("profiling", "torch_profiler_with_stack"): "torch_profiler_with_stack",
+        ("profiling", "torch_profiler_with_flops"): "torch_profiler_with_flops",
+        ("profiling", "torch_profiler_rank0_only"): "torch_profiler_rank0_only",
         ("logging", "log_every"): "log_every",
         ("logging", "metrics_jsonl"): "metrics_jsonl",
         ("logging", "run_manifest"): "run_manifest",
@@ -518,6 +557,13 @@ def _print_run_summary(
         f"wandb_project={args.wandb_project} wandb_mode={args.wandb_mode} "
         f"wandb_run_id={args.wandb_run_id} "
         f"wandb_checkpoint_every={args.wandb_checkpoint_every}"
+    )
+    print(
+        "profiling="
+        f"torch_profiler={args.torch_profiler} dir={args.torch_profiler_dir} "
+        f"schedule=(wait={args.torch_profiler_wait}, warmup={args.torch_profiler_warmup}, "
+        f"active={args.torch_profiler_active}, repeat={args.torch_profiler_repeat}) "
+        f"rank0_only={args.torch_profiler_rank0_only}"
     )
     print(
         "checkpoint="
@@ -636,6 +682,19 @@ def _build_run_manifest(
                 "wandb_run_id": args.wandb_run_id,
                 "wandb_mode": args.wandb_mode,
                 "wandb_checkpoint_every": args.wandb_checkpoint_every,
+            },
+            "profiling": {
+                "torch_profiler": args.torch_profiler,
+                "torch_profiler_dir": args.torch_profiler_dir,
+                "torch_profiler_wait": args.torch_profiler_wait,
+                "torch_profiler_warmup": args.torch_profiler_warmup,
+                "torch_profiler_active": args.torch_profiler_active,
+                "torch_profiler_repeat": args.torch_profiler_repeat,
+                "torch_profiler_record_shapes": args.torch_profiler_record_shapes,
+                "torch_profiler_profile_memory": args.torch_profiler_profile_memory,
+                "torch_profiler_with_stack": args.torch_profiler_with_stack,
+                "torch_profiler_with_flops": args.torch_profiler_with_flops,
+                "torch_profiler_rank0_only": args.torch_profiler_rank0_only,
             },
             "checkpoint": {
                 "dir": args.checkpoint_dir,

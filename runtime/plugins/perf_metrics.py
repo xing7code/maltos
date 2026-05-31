@@ -11,7 +11,7 @@ from runtime.plugin import MetricValue, PluginId, RuntimePlugin
 class PerfMetricsPlugin(RuntimePlugin):
     def __init__(self, include_cuda_memory: bool = True) -> None:
         super().__init__(
-            id=PluginId.PROFILER,
+            id=PluginId.PERF_METRICS,
             name="perf_metrics",
             runs_after={PluginId.PRECISION, PluginId.GRAD_CLIP},
         )

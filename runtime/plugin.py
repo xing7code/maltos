@@ -41,7 +41,8 @@ class PluginId(str, Enum):
     ZERO2 = "zero2"
     ZERO3 = "zero3"
     CHECKPOINT = "checkpoint"
-    PROFILER = "profiler"
+    PERF_METRICS = "perf_metrics"
+    TORCH_PROFILER = "torch_profiler"
 
 
 
@@ -96,3 +97,6 @@ class RuntimePlugin:
 
     def collect_metrics(self) -> dict[str, MetricValue]:
         return {}
+
+    def close(self) -> None:
+        pass

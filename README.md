@@ -289,6 +289,24 @@ initialized only on rank 0. Fine-grained profiling is intentionally kept out of
 the steady-state training path. MFU is a reporting layer concern and can be
 computed offline from `perf/tflops_per_gpu` and a declared hardware peak.
 
+Use PyTorch profiler for trace-based performance debugging:
+
+```bash
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+  --config configs/llama_50m.yaml \
+  --data datasets/fineweb_50m \
+  --max-steps 20 \
+  --torch-profiler \
+  --torch-profiler-dir traces/llama_50m \
+  --torch-profiler-wait 2 \
+  --torch-profiler-warmup 2 \
+  --torch-profiler-active 4
+```
+
+Profiler traces are written per rank under `rank_XXXXX/` directories. This mode
+is for CUDA/NCCL/operator timeline analysis and has non-trivial overhead; keep
+it off for normal throughput runs.
+
 Training recipes support AdamW hyperparameters plus constant, linear, and cosine LR schedules:
 
 ```yaml

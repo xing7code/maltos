@@ -93,6 +93,10 @@ class RuntimeCore:
         self._maybe_build_runtime_optimizer()
         self._validate_optimizer_owner()
 
+    def close(self) -> None:
+        for plugin in reversed(self.plugins):
+            plugin.close()
+
     def run_train_step(self, batch: Any) -> torch.Tensor:
         if self.device is not None:
             batch = _move_to_device(batch, torch.device(self.device))

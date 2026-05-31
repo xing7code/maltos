@@ -6,6 +6,9 @@ pieces remain easy to validate in a single process.
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
@@ -15,6 +18,7 @@ from runtime import MeshConfig, PluginId, RuntimeCore, RuntimePhase
 from runtime.plugins.ddp import DataParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.precision import PrecisionPlugin
+from runtime.plugins.torch_profiler import TorchProfilerPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugin import RuntimePlugin
 
@@ -57,7 +61,7 @@ class RecordingPlugin(RuntimePlugin):
 
 class PluginStateEcho(RuntimePlugin):
     def __init__(self) -> None:
-        super().__init__(id=PluginId.PROFILER, name="plugin_state_echo")
+        super().__init__(id=PluginId.CHECKPOINT, name="plugin_state_echo")
         self.value = 0
 
     def export_plugin_state(self) -> dict[str, object]:
@@ -71,7 +75,7 @@ class PluginStateEcho(RuntimePlugin):
 
 class MetricsPlugin(RuntimePlugin):
     def __init__(self) -> None:
-        super().__init__(id=PluginId.PROFILER, name="metrics_plugin")
+        super().__init__(id=PluginId.PERF_METRICS, name="metrics_plugin")
 
     def collect_metrics(self) -> dict[str, float | int | str | bool | None]:
         return {"tokens_per_sec": 12.5, "enabled": True}
@@ -92,7 +96,7 @@ class OptimizerOwnerPlugin(RuntimePlugin):
 
 class ReplaceLinearPlugin(RuntimePlugin):
     def __init__(self) -> None:
-        super().__init__(id=PluginId.PROFILER, name="replace_linear")
+        super().__init__(id=PluginId.CHECKPOINT, name="replace_linear")
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         model.proj = nn.Linear(4, 1)
@@ -106,9 +110,9 @@ def _sgd_factory(lr: float = 0.01):
 def test_plugin_ordering() -> None:
     events: list[str] = []
     plugins = [
-        RecordingPlugin(PluginId.PROFILER, events, name="custom_profiler", runs_after={PluginId.CP, PluginId.TP}),
+        RecordingPlugin(PluginId.PERF_METRICS, events, name="custom_metrics", runs_after={PluginId.CP, PluginId.TP}),
         RecordingPlugin(PluginId.TP, events, name="custom_tensor"),
-        RecordingPlugin(PluginId.CHECKPOINT, events, runs_before={PluginId.PROFILER}),
+        RecordingPlugin(PluginId.CHECKPOINT, events, runs_before={PluginId.PERF_METRICS}),
     ]
     core = RuntimeCore(
         mesh=MeshConfig(),
@@ -118,8 +122,8 @@ def test_plugin_ordering() -> None:
         plugins=plugins,
     )
 
-    assert [plugin.id for plugin in core.plugins] == [PluginId.TP, PluginId.CHECKPOINT, PluginId.PROFILER]
-    assert [plugin.name for plugin in core.plugins] == ["custom_tensor", "checkpoint", "custom_profiler"]
+    assert [plugin.id for plugin in core.plugins] == [PluginId.TP, PluginId.CHECKPOINT, PluginId.PERF_METRICS]
+    assert [plugin.name for plugin in core.plugins] == ["custom_tensor", "checkpoint", "custom_metrics"]
 
 
 def test_optimizer_factory_runs_after_model_transform() -> None:
@@ -188,7 +192,7 @@ def test_train_step_phases_and_state_manager() -> None:
         plan=ParallelPlan(),
         model=model,
         optimizer_factory=_sgd_factory(),
-        plugins=[RecordingPlugin(PluginId.PROFILER, events, name="recorder")],
+        plugins=[RecordingPlugin(PluginId.CHECKPOINT, events, name="recorder")],
     )
     core.setup()
     loss = core.run_train_step(torch.ones(2, 4))
@@ -328,8 +332,39 @@ def test_runtime_collects_plugin_metrics() -> None:
     core.setup()
     core.run_train_step(torch.ones(2, 4))
     metrics = core.collect_metrics()
-    assert metrics["profiler/tokens_per_sec"] == 12.5
-    assert metrics["profiler/enabled"] is True
+    assert metrics["perf_metrics/tokens_per_sec"] == 12.5
+    assert metrics["perf_metrics/enabled"] is True
+
+
+def test_torch_profiler_plugin_writes_trace() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        model = LossModel()
+        core = RuntimeCore(
+            mesh=MeshConfig(),
+            plan=ParallelPlan(),
+            model=model,
+            optimizer_factory=_sgd_factory(),
+            plugins=[
+                TorchProfilerPlugin(
+                    trace_dir=tmp,
+                    wait=0,
+                    warmup=1,
+                    active=1,
+                    repeat=1,
+                )
+            ],
+        )
+        core.setup()
+        core.run_train_step(torch.ones(2, 4))
+        core.run_train_step(torch.ones(2, 4))
+        metrics = core.collect_metrics()
+        core.close()
+
+        assert metrics["torch_profiler/enabled"] is True
+        assert metrics["torch_profiler/trace_dir"].endswith("rank_00000")
+        trace_dir = Path(tmp) / "rank_00000"
+        assert trace_dir.is_dir()
+        assert any(trace_dir.iterdir())
 
 
 def test_precision_plugin_fp16_requires_cuda() -> None:
@@ -364,7 +399,7 @@ def test_trainer_state_plugin_states_roundtrip() -> None:
     core.state.microbatch_idx = 1
     trainer_state = core.state_manager.export_trainer_state()
     assert trainer_state.plugin_states is not None
-    assert trainer_state.plugin_states["profiler"]["value"] == 7
+    assert trainer_state.plugin_states["checkpoint"]["value"] == 7
     assert trainer_state.microbatch_idx == 1
     echo.value = 0
     core.state.microbatch_idx = 0
@@ -500,6 +535,7 @@ def main() -> None:
     test_runtime_optimizer_checkpoint_policy()
     test_precision_plugin_metrics_and_clip()
     test_runtime_collects_plugin_metrics()
+    test_torch_profiler_plugin_writes_trace()
     test_precision_plugin_fp16_requires_cuda()
     test_trainer_state_plugin_states_roundtrip()
     test_grad_accumulation_runtime_step_cadence()
