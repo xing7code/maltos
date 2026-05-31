@@ -259,6 +259,16 @@ The script prints a resolved run summary on rank 0, including model size,
 mesh, plugins, batch tokens, target tokens, estimated FLOPs/token, logging,
 and checkpoint settings.
 
+Use `--dry-run` to validate a recipe without entering the training loop or
+initializing W&B:
+
+```bash
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+  --config configs/llama_50m.yaml \
+  --data datasets/fineweb_50m \
+  --dry-run
+```
+
 The training script logs `loss`, `lr`, `train/tokens`, `train/tokens_per_sec`,
 `perf/step_sec`, `perf/step_sec_window`, estimated `perf/tflops_per_gpu`, and
 CUDA memory metrics when CUDA is available. Timing metrics ending in `_sec` are

@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=10)
+    parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -153,7 +154,7 @@ def main() -> None:
         seed=args.seed,
     )
     runtime = _build_runtime(args, model, device)
-    logger, checkpoint_uploader = _build_logging(args, rank)
+    logger, checkpoint_uploader = (None, None) if args.dry_run else _build_logging(args, rank)
     trainer = Trainer(
         runtime=runtime,
         dataloader=loader,
@@ -180,6 +181,13 @@ def main() -> None:
         world_size=world_size,
         rank=rank,
     )
+    if args.dry_run:
+        if rank == 0:
+            print("dry_run=true")
+        if dist.is_initialized():
+            distributed_barrier()
+            dist.destroy_process_group()
+        return
     trainer.fit()
     if dist.is_initialized():
         distributed_barrier()
@@ -394,6 +402,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("parallel", "zero_stage"): "zero_stage",
         ("parallel", "ddp_mode"): "ddp_mode",
         ("training", "max_steps"): "max_steps",
+        ("training", "dry_run"): "dry_run",
         ("training", "grad_accum_steps"): "grad_accum_steps",
         ("training", "lr"): "lr",
         ("training", "weight_decay"): "weight_decay",
@@ -469,6 +478,7 @@ def _print_run_summary(
     print(f"plugins={plugin_names}")
     print(
         "training="
+        f"dry_run={args.dry_run} "
         f"precision={args.precision} lr={args.lr} weight_decay={args.weight_decay} "
         f"adam_betas=({args.adam_beta1}, {args.adam_beta2}) adam_eps={args.adam_eps} "
         f"lr_schedule={args.lr_schedule} "
