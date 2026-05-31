@@ -269,6 +269,17 @@ PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
   --dry-run
 ```
 
+Use `--run-manifest` to write the resolved run configuration as JSON. This works
+for both dry-runs and normal training runs:
+
+```bash
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+  --config configs/llama_50m.yaml \
+  --data datasets/fineweb_50m \
+  --dry-run \
+  --run-manifest logs/llama_50m_manifest.json
+```
+
 The training script logs `loss`, `lr`, `train/tokens`, `train/tokens_per_sec`,
 `perf/step_sec`, `perf/step_sec_window`, estimated `perf/tflops_per_gpu`, and
 CUDA memory metrics when CUDA is available. Timing metrics ending in `_sec` are

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 from pathlib import Path
+import subprocess
 from typing import Any
 
 import numpy as np
@@ -88,6 +90,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--metrics-jsonl", type=str, default=None)
+    parser.add_argument("--run-manifest", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-entity", type=str, default=None)
@@ -181,6 +184,16 @@ def main() -> None:
         world_size=world_size,
         rank=rank,
     )
+    if args.run_manifest is not None:
+        _write_run_manifest(
+            args=args,
+            runtime=runtime,
+            initial_trainable_params=initial_trainable_params,
+            data_paths=data_paths,
+            device=device,
+            world_size=world_size,
+            rank=rank,
+        )
     if args.dry_run:
         if rank == 0:
             print("dry_run=true")
@@ -417,6 +430,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("training", "disable_perf_metrics"): "disable_perf_metrics",
         ("logging", "log_every"): "log_every",
         ("logging", "metrics_jsonl"): "metrics_jsonl",
+        ("logging", "run_manifest"): "run_manifest",
         ("logging", "wandb_project"): "wandb_project",
         ("logging", "wandb_run_name"): "wandb_run_name",
         ("logging", "wandb_entity"): "wandb_entity",
@@ -500,6 +514,7 @@ def _print_run_summary(
     print(
         "logging="
         f"log_every={args.log_every} jsonl={args.metrics_jsonl} "
+        f"run_manifest={args.run_manifest} "
         f"wandb_project={args.wandb_project} wandb_mode={args.wandb_mode} "
         f"wandb_run_id={args.wandb_run_id} "
         f"wandb_checkpoint_every={args.wandb_checkpoint_every}"
@@ -510,6 +525,156 @@ def _print_run_summary(
         f"keep_last={args.checkpoint_keep_last} keep_every_n_steps={args.checkpoint_keep_every_n_steps} "
         f"min_free_gb={args.checkpoint_min_free_gb} resume_from={args.resume_from}"
     )
+
+
+def _write_run_manifest(
+    *,
+    args: argparse.Namespace,
+    runtime: RuntimeCore,
+    initial_trainable_params: int,
+    data_paths: list[Path],
+    device: torch.device,
+    world_size: int,
+    rank: int,
+) -> None:
+    if rank != 0:
+        return
+    path = Path(args.run_manifest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = _build_run_manifest(
+        args=args,
+        runtime=runtime,
+        initial_trainable_params=initial_trainable_params,
+        data_paths=data_paths,
+        device=device,
+        world_size=world_size,
+    )
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def _build_run_manifest(
+    *,
+    args: argparse.Namespace,
+    runtime: RuntimeCore,
+    initial_trainable_params: int,
+    data_paths: list[Path],
+    device: torch.device,
+    world_size: int,
+) -> dict[str, Any]:
+    local_trainable_params = _count_trainable_params(runtime.model)
+    global_batch_tokens = args.micro_batch_size * args.seq_len * args.dp_size * args.grad_accum_steps
+    total_train_tokens = global_batch_tokens * args.max_steps
+    optimizer, scheduler = runtime.get_optimizer_and_scheduler()
+    return {
+        "version": 1,
+        "git": {
+            "commit": _git_output(["rev-parse", "HEAD"]),
+            "branch": _git_output(["rev-parse", "--abbrev-ref", "HEAD"]),
+            "dirty": _git_is_dirty(),
+        },
+        "args": vars(args),
+        "resolved": {
+            "device": str(device),
+            "world_size": world_size,
+            "mesh": {
+                "dp": args.dp_size,
+                "tp": args.tp_size,
+                "pp": 1,
+                "cp": 1,
+                "ep": 1,
+            },
+            "plugins": [
+                {
+                    "id": plugin.id.value,
+                    "name": plugin.name,
+                    "owns_optimizer": plugin.owns_optimizer,
+                }
+                for plugin in runtime.plugins
+            ],
+            "model": {
+                "type": args.model,
+                "initial_trainable_params": initial_trainable_params,
+                "runtime_local_trainable_params": local_trainable_params,
+                "attention_backend": args.attention_backend,
+                "activation_checkpointing": args.activation_checkpointing,
+                "activation_checkpoint_every_n_layers": args.activation_checkpoint_every_n_layers,
+            },
+            "optimizer": {
+                "type": type(optimizer).__name__ if optimizer is not None else None,
+                "scheduler": type(scheduler).__name__ if scheduler is not None else None,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "adam_beta1": args.adam_beta1,
+                "adam_beta2": args.adam_beta2,
+                "adam_eps": args.adam_eps,
+                "lr_schedule": args.lr_schedule,
+                "warmup_steps": args.warmup_steps,
+                "min_lr": args.min_lr,
+            },
+            "training": {
+                "dry_run": args.dry_run,
+                "precision": args.precision,
+                "grad_accum_steps": args.grad_accum_steps,
+                "micro_batch_size": args.micro_batch_size,
+                "seq_len": args.seq_len,
+                "tokens_per_step": global_batch_tokens,
+                "target_tokens": total_train_tokens,
+                "max_steps": args.max_steps,
+                "grad_clip": args.grad_clip,
+            },
+            "data": {
+                "num_shards": len(data_paths),
+                "paths": [str(path) for path in data_paths],
+            },
+            "logging": {
+                "log_every": args.log_every,
+                "metrics_jsonl": args.metrics_jsonl,
+                "wandb_project": args.wandb_project,
+                "wandb_run_name": args.wandb_run_name,
+                "wandb_run_id": args.wandb_run_id,
+                "wandb_mode": args.wandb_mode,
+                "wandb_checkpoint_every": args.wandb_checkpoint_every,
+            },
+            "checkpoint": {
+                "dir": args.checkpoint_dir,
+                "every": args.checkpoint_every,
+                "keep_last": args.checkpoint_keep_last,
+                "keep_every_n_steps": args.checkpoint_keep_every_n_steps,
+                "min_free_gb": args.checkpoint_min_free_gb,
+                "resume_from": args.resume_from,
+            },
+        },
+    }
+
+
+def _git_output(args: list[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def _git_is_dirty() -> bool | None:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return bool(result.stdout.strip())
 
 
 def _count_trainable_params(model: torch.nn.Module) -> int:
