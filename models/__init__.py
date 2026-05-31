@@ -1,3 +1,4 @@
+from .activation_checkpointing import ActivationCheckpointConfig
 from .llama import (
     LlamaConfig,
     LlamaForCausalLM,
@@ -15,6 +16,7 @@ from .tiny_transformer import (
 
 __all__ = [
     "TinyModel",
+    "ActivationCheckpointConfig",
     "LlamaConfig",
     "LlamaForCausalLM",
     "LlamaForCausalLMTp",

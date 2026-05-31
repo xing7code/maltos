@@ -12,6 +12,7 @@ import yaml
 
 from data import PretrainingDataLoader, TokenShardDataset
 from models import (
+    ActivationCheckpointConfig,
     LlamaConfig,
     LlamaForCausalLM,
     LlamaForCausalLMTp,
@@ -63,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument("--eps", type=float, default=1e-5)
+    parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--activation-checkpoint-every-n-layers", type=int, default=1)
 
     parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--tp-size", type=int, default=1)
@@ -187,6 +190,10 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
                 num_key_value_heads=args.n_kv_heads or args.n_heads,
                 max_position_embeddings=args.seq_len,
                 rms_norm_eps=args.eps,
+                activation_checkpointing=ActivationCheckpointConfig(
+                    enabled=args.activation_checkpointing,
+                    every_n_layers=args.activation_checkpoint_every_n_layers,
+                ),
             )
         )
     cls = TinyTransformerTpSp if args.use_sp else TinyTransformerTp if args.tp_size > 1 else TinyTransformer
@@ -320,6 +327,8 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("model", "vocab_size"): "vocab_size",
         ("model", "rms_norm_eps"): "eps",
         ("model", "eps"): "eps",
+        ("model", "activation_checkpointing"): "activation_checkpointing",
+        ("model", "activation_checkpoint_every_n_layers"): "activation_checkpoint_every_n_layers",
         ("parallel", "dp_size"): "dp_size",
         ("parallel", "tp_size"): "tp_size",
         ("parallel", "use_sp"): "use_sp",
@@ -396,6 +405,11 @@ def _print_run_summary(
         "training="
         f"precision={args.precision} lr={args.lr} grad_accum_steps={args.grad_accum_steps} "
         f"micro_batch_size={args.micro_batch_size} seq_len={args.seq_len}"
+    )
+    print(
+        "model_features="
+        f"activation_checkpointing={args.activation_checkpointing} "
+        f"activation_checkpoint_every_n_layers={args.activation_checkpoint_every_n_layers}"
     )
     print(f"tokens_per_step={global_batch_tokens:,} target_tokens={total_train_tokens:,}")
     print(

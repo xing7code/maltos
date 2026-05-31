@@ -274,7 +274,10 @@ class RuntimeCore:
     def _populate_static_model_metrics(self) -> None:
         self.state.static_metrics["perf/world_size"] = self.mesh.world_size
         if isinstance(self.model, FlopsEstimatableModule):
-            self.state.static_metrics["perf/flops_per_token"] = float(self.model.flops_per_token())
+            try:
+                self.state.static_metrics["perf/flops_per_token"] = float(self.model.flops_per_token())
+            except AttributeError:
+                pass
 
     def _validate_mesh_and_plan(self) -> None:
         if self.plan.zero_stage > 0 and self.mesh.dp <= 1:

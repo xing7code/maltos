@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
+from models.activation_checkpointing import ActivationCheckpointConfig
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 
 
@@ -21,6 +23,7 @@ class LlamaConfig:
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     tie_word_embeddings: bool = False
+    activation_checkpointing: ActivationCheckpointConfig = field(default_factory=ActivationCheckpointConfig)
 
 
 class LlamaRMSNorm(nn.Module):
@@ -148,8 +151,11 @@ class LlamaForCausalLM(nn.Module):
             input_ids, labels = batch, None
 
         x = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            x = layer(x)
+        for layer_idx, layer in enumerate(self.layers):
+            if self.training and self.config.activation_checkpointing.should_checkpoint_layer(layer_idx):
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         logits = self.lm_head(self.norm(x))
         if labels is None:
             return logits

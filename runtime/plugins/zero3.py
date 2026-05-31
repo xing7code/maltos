@@ -194,6 +194,7 @@ class Zero3Plugin(RuntimePlugin):
     def _make_free_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs, _outputs) -> None:
             self._free_full_params(bucket)
+            bucket.fwd_handle = None
 
         return hook
 

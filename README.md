@@ -41,7 +41,7 @@ This is intentionally small enough to read, but the core control flow mirrors th
 | Pipeline parallelism | Planned |
 | Context parallelism | Planned |
 | Expert parallelism | Planned |
-| Activation checkpointing | Planned |
+| LLaMA activation checkpointing | Supported |
 | FlashAttention-specific kernels | Planned |
 
 ## System Flow
@@ -267,6 +267,15 @@ initialized only on rank 0. Fine-grained profiling is intentionally kept out of
 the steady-state training path. MFU is a reporting layer concern and can be
 computed offline from `perf/tflops_per_gpu` and a declared hardware peak.
 
+The LLaMA path supports block-level activation checkpointing:
+
+```bash
+PYTHONPATH=. .venv/bin/python tools/pretrain.py \
+  --config configs/llama_50m.yaml \
+  --activation-checkpointing \
+  --activation-checkpoint-every-n-layers 2
+```
+
 To continue logging into an existing W&B run, pass its run id:
 
 ```bash
@@ -345,7 +354,8 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
 ## Current Limitations
 
 - Pipeline parallel, context parallel, and expert parallel are planned but not implemented yet.
-- Activation checkpointing and FlashAttention-specific kernels are not implemented yet.
+- Activation checkpointing is implemented for the LLaMA path; tiny models keep the simpler eager path.
+- FlashAttention-specific kernels are not implemented yet.
 - The current implementation prioritizes clarity and correctness over Megatron-level throughput optimization.
 - The tiny transformer is intentionally small and readable; the LLaMA path is more realistic but still minimal.
 - YAML recipes cover the main experiment settings; CLI flags can override any recipe field for quick sweeps.

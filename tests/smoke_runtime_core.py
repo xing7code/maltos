@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from models import ActivationCheckpointConfig, LlamaConfig, LlamaForCausalLM
 from parallel import ParallelPlan
 from runtime import MeshConfig, PluginId, RuntimeCore, RuntimePhase
 from runtime.plugins.ddp import DataParallelPlugin
@@ -411,6 +412,44 @@ def test_grad_accumulation_resume_boundary_cadence() -> None:
     assert resumed.state.step == 1
 
 
+def test_llama_activation_checkpointing_train_step() -> None:
+    torch.manual_seed(1234)
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            max_position_embeddings=8,
+            activation_checkpointing=ActivationCheckpointConfig(enabled=True, every_n_layers=2),
+        )
+    )
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=model,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+    )
+    batch = {
+        "input_ids": torch.randint(0, 32, (2, 8)),
+        "labels": torch.randint(0, 32, (2, 8)),
+    }
+
+    core.setup()
+    before = {name: param.detach().clone() for name, param in core.model.named_parameters()}
+    loss = core.run_train_step(batch)
+
+    assert loss.ndim == 0
+    assert core.state.step == 1
+    assert any(
+        not torch.equal(before[name], param.detach())
+        for name, param in core.model.named_parameters()
+        if param.requires_grad
+    )
+
+
 def main() -> None:
     test_plugin_ordering()
     test_missing_required_plugin_fails()
@@ -425,6 +464,7 @@ def main() -> None:
     test_trainer_state_plugin_states_roundtrip()
     test_grad_accumulation_runtime_step_cadence()
     test_grad_accumulation_resume_boundary_cadence()
+    test_llama_activation_checkpointing_train_step()
     print("runtime core smoke ok")
 
 
