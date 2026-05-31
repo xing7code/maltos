@@ -28,10 +28,15 @@ class MetricReduction(str, Enum):
     NONE = "none"
 
 
+class MetricStepReduction(str, Enum):
+    PER_STEP = "per_step"
+
+
 @dataclass(frozen=True)
 class MetricRule:
     local: MetricReduction = MetricReduction.LAST
     distributed: MetricReduction = MetricReduction.RANK0
+    step: MetricStepReduction | None = None
 
 
 class MetricAggregator:
@@ -48,7 +53,7 @@ class MetricAggregator:
         for key, value in metrics.items():
             self._values.setdefault(key, []).append(value)
 
-    def flush(self) -> dict[str, MetricValue]:
+    def flush(self, *, step_delta: int | None = None) -> dict[str, MetricValue]:
         local_metrics = {
             key: _reduce_local(values, _rule_for_key(key, self.rules).local)
             for key, values in self._values.items()
@@ -58,6 +63,7 @@ class MetricAggregator:
             key: self.syncer.reduce_value(value, _rule_for_key(key, self.rules).distributed)
             for key, value in local_metrics.items()
         }
+        _apply_step_reductions(metrics, self.rules, step_delta=step_delta)
         _add_derived_metrics(metrics)
         return metrics
 
@@ -224,7 +230,7 @@ def _rule_for_key(key: str, rules: dict[str, MetricRule]) -> MetricRule:
     if key == "should_step_optimizer":
         return MetricRule(MetricReduction.LAST, MetricReduction.RANK0)
     if key.endswith("_sec"):
-        return MetricRule(MetricReduction.SUM, MetricReduction.MAX)
+        return MetricRule(MetricReduction.SUM, MetricReduction.MAX, MetricStepReduction.PER_STEP)
     if key.endswith("/overflow"):
         return MetricRule(MetricReduction.ANY, MetricReduction.ANY)
     if key.endswith("/grad_norm") or "memory" in key:
@@ -256,9 +262,30 @@ def _reduce_local(values: list[MetricValue], reduction: MetricReduction) -> Metr
     raise ValueError(f"unsupported local metric reduction={reduction.value}")
 
 
+def _apply_step_reductions(
+    metrics: dict[str, MetricValue],
+    rules: dict[str, MetricRule],
+    *,
+    step_delta: int | None,
+) -> None:
+    for key, value in list(metrics.items()):
+        rule = _rule_for_key(key, rules)
+        if rule.step is None:
+            continue
+        if rule.step == MetricStepReduction.PER_STEP:
+            if step_delta is None or step_delta < 1:
+                raise ValueError(f"step_delta must be >= 1 for per-step metric {key!r}, got {step_delta}")
+            if not isinstance(value, (float, int)):
+                continue
+            metrics[f"{key}_window"] = float(value)
+            metrics[key] = float(value) / float(step_delta)
+            continue
+        raise ValueError(f"unsupported metric step reduction={rule.step.value}")
+
+
 def _add_derived_metrics(metrics: dict[str, MetricValue]) -> None:
     tokens = metrics.get("train/tokens")
-    elapsed_sec = metrics.get("perf/step_sec")
+    elapsed_sec = metrics.get("perf/step_sec_window", metrics.get("perf/step_sec"))
     if isinstance(tokens, (float, int)) and isinstance(elapsed_sec, (float, int)) and elapsed_sec > 0:
         metrics["train/tokens_per_sec"] = float(tokens) / float(elapsed_sec)
     tokens_per_sec = metrics.get("train/tokens_per_sec")

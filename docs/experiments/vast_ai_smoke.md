@@ -90,6 +90,7 @@ PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
 - `train/tokens`
 - `train/tokens_per_sec`
 - `perf/step_sec`
+- `perf/step_sec_window`
 - `perf/tflops_per_gpu`
 - `grad_clip/grad_norm`
 - `memory/max_allocated_gb`

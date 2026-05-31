@@ -259,11 +259,13 @@ mesh, plugins, batch tokens, target tokens, estimated FLOPs/token, logging,
 and checkpoint settings.
 
 The training script logs `loss`, `lr`, `train/tokens`, `train/tokens_per_sec`,
-`perf/step_sec`, estimated `perf/tflops_per_gpu`, and CUDA memory metrics when
-CUDA is available. W&B is initialized only on rank 0. Fine-grained profiling is
-intentionally kept out of the steady-state training path. MFU is a reporting
-layer concern and can be computed offline from `perf/tflops_per_gpu` and a
-declared hardware peak.
+`perf/step_sec`, `perf/step_sec_window`, estimated `perf/tflops_per_gpu`, and
+CUDA memory metrics when CUDA is available. Timing metrics ending in `_sec` are
+reported as per-optimizer-step averages over the logging interval; the matching
+`*_sec_window` metric records the total wall time for that interval. W&B is
+initialized only on rank 0. Fine-grained profiling is intentionally kept out of
+the steady-state training path. MFU is a reporting layer concern and can be
+computed offline from `perf/tflops_per_gpu` and a declared hardware peak.
 
 W&B checkpoint artifacts can be enabled by setting `--wandb-checkpoint-every N`.
 `N` must be a multiple of `--checkpoint-every`; local checkpointing remains the

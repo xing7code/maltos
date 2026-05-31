@@ -279,6 +279,19 @@ def test_trainer_checkpoint_min_free_space_raises() -> None:
             raise AssertionError("checkpoint free-space guard did not raise")
 
 
+def test_metric_aggregator_step_reduction() -> None:
+    aggregator = MetricAggregator()
+    aggregator.update({"step": 1, "perf/step_sec": 3.0, "train/tokens": 10.0, "perf/world_size": 1})
+    aggregator.update({"step": 2, "perf/step_sec": 5.0, "train/tokens": 14.0, "perf/world_size": 1})
+
+    metrics = aggregator.flush(step_delta=2)
+
+    assert metrics["perf/step_sec_window"] == 8.0
+    assert metrics["perf/step_sec"] == 4.0
+    assert metrics["train/tokens"] == 24.0
+    assert metrics["train/tokens_per_sec"] == 3.0
+
+
 def main() -> None:
     test_trainer_logs_optimizer_steps()
     test_trainer_aggregates_metrics_over_log_interval()
@@ -287,6 +300,7 @@ def main() -> None:
     test_trainer_checkpoint_uploader_follows_upload_cadence()
     test_trainer_checkpoint_retention()
     test_trainer_checkpoint_min_free_space_raises()
+    test_metric_aggregator_step_reduction()
     print("trainer loop smoke ok")
 
 

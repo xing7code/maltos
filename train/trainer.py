@@ -65,12 +65,14 @@ class Trainer:
         self.loggers = _normalize_loggers(logger)
         self.metric_aggregator = metric_aggregator or MetricAggregator()
         self.checkpoint_uploader = checkpoint_uploader
+        self._last_logged_step = 0
 
     def setup(self) -> None:
         self.runtime.setup()
         self.runtime.state_manager.bind_dataloader(self.dataloader)
         if self.config.resume_from is not None:
             load_sharded_checkpoint(self.runtime.state_manager, self.config.resume_from)
+        self._last_logged_step = self.runtime.state.step
 
     def fit(self) -> None:
         try:
@@ -92,7 +94,9 @@ class Trainer:
         step = self.runtime.state.step
         if step == 0 or step % self.config.log_every != 0:
             return
-        metrics = self.metric_aggregator.flush()
+        step_delta = step - self._last_logged_step
+        metrics = self.metric_aggregator.flush(step_delta=step_delta)
+        self._last_logged_step = step
         if not self.loggers:
             return
         if not _is_log_rank():
