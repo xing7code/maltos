@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -40,9 +41,35 @@ class CheckpointArtifact:
     source_rank: int | None = None
 
 
-def save_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> None:
-    runtime = state_manager.runtime
+def save_sharded_checkpoint(
+    state_manager: StateManager,
+    path: str | Path,
+    *,
+    min_free_gb: float | None = None,
+) -> None:
     checkpoint_dir = Path(path)
+    if min_free_gb is not None:
+        _check_min_free_space(checkpoint_dir.parent, min_free_gb)
+    tmp_dir = checkpoint_dir.with_name(f"{checkpoint_dir.name}.tmp")
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
+        raise FileExistsError(f"checkpoint already exists: {checkpoint_dir}")
+    if rank == 0:
+        if checkpoint_dir.exists():
+            checkpoint_dir.rmdir()
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.parent.mkdir(parents=True, exist_ok=True)
+    distributed_barrier()
+    _save_sharded_checkpoint_contents(state_manager, tmp_dir)
+    distributed_barrier()
+    if rank == 0:
+        tmp_dir.rename(checkpoint_dir)
+    distributed_barrier()
+
+
+def _save_sharded_checkpoint_contents(state_manager: StateManager, checkpoint_dir: Path) -> None:
+    runtime = state_manager.runtime
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -252,3 +279,14 @@ def _validate_unique_artifacts(manifest: CheckpointManifest) -> None:
         if key in seen:
             raise ValueError(f"duplicate artifact in manifest: kind={artifact.kind}, rank={artifact.rank}")
         seen.add(key)
+
+
+def _check_min_free_space(path: Path, min_free_gb: float) -> None:
+    if min_free_gb < 0:
+        raise ValueError(f"min_free_gb must be >= 0, got {min_free_gb}")
+    path.mkdir(parents=True, exist_ok=True)
+    free_gb = shutil.disk_usage(path).free / 1e9
+    if free_gb < min_free_gb:
+        raise RuntimeError(
+            f"insufficient free space for checkpoint: path={path} free_gb={free_gb:.2f} required_gb={min_free_gb:.2f}"
+        )

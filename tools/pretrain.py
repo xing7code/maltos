@@ -83,6 +83,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-checkpoint-every", type=int, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--checkpoint-every", type=int, default=None)
+    parser.add_argument("--checkpoint-keep-last", type=int, default=None)
+    parser.add_argument("--checkpoint-keep-every-n-steps", type=int, default=None)
+    parser.add_argument("--checkpoint-min-free-gb", type=float, default=None)
     parser.add_argument("--resume-from", type=str, default=None)
 
     parser.add_argument("--backend", type=str, default=None)
@@ -147,6 +150,9 @@ def main() -> None:
             checkpoint_every=args.checkpoint_every,
             checkpoint_dir=args.checkpoint_dir,
             resume_from=args.resume_from,
+            checkpoint_keep_last=args.checkpoint_keep_last,
+            checkpoint_keep_every_n_steps=args.checkpoint_keep_every_n_steps,
+            checkpoint_min_free_gb=args.checkpoint_min_free_gb,
         ),
         logger=logger,
         checkpoint_uploader=checkpoint_uploader,
@@ -335,6 +341,12 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("checkpoint", "checkpoint_dir"): "checkpoint_dir",
         ("checkpoint", "every"): "checkpoint_every",
         ("checkpoint", "checkpoint_every"): "checkpoint_every",
+        ("checkpoint", "keep_last"): "checkpoint_keep_last",
+        ("checkpoint", "checkpoint_keep_last"): "checkpoint_keep_last",
+        ("checkpoint", "keep_every_n_steps"): "checkpoint_keep_every_n_steps",
+        ("checkpoint", "checkpoint_keep_every_n_steps"): "checkpoint_keep_every_n_steps",
+        ("checkpoint", "min_free_gb"): "checkpoint_min_free_gb",
+        ("checkpoint", "checkpoint_min_free_gb"): "checkpoint_min_free_gb",
         ("checkpoint", "resume_from"): "resume_from",
     }
     return aliases.get((section, key), key)
@@ -396,7 +408,9 @@ def _print_run_summary(
     )
     print(
         "checkpoint="
-        f"dir={args.checkpoint_dir} every={args.checkpoint_every} resume_from={args.resume_from}"
+        f"dir={args.checkpoint_dir} every={args.checkpoint_every} "
+        f"keep_last={args.checkpoint_keep_last} keep_every_n_steps={args.checkpoint_keep_every_n_steps} "
+        f"min_free_gb={args.checkpoint_min_free_gb} resume_from={args.resume_from}"
     )
 
 

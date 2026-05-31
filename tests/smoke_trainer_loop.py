@@ -196,6 +196,7 @@ def test_trainer_checkpoint_resume_matches_continuous() -> None:
         )
         interrupted_trainer.setup()
         interrupted_trainer.fit()
+        assert not (checkpoint_dir / "step_00000002.tmp").exists()
 
         restored = _make_runtime(seed=9999)
         restored_trainer = Trainer(
@@ -234,12 +235,58 @@ def test_trainer_checkpoint_uploader_follows_upload_cadence() -> None:
         assert [path.name for path, _ in uploader.uploads] == ["step_00000002", "step_00000004"]
 
 
+def test_trainer_checkpoint_retention() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        checkpoint_dir = Path(tmp) / "ckpts"
+        runtime = _make_runtime()
+        trainer = Trainer(
+            runtime=runtime,
+            dataloader=_make_loader(),
+            config=TrainerConfig(
+                max_steps=4,
+                checkpoint_every=1,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_keep_last=1,
+                checkpoint_keep_every_n_steps=2,
+            ),
+        )
+        trainer.setup()
+        trainer.fit()
+
+        assert sorted(path.name for path in checkpoint_dir.iterdir()) == ["step_00000002", "step_00000004"]
+
+
+def test_trainer_checkpoint_min_free_space_raises() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        checkpoint_dir = Path(tmp) / "ckpts"
+        runtime = _make_runtime()
+        trainer = Trainer(
+            runtime=runtime,
+            dataloader=_make_loader(),
+            config=TrainerConfig(
+                max_steps=1,
+                checkpoint_every=1,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_min_free_gb=1_000_000_000,
+            ),
+        )
+        trainer.setup()
+        try:
+            trainer.fit()
+        except RuntimeError as exc:
+            assert "insufficient free space" in str(exc)
+        else:
+            raise AssertionError("checkpoint free-space guard did not raise")
+
+
 def main() -> None:
     test_trainer_logs_optimizer_steps()
     test_trainer_aggregates_metrics_over_log_interval()
     test_trainer_collects_each_microbatch_metric()
     test_trainer_checkpoint_resume_matches_continuous()
     test_trainer_checkpoint_uploader_follows_upload_cadence()
+    test_trainer_checkpoint_retention()
+    test_trainer_checkpoint_min_free_space_raises()
     print("trainer loop smoke ok")
 
 

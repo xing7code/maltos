@@ -43,4 +43,7 @@ logging:
 checkpoint:
   dir: checkpoints/llama_10m
   every: 50
+  keep_last: 1
+  keep_every_n_steps: 250
+  min_free_gb: 5
   resume_from: null

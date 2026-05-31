@@ -270,6 +270,22 @@ W&B checkpoint artifacts can be enabled by setting `--wandb-checkpoint-every N`.
 source of truth, and rank 0 uploads selected checkpoint directories
 asynchronously as W&B Artifacts.
 
+Checkpoint writes are atomic at the step-directory level: the runtime writes a
+`step_XXXXXXXX.tmp` directory first and renames it only after all rank-local
+artifacts and the manifest are complete. Recipes can also set retention and
+free-space guardrails:
+
+```yaml
+checkpoint:
+  every: 100
+  keep_last: 1
+  keep_every_n_steps: 500
+  min_free_gb: 5
+```
+
+`min_free_gb` is fail-fast: if the checkpoint filesystem has less free space
+than requested, training raises instead of writing a partial checkpoint.
+
 Existing checkpoints can also be uploaded manually:
 
 ```bash
