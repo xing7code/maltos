@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument("--eps", type=float, default=1e-5)
+    parser.add_argument("--attention-backend", type=str, default="sdpa_auto", choices=("eager", "sdpa_auto", "sdpa_flash"))
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--activation-checkpoint-every-n-layers", type=int, default=1)
 
@@ -190,6 +191,7 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
                 num_key_value_heads=args.n_kv_heads or args.n_heads,
                 max_position_embeddings=args.seq_len,
                 rms_norm_eps=args.eps,
+                attention_backend=args.attention_backend,
                 activation_checkpointing=ActivationCheckpointConfig(
                     enabled=args.activation_checkpointing,
                     every_n_layers=args.activation_checkpoint_every_n_layers,
@@ -327,6 +329,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("model", "vocab_size"): "vocab_size",
         ("model", "rms_norm_eps"): "eps",
         ("model", "eps"): "eps",
+        ("model", "attention_backend"): "attention_backend",
         ("model", "activation_checkpointing"): "activation_checkpointing",
         ("model", "activation_checkpoint_every_n_layers"): "activation_checkpoint_every_n_layers",
         ("parallel", "dp_size"): "dp_size",
@@ -408,6 +411,7 @@ def _print_run_summary(
     )
     print(
         "model_features="
+        f"attention_backend={args.attention_backend} "
         f"activation_checkpointing={args.activation_checkpointing} "
         f"activation_checkpoint_every_n_layers={args.activation_checkpoint_every_n_layers}"
     )

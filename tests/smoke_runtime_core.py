@@ -450,6 +450,31 @@ def test_llama_activation_checkpointing_train_step() -> None:
     )
 
 
+def test_llama_sdpa_auto_matches_eager_attention() -> None:
+    torch.manual_seed(1234)
+    base_config = dict(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=8,
+    )
+    sdpa = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend="sdpa_auto"))
+    eager = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend="eager"))
+    eager.load_state_dict(sdpa.state_dict())
+    sdpa.eval()
+    eager.eval()
+    input_ids = torch.randint(0, 32, (2, 8))
+
+    with torch.no_grad():
+        sdpa_logits = sdpa(input_ids)
+        eager_logits = eager(input_ids)
+
+    torch.testing.assert_close(sdpa_logits, eager_logits, atol=1e-5, rtol=1e-5)
+
+
 def main() -> None:
     test_plugin_ordering()
     test_missing_required_plugin_fails()
@@ -465,6 +490,7 @@ def main() -> None:
     test_grad_accumulation_runtime_step_cadence()
     test_grad_accumulation_resume_boundary_cadence()
     test_llama_activation_checkpointing_train_step()
+    test_llama_sdpa_auto_matches_eager_attention()
     print("runtime core smoke ok")
 
 

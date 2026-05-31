@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from models.activation_checkpointing import ActivationCheckpointConfig
@@ -23,7 +24,13 @@ class LlamaConfig:
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     tie_word_embeddings: bool = False
+    attention_backend: str = "sdpa_auto"
     activation_checkpointing: ActivationCheckpointConfig = field(default_factory=ActivationCheckpointConfig)
+
+    def __post_init__(self) -> None:
+        valid_backends = {"eager", "sdpa_auto", "sdpa_flash"}
+        if self.attention_backend not in valid_backends:
+            raise ValueError(f"attention_backend must be one of {sorted(valid_backends)}, got {self.attention_backend!r}")
 
 
 class LlamaRMSNorm(nn.Module):
@@ -66,9 +73,20 @@ def _repeat_kv(x: torch.Tensor, repeats: int) -> torch.Tensor:
     return x.repeat_interleave(repeats, dim=1)
 
 
+def _eager_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    scale = q.size(-1) ** -0.5
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    seq_len = q.size(-2)
+    causal_mask = torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool).tril()
+    scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
+    probs = scores.softmax(dim=-1)
+    return torch.matmul(probs, v)
+
+
 class LlamaAttention(nn.Module):
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
+        self.config = config
         if config.hidden_size % config.num_attention_heads != 0:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         self.hidden_size = config.hidden_size
@@ -100,7 +118,13 @@ class LlamaAttention(nn.Module):
         repeats = q.size(1) // k.size(1)
         k = _repeat_kv(k, repeats)
         v = _repeat_kv(v, repeats)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if self.config.attention_backend == "sdpa_auto":
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif self.config.attention_backend == "sdpa_flash":
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            out = _eager_causal_attention(q, k, v)
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(out)
 

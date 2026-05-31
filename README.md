@@ -42,6 +42,7 @@ This is intentionally small enough to read, but the core control flow mirrors th
 | Context parallelism | Planned |
 | Expert parallelism | Planned |
 | LLaMA activation checkpointing | Supported |
+| LLaMA SDPA attention backends | Supported |
 | FlashAttention-specific kernels | Planned |
 
 ## System Flow
@@ -272,6 +273,7 @@ The LLaMA path supports block-level activation checkpointing:
 ```bash
 PYTHONPATH=. .venv/bin/python tools/pretrain.py \
   --config configs/llama_50m.yaml \
+  --attention-backend sdpa_auto \
   --activation-checkpointing \
   --activation-checkpoint-every-n-layers 2
 ```
@@ -355,7 +357,7 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
 
 - Pipeline parallel, context parallel, and expert parallel are planned but not implemented yet.
 - Activation checkpointing is implemented for the LLaMA path; tiny models keep the simpler eager path.
-- FlashAttention-specific kernels are not implemented yet.
+- The LLaMA path supports `eager`, `sdpa_auto`, and `sdpa_flash` attention backends. `sdpa_auto` uses PyTorch's SDPA dispatcher by default; `sdpa_flash` asks PyTorch to use its FlashAttention backend when the shape, dtype, and device are eligible. Custom FlashAttention kernels are not implemented yet.
 - The current implementation prioritizes clarity and correctness over Megatron-level throughput optimization.
 - The tiny transformer is intentionally small and readable; the LLaMA path is more realistic but still minimal.
 - YAML recipes cover the main experiment settings; CLI flags can override any recipe field for quick sweeps.
