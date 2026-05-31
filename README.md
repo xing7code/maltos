@@ -1,10 +1,20 @@
-# LLM Train Systems
+# ALLOY
 
-A compact pretraining runtime for experimenting with modern large-model training infrastructure.
+**Adaptive LLM Learning Orchestration sYstem.**
 
-The goal of this repo is not to hide PyTorch behind a framework. The goal is to make the moving pieces of a pretraining system explicit: process meshes, runtime phases, composable parallel plugins, sharded checkpointing, dataloader state, metric aggregation, and a trainer loop that can run real token shards.
+ALLOY is a compact training systems runtime for composing LLM pretraining
+strategies through plugins. The name is intentional: tensor parallelism,
+sequence parallelism, DDP, ZeRO, precision, checkpointing, metrics, and profiler
+traces are separate components that combine into one runtime, like an alloy made
+from different materials.
 
-Technical writeup: [A Small but Realistic Runtime for LLM Pretraining](docs/blog/a-small-but-realistic-runtime-for-llm-pretraining.md)
+The goal of this repo is not to hide PyTorch behind a framework. The goal is to
+make the moving pieces of a training system explicit: process meshes, runtime
+phases, composable parallel plugins, sharded checkpointing, dataloader state,
+metric aggregation, and a trainer loop that can run real token shards.
+
+Technical writeups live in the companion blog repo:
+[`alloy-blog`](https://github.com/xing7code/alloy-blog).
 
 Experiment tracking: [W&B report](https://api.wandb.ai/links/xing7-org/f2s88x30)
 
@@ -22,7 +32,12 @@ Experiment tracking: [W&B report](https://api.wandb.ai/links/xing7-org/f2s88x30)
 - Console, JSONL, and W&B metric logging.
 - End-to-end LLaMA/tiny pretraining recipe.
 
-This is intentionally small enough to read, but the core control flow mirrors the shape of larger pretraining systems: Megatron-style TP/SP, ZeRO/FSDP-style optimizer ownership, explicit process mesh axes, and checkpoint metadata that describes local shards.
+This is intentionally small enough to read, but the core control flow mirrors
+the shape of larger pretraining systems: Megatron-style TP/SP, ZeRO/FSDP-style
+optimizer ownership, explicit process mesh axes, and checkpoint metadata that
+describes local shards. Long term, ALLOY is meant to grow from pretraining into
+a modular training stack for SFT, preference training, RL, and fast research
+workflows.
 
 ## Support Matrix
 
@@ -45,14 +60,14 @@ This is intentionally small enough to read, but the core control flow mirrors th
 | LLaMA SDPA attention backends | Supported |
 | FlashAttention-specific kernels | Planned |
 
-## System Flow
+## ALLOY Runtime Flow
 
 ```mermaid
 flowchart LR
     shards["Token .bin shards"] --> loader["PretrainingDataLoader"]
     loader --> trainer["Trainer"]
 
-    trainer --> runtime["RuntimeCore"]
+    trainer --> runtime["ALLOY RuntimeCore"]
     runtime --> model["PyTorch model"]
     runtime --> plugins["Runtime plugins"]
     runtime --> state["StateManager"]
