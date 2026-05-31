@@ -1,3 +1,14 @@
+---
+layout: post
+title: A Small but Realistic Runtime for LLM Pretraining
+description: Building a compact training runtime with process meshes, composable parallel plugins, sharded checkpoints, token-stream resume, and real 1/2/4 GPU experiments.
+category: Runtime overview
+date: 2026-05-26
+read_time: 18 min read
+hero_image: /blog/assets/runtime-overview.svg
+hero_alt: Runtime overview diagram
+---
+
 # A Small but Realistic Runtime for LLM Pretraining
 
 Modern LLM pretraining systems are often described through their parallelism
