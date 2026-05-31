@@ -215,6 +215,7 @@ def test_multiple_optimizer_plugin_owners_fail() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=LossModel(),
+        optimizer_factory=_sgd_factory(),
         plugins=[
             OptimizerOwnerPlugin(PluginId.ZERO1),
             OptimizerOwnerPlugin(PluginId.ZERO2),
@@ -237,7 +238,7 @@ def test_runtime_core_requires_optimizer_owner() -> None:
     try:
         core.setup()
     except ValueError as exc:
-        assert "requires optimizer_factory" in str(exc)
+        assert "optimizer_factory is required" in str(exc)
     else:
         raise AssertionError("RuntimeCore accepted a config without an optimizer owner")
 

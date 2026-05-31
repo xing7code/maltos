@@ -268,11 +268,15 @@ initialized only on rank 0. Fine-grained profiling is intentionally kept out of
 the steady-state training path. MFU is a reporting layer concern and can be
 computed offline from `perf/tflops_per_gpu` and a declared hardware peak.
 
-Training recipes support constant, linear, and cosine LR schedules:
+Training recipes support AdamW hyperparameters plus constant, linear, and cosine LR schedules:
 
 ```yaml
 training:
   lr: 3.0e-4
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
   lr_schedule: cosine
   warmup_steps: 100
   min_lr: 3.0e-5

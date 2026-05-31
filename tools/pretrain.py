@@ -55,6 +55,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.95)
+    parser.add_argument("--adam-eps", type=float, default=1e-8)
     parser.add_argument("--lr-schedule", type=str, default="constant", choices=("constant", "linear", "cosine"))
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--min-lr", type=float, default=0.0)
@@ -217,7 +221,7 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
 
 def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: torch.device) -> RuntimeCore:
     plugins = []
-    optimizer_factory = lambda params: torch.optim.AdamW(params, lr=args.lr)
+    optimizer_factory = _build_optimizer_factory(args)
     scheduler_factory = _build_scheduler_factory(args)
     if args.tp_size > 1:
         plugins.append(TensorParallelPlugin())
@@ -260,6 +264,27 @@ def _build_ddp(mode: str) -> DataParallelPlugin | BucketDataParallelPlugin:
     if mode == "bucket":
         return BucketDataParallelPlugin()
     return DataParallelPlugin(async_op=(mode == "async"))
+
+
+def _build_optimizer_factory(args: argparse.Namespace):
+    if args.lr < 0:
+        raise ValueError("--lr must be >= 0")
+    if args.weight_decay < 0:
+        raise ValueError("--weight-decay must be >= 0")
+    if not 0.0 <= args.adam_beta1 < 1.0:
+        raise ValueError("--adam-beta1 must be in [0, 1)")
+    if not 0.0 <= args.adam_beta2 < 1.0:
+        raise ValueError("--adam-beta2 must be in [0, 1)")
+    if args.adam_eps <= 0:
+        raise ValueError("--adam-eps must be > 0")
+
+    return lambda params: torch.optim.AdamW(
+        params,
+        lr=args.lr,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=args.adam_eps,
+        weight_decay=args.weight_decay,
+    )
 
 
 def _build_scheduler_factory(args: argparse.Namespace):
@@ -371,6 +396,10 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("training", "max_steps"): "max_steps",
         ("training", "grad_accum_steps"): "grad_accum_steps",
         ("training", "lr"): "lr",
+        ("training", "weight_decay"): "weight_decay",
+        ("training", "adam_beta1"): "adam_beta1",
+        ("training", "adam_beta2"): "adam_beta2",
+        ("training", "adam_eps"): "adam_eps",
         ("training", "lr_schedule"): "lr_schedule",
         ("training", "warmup_steps"): "warmup_steps",
         ("training", "min_lr"): "min_lr",
@@ -440,7 +469,9 @@ def _print_run_summary(
     print(f"plugins={plugin_names}")
     print(
         "training="
-        f"precision={args.precision} lr={args.lr} lr_schedule={args.lr_schedule} "
+        f"precision={args.precision} lr={args.lr} weight_decay={args.weight_decay} "
+        f"adam_betas=({args.adam_beta1}, {args.adam_beta2}) adam_eps={args.adam_eps} "
+        f"lr_schedule={args.lr_schedule} "
         f"warmup_steps={args.warmup_steps} min_lr={args.min_lr} grad_accum_steps={args.grad_accum_steps} "
         f"micro_batch_size={args.micro_batch_size} seq_len={args.seq_len}"
     )
