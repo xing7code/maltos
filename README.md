@@ -267,6 +267,16 @@ initialized only on rank 0. Fine-grained profiling is intentionally kept out of
 the steady-state training path. MFU is a reporting layer concern and can be
 computed offline from `perf/tflops_per_gpu` and a declared hardware peak.
 
+To continue logging into an existing W&B run, pass its run id:
+
+```bash
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+  --config configs/llama_50m.yaml \
+  --data datasets/fineweb_50m \
+  --resume-from checkpoints/llama_50m/step_00002500 \
+  --wandb-run-id oxqveqbo
+```
+
 W&B checkpoint artifacts can be enabled by setting `--wandb-checkpoint-every N`.
 `N` must be a multiple of `--checkpoint-every`; local checkpointing remains the
 source of truth, and rank 0 uploads selected checkpoint directories

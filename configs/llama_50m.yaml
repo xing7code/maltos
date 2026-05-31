@@ -34,6 +34,7 @@ logging:
   metrics_jsonl: logs/llama_50m.jsonl
   wandb_project: llm-train-systems
   wandb_run_name: llama-50m-dp2-tp2-sp-zero3
+  wandb_run_id: null
   wandb_tags:
     - llama
     - 50m-tokens

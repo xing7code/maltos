@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-id", type=str, default=None)
     parser.add_argument("--wandb-mode", type=str, default=None, choices=("online", "offline", "disabled"))
     parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags")
     parser.add_argument("--wandb-checkpoint-every", type=int, default=None)
@@ -261,6 +262,7 @@ def _build_logging(args: argparse.Namespace, rank: int) -> tuple[list[MetricLogg
             project=args.wandb_project,
             name=args.wandb_run_name,
             entity=args.wandb_entity,
+            run_id=args.wandb_run_id,
             mode=args.wandb_mode,
             tags=_parse_tags(args.wandb_tags),
             config=vars(args),
@@ -334,6 +336,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("logging", "wandb_project"): "wandb_project",
         ("logging", "wandb_run_name"): "wandb_run_name",
         ("logging", "wandb_entity"): "wandb_entity",
+        ("logging", "wandb_run_id"): "wandb_run_id",
         ("logging", "wandb_mode"): "wandb_mode",
         ("logging", "wandb_tags"): "wandb_tags",
         ("logging", "wandb_checkpoint_every"): "wandb_checkpoint_every",
@@ -404,6 +407,7 @@ def _print_run_summary(
         "logging="
         f"log_every={args.log_every} jsonl={args.metrics_jsonl} "
         f"wandb_project={args.wandb_project} wandb_mode={args.wandb_mode} "
+        f"wandb_run_id={args.wandb_run_id} "
         f"wandb_checkpoint_every={args.wandb_checkpoint_every}"
     )
     print(
