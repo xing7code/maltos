@@ -6,7 +6,7 @@ Goal: run a small real-data LLaMA pretraining smoke with observable metrics and 
 
 ```bash
 git clone <repo-url>
-cd llm-train-systems
+cd maltos
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt

@@ -42,7 +42,7 @@ training:
 logging:
   log_every: 1
   metrics_jsonl: logs/llama_50m.jsonl
-  wandb_project: llm-train-systems
+  wandb_project: maltos
   wandb_run_name: llama-50m-dp2-tp2-sp-zero3
   wandb_run_id: null
   wandb_tags:

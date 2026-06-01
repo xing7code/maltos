@@ -3,7 +3,7 @@ example:
 PYTHONPATH=. python tools/upload_wandb_checkpoint.py \
   --checkpoint-dir checkpoints/llama_50m_dp2_tp2_sp_zero3 \
   --steps 1000 2000 3000 \
-  --project llm-train-systems \
+  --project maltos \
   --entity xing7-org \
   --artifact-prefix llama-50m-dp2-tp2-sp-zero3
 """

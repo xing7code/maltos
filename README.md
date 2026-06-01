@@ -1,12 +1,11 @@
-# ALLOY
+# MALTOS
 
-**Adaptive LLM Learning Orchestration sYstem.**
+**Modular Assembly LLM Training and Optimization Systems.**
 
-ALLOY is a compact training systems runtime for composing LLM pretraining
-strategies through plugins. The name is intentional: tensor parallelism,
-sequence parallelism, DDP, ZeRO, precision, checkpointing, metrics, and profiler
-traces are separate components that combine into one runtime, like an alloy made
-from different materials.
+MALTOS is a modular, composable runtime for large-scale foundation model
+training. Tensor parallelism, sequence parallelism, DDP, ZeRO, precision,
+checkpointing, metrics, and profiler traces are assembled as plugins around one
+phase-oriented training runtime instead of being baked into the trainer loop.
 
 The goal of this repo is not to hide PyTorch behind a framework. The goal is to
 make the moving pieces of a training system explicit: process meshes, runtime
@@ -14,7 +13,7 @@ phases, composable parallel plugins, sharded checkpointing, dataloader state,
 metric aggregation, and a trainer loop that can run real token shards.
 
 Technical writeups live in the companion blog repo:
-[`alloy-blog`](https://github.com/xing7code/alloy-blog).
+[xing7code/maltos-blog](https://github.com/xing7code/maltos-blog).
 
 Experiment tracking: [W&B report](https://api.wandb.ai/links/xing7-org/f2s88x30)
 
@@ -35,7 +34,7 @@ Experiment tracking: [W&B report](https://api.wandb.ai/links/xing7-org/f2s88x30)
 This is intentionally small enough to read, but the core control flow mirrors
 the shape of larger pretraining systems: Megatron-style TP/SP, ZeRO/FSDP-style
 optimizer ownership, explicit process mesh axes, and checkpoint metadata that
-describes local shards. Long term, ALLOY is meant to grow from pretraining into
+describes local shards. Long term, MALTOS is meant to grow from pretraining into
 a modular training stack for SFT, preference training, RL, and fast research
 workflows.
 
@@ -60,14 +59,14 @@ workflows.
 | LLaMA SDPA attention backends | Supported |
 | FlashAttention-specific kernels | Planned |
 
-## ALLOY Runtime Flow
+## MALTOS Runtime Flow
 
 ```mermaid
 flowchart LR
     shards["Token .bin shards"] --> loader["PretrainingDataLoader"]
     loader --> trainer["Trainer"]
 
-    trainer --> runtime["ALLOY RuntimeCore"]
+    trainer --> runtime["MALTOS RuntimeCore"]
     runtime --> model["PyTorch model"]
     runtime --> plugins["Runtime plugins"]
     runtime --> state["StateManager"]
@@ -383,7 +382,7 @@ Existing checkpoints can also be uploaded manually:
 PYTHONPATH=. .venv/bin/python tools/upload_wandb_checkpoint.py \
   --checkpoint-dir checkpoints/llama_50m_dp2_tp2_sp_zero3 \
   --steps 500 1000 1500 2000 2500 \
-  --project llm-train-systems \
+  --project maltos \
   --entity xing7-org \
   --artifact-prefix llama-50m-dp2-tp2-sp-zero3-main
 ```
