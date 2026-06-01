@@ -25,6 +25,7 @@ Experiment tracking: [W&B report](https://api.wandb.ai/links/xing7-org/f2s88x30)
 - ZeRO-1, ZeRO-2, and ZeRO-3 style optimizer/parameter sharding.
 - Mixed precision hooks for bf16/fp16, with GradScaler state checkpointing for fp16.
 - Gradient accumulation and gradient clipping.
+- PyTorch fused AdamW support for CUDA optimizer-step throughput.
 - Stateful pretraining dataloader over mmap token shards.
 - Sharded checkpoint save/load for model, optimizer, trainer, plugin, RNG, and dataloader state.
 - Metric collection from runtime/plugins, interval aggregation, and console/jsonl logging.
@@ -330,6 +331,7 @@ training:
   adam_beta1: 0.9
   adam_beta2: 0.95
   adam_eps: 1.0e-8
+  fused_adamw: true
   lr_schedule: cosine
   warmup_steps: 100
   min_lr: 3.0e-5

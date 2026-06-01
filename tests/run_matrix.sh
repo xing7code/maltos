@@ -13,6 +13,9 @@ echo "=== smoke/runtime core ==="
 echo "=== smoke/trainer loop ==="
 "${PYTHON_BIN}" tests/smoke_trainer_loop.py
 
+echo "=== smoke/pretrain cli ==="
+"${PYTHON_BIN}" tests/smoke_pretrain_cli.py
+
 echo "=== checkpoint manifest validation ==="
 "${PYTHON_BIN}" tests/checkpoint_manifest_validation.py
 
