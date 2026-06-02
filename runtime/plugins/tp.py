@@ -5,7 +5,7 @@ import torch.nn as nn
 from parallel.specs import TpSpShardAxis
 from runtime.core import RuntimePhase
 from runtime.mesh import MeshAxis
-from runtime.plugin import ParallelizableModule, PluginId, RuntimePlugin
+from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
 from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
 from state.state import ParamState
 
@@ -24,9 +24,9 @@ class TensorParallelPlugin(RuntimePlugin):
         return self.runtime.get_group(MeshAxis.TP)
 
     def transform_model(self, model: nn.Module) -> nn.Module:
-        if not isinstance(model, ParallelizableModule):
+        if not isinstance(model, TpSpParallelizableModule):
             return model
-        spec = model.parallelize_spec()
+        spec = model.tpsp_parallelize_spec()
         for rule in spec.rules:
             module = model.get_submodule(rule.module_path)
             if not isinstance(module, nn.Linear):

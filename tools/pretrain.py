@@ -25,11 +25,13 @@ from models import (
     TinyTransformerTpSp,
 )
 from parallel import ParallelPlan
+from parallel.schedule import PipelineScheduleConfig
 from runtime import MeshConfig, RuntimeCore
 from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.perf_metrics import PerfMetricsPlugin
+from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.torch_profiler import TorchProfilerPlugin
@@ -82,6 +84,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--activation-checkpoint-every-n-layers", type=int, default=1)
 
     parser.add_argument("--dp-size", type=int, default=1)
+    parser.add_argument("--pp-size", type=int, default=1)
+    parser.add_argument("--pp-microbatches", type=int, default=1)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--zero-stage", type=int, default=0, choices=(0, 1, 2, 3))
     parser.add_argument("--use-sp", action=argparse.BooleanOptionalAction, default=False)
@@ -136,8 +140,11 @@ def main() -> None:
     device = _select_device()
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    if world_size != args.dp_size * args.tp_size:
-        raise ValueError(f"world_size={world_size} must equal dp_size * tp_size={args.dp_size * args.tp_size}")
+    expected_world_size = args.dp_size * args.pp_size * args.tp_size
+    if world_size != expected_world_size:
+        raise ValueError(
+            f"world_size={world_size} must equal dp_size * pp_size * tp_size={expected_world_size}"
+        )
     if args.use_sp and args.tp_size <= 1:
         raise ValueError("--use-sp requires --tp-size > 1")
     if args.zero_stage > 0 and args.dp_size <= 1:
@@ -157,7 +164,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
-    dp_rank = rank // args.tp_size
+    dp_rank = rank // (args.pp_size * args.tp_size)
     data_paths = _expand_data_paths(args.data)
     model = _build_model(args)
     initial_trainable_params = _count_trainable_params(model)
@@ -262,6 +269,8 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         plugins.append(TensorParallelPlugin())
     if args.use_sp:
         plugins.append(SequenceParallelPlugin())
+    if args.pp_size > 1:
+        plugins.append(PipelineParallelPlugin())
     if args.zero_stage == 0:
         if args.dp_size > 1:
             plugins.append(_build_ddp(args.ddp_mode or "sync"))
@@ -299,8 +308,11 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         )
 
     return RuntimeCore(
-        mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
-        plan=ParallelPlan(zero_stage=args.zero_stage),
+        mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=1, ep=1),
+        plan=ParallelPlan(
+            zero_stage=args.zero_stage,
+            pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
+        ),
         device=device,
         model=model,
         optimizer_factory=optimizer_factory,
@@ -443,6 +455,8 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("model", "activation_checkpointing"): "activation_checkpointing",
         ("model", "activation_checkpoint_every_n_layers"): "activation_checkpoint_every_n_layers",
         ("parallel", "dp_size"): "dp_size",
+        ("parallel", "pp_size"): "pp_size",
+        ("parallel", "pp_microbatches"): "pp_microbatches",
         ("parallel", "tp_size"): "tp_size",
         ("parallel", "use_sp"): "use_sp",
         ("parallel", "zero_stage"): "zero_stage",
@@ -531,7 +545,7 @@ def _print_run_summary(
     print(f"runtime_local_trainable_params={local_trainable_params:,}")
     print(
         "mesh="
-        f"dp={args.dp_size} tp={args.tp_size} pp=1 cp=1 "
+        f"dp={args.dp_size} tp={args.tp_size} pp={args.pp_size} cp=1 "
         f"world_size={world_size} device={device}"
     )
     print(f"plugins={plugin_names}")
@@ -543,7 +557,8 @@ def _print_run_summary(
         f"fused_adamw={args.fused_adamw} "
         f"lr_schedule={args.lr_schedule} "
         f"warmup_steps={args.warmup_steps} min_lr={args.min_lr} grad_accum_steps={args.grad_accum_steps} "
-        f"micro_batch_size={args.micro_batch_size} seq_len={args.seq_len}"
+        f"micro_batch_size={args.micro_batch_size} seq_len={args.seq_len} "
+        f"pp_microbatches={args.pp_microbatches}"
     )
     print(
         "model_features="

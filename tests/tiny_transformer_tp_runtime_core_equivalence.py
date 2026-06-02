@@ -86,10 +86,10 @@ def _baseline_loss(model: TinyTransformer, tokens: torch.Tensor) -> float:
 
 
 def _rule_by_param_name(model: TinyTransformer) -> dict[str, str]:
-    if not hasattr(model, "parallelize_spec"):
+    if not hasattr(model, "tpsp_parallelize_spec"):
         return {}
     rules = {}
-    for rule in model.parallelize_spec().rules:
+    for rule in model.tpsp_parallelize_spec().rules:
         if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
             rules[f"{rule.module_path}.weight"] = rule.shard_axis
             rules[f"{rule.module_path}.bias"] = rule.shard_axis

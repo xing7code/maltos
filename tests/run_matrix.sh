@@ -37,6 +37,16 @@ echo "=== zero3 checkpoint roundtrip ==="
 echo "=== tp checkpoint manifest ==="
 "${PYTHON_BIN}" tests/tiny_transformer_tp_checkpoint_manifest.py
 
+echo "=== tiny transformer pp equivalence ==="
+for c in pp pp_ddp_sync pp_zero1 pp_zero2 pp_zero3; do
+  echo "--- pp case: ${c} ---"
+  if [ "${c}" = "pp" ]; then
+    "${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case "${c}" --world-size 2 --dp-size 1 --pp-size 2
+  else
+    "${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case "${c}" --world-size 4 --dp-size 2 --pp-size 2
+  fi
+done
+
 echo "=== tiny transformer integration matrix ==="
 for c in tp_sp tp_sp_ddp_sync tp_sp_ddp_async tp_sp_ddp_bucket tp_sp_zero1 tp_sp_zero2 tp_sp_zero3; do
   echo "--- case: ${c} ---"

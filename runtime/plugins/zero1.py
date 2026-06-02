@@ -74,12 +74,12 @@ class Zero1Plugin(RuntimePlugin):
         return model
 
     def on_phase(self, phase: RuntimePhase) -> None:
-        if phase == RuntimePhase.PRE_FORWARD:
+        if phase == RuntimePhase.PRE_BACKWARD:
             assert self.runtime is not None
             context = self.runtime.state.step_context
             self._reset_buckets(
-                grad_accum_start=context.accum_start if context is not None else True,
-                grad_accum_end=context.is_step_boundary if context is not None else True,
+                grad_accum_start=context.accum_start,
+                grad_accum_end=context.is_step_boundary,
             )
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None

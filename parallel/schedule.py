@@ -12,3 +12,10 @@ class PipelineScheduleType(str, Enum):
 class PipelineScheduleConfig:
     schedule: PipelineScheduleType = PipelineScheduleType.ONE_FWD_ONE_BWD
     virtual_stages: int = 1
+    microbatches: int = 1
+
+    def __post_init__(self) -> None:
+        if self.virtual_stages < 1:
+            raise ValueError(f"virtual_stages must be >= 1, got {self.virtual_stages}")
+        if self.microbatches < 1:
+            raise ValueError(f"microbatches must be >= 1, got {self.microbatches}")

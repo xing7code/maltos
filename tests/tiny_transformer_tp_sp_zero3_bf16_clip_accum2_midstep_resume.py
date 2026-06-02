@@ -90,7 +90,7 @@ def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[t
 
 def _rule_by_param_name(model: TinyTransformerTpSp) -> dict[str, str]:
     rules = {}
-    for rule in model.parallelize_spec().rules:
+    for rule in model.tpsp_parallelize_spec().rules:
         if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
             rules[f"{rule.module_path}.weight"] = rule.shard_axis
             rules[f"{rule.module_path}.bias"] = rule.shard_axis

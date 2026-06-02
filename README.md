@@ -53,7 +53,7 @@ workflows.
 | Stateful token-shard dataloader | Supported |
 | Sharded checkpoint save/load | Supported |
 | W&B metric logging and checkpoint artifacts | Supported |
-| Pipeline parallelism | Planned |
+| Pipeline parallelism | PP v0 supported (pp-only) |
 | Context parallelism | Planned |
 | Expert parallelism | Planned |
 | LLaMA activation checkpointing | Supported |
@@ -142,6 +142,11 @@ The trainer collects metrics every microstep, but only logs/checkpoints on
 optimizer-step boundaries. This keeps gradient accumulation observability
 honest without making checkpoints land mid-step unless explicitly requested by
 tests.
+
+Current PP support is intentionally narrow: decoder-only TinyTransformer/LLaMA
+layer partitioning, runtime-owned optimizer per stage, and pipeline
+microbatching inside `run_step()`. PP v0 does not yet compose with TP/SP, DDP,
+or ZeRO.
 
 ## Batch Contract
 
@@ -439,7 +444,7 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
 
 ## Design Notes
 
-- The model stays close to normal PyTorch. Parallel behavior is declared by `parallelize_spec()` and applied by runtime plugins.
+- The model stays close to normal PyTorch. TP/SP behavior is declared by `tpsp_parallelize_spec()` and applied by runtime plugins.
 - `RuntimeCore` is the execution engine. It does not own the dataloader or logging sinks.
 - `Trainer` owns the training loop, dataloader binding, checkpoint cadence, and metric cadence.
 - Plugins can own optimizers, as ZeRO does. Otherwise `RuntimeCore` owns the optimizer.

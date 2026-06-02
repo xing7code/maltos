@@ -8,7 +8,7 @@ from parallel.specs import TpSpComm, TpSpShardAxis, TpSpShardRule
 from runtime.core import RuntimePhase
 from runtime.layers.functional import all_gather
 from runtime.mesh import MeshAxis
-from runtime.plugin import ParallelizableModule, PluginId, RuntimePlugin
+from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
 
 
 class SequenceParallelPlugin(RuntimePlugin):
@@ -44,10 +44,10 @@ class SequenceParallelPlugin(RuntimePlugin):
         return dist.get_world_size(self.sp_group)
 
     def transform_model(self, model: nn.Module) -> nn.Module:
-        if not isinstance(model, ParallelizableModule):
+        if not isinstance(model, TpSpParallelizableModule):
             return model
 
-        for rule in model.parallelize_spec().rules:
+        for rule in model.tpsp_parallelize_spec().rules:
             if rule.shard_axis != TpSpShardAxis.SEQUENCE:
                 continue
             module = model.get_submodule(rule.module_path)

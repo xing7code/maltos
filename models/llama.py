@@ -9,6 +9,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from models.activation_checkpointing import ActivationCheckpointConfig
+from parallel.pipeline import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 
 
@@ -167,28 +168,47 @@ class LlamaForCausalLM(nn.Module):
 
     def forward(self, batch):
         if isinstance(batch, dict):
-            input_ids = batch["input_ids"]
+            input_ids = batch.get("input_ids")
+            hidden_states = batch.get("hidden_states")
             labels = batch.get("labels")
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
+            hidden_states = None
         else:
             input_ids, labels = batch, None
+            hidden_states = None
 
-        x = self.embed_tokens(input_ids)
+        if hidden_states is not None:
+            x = hidden_states
+        else:
+            if input_ids is None:
+                raise ValueError("LlamaForCausalLM requires input_ids or hidden_states")
+            if self.embed_tokens is None:
+                raise ValueError("LlamaForCausalLM PP non-first stage requires hidden_states input")
+            x = self.embed_tokens(input_ids)
         for layer_idx, layer in enumerate(self.layers):
             if self.training and self.config.activation_checkpointing.should_checkpoint_layer(layer_idx):
                 x = checkpoint(layer, x, use_reentrant=False)
             else:
                 x = layer(x)
+        if self.norm is None or self.lm_head is None:
+            return x
         logits = self.lm_head(self.norm(x))
         if labels is None:
             return logits
-        if labels.shape != input_ids.shape:
+        if input_ids is not None and labels.shape != input_ids.shape:
             raise ValueError(f"labels shape must match input_ids shape, got {labels.shape} vs {input_ids.shape}")
         return F.cross_entropy(
             logits.contiguous().view(-1, logits.size(-1)),
             labels.contiguous().view(-1),
             ignore_index=-100,
+        )
+
+    def pipeline_parallel_spec(self) -> PipelineParallelSpec:
+        return PipelineParallelSpec(
+            head_layers=["embed_tokens"],
+            pipe_layers=["layers"],
+            tail_layers=["norm", "lm_head"],
         )
 
     def flops_per_token(self) -> float:
@@ -206,7 +226,7 @@ class LlamaForCausalLM(nn.Module):
 
 
 class LlamaForCausalLMTp(LlamaForCausalLM):
-    def parallelize_spec(self) -> TpSpParallelSpec:
+    def tpsp_parallelize_spec(self) -> TpSpParallelSpec:
         rules = []
         for i in range(len(self.layers)):
             rules += [
@@ -222,7 +242,7 @@ class LlamaForCausalLMTp(LlamaForCausalLM):
 
 
 class LlamaForCausalLMTpSp(LlamaForCausalLM):
-    def parallelize_spec(self) -> TpSpParallelSpec:
+    def tpsp_parallelize_spec(self) -> TpSpParallelSpec:
         rules = [
             TpSpShardRule("embed_tokens", shard_axis=TpSpShardAxis.SEQUENCE, post_comm="scatter", comm_dim=1),
         ]

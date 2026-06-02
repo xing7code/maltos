@@ -17,36 +17,8 @@ from state.state import StateManager
 
 OptimizerFactory = Callable[[Iterable[nn.Parameter]], torch.optim.Optimizer]
 SchedulerFactory = Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler.LRScheduler]
-StepRunnerFn = Callable[[Any, "StepContext"], torch.Tensor]
+StepRunnerFn = Callable[[Any], torch.Tensor]
 
-
-@dataclass
-class StepContext:
-    step: int = 0
-    microbatch_idx: int = 0
-    grad_accum_steps: int = 1
-
-    def __post_init__(self) -> None:
-        if self.grad_accum_steps < 1:
-            raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
-
-    @property
-    def accum_start(self) -> bool:
-        return self.microbatch_idx == 0
-
-    @property
-    def is_step_boundary(self) -> bool:
-        return ((self.microbatch_idx + 1) % self.grad_accum_steps) == 0
-
-    @property
-    def loss_divisor(self) -> float:
-        return float(self.grad_accum_steps)
-
-    def advance_micro_step(self) -> None:
-        self.microbatch_idx = (self.microbatch_idx + 1) % self.grad_accum_steps
-
-    def advance_step(self) -> None:
-        self.step += 1
 
 class RuntimePhase(str, Enum):
     SETUP = "setup"
@@ -60,6 +32,58 @@ class RuntimePhase(str, Enum):
     POST_STEP = "post_step"
     PRE_SAVE = "pre_save"
     POST_LOAD = "post_load"
+
+
+@dataclass
+class StepContext:
+    step: int = 0
+    microbatch_idx: int = 0
+    grad_accum_steps: int = 1
+    pp_fwd_microbatch_idx: int = 0
+    pp_bwd_microbatch_idx: int = 0
+    pp_num_microbatches: int = 1
+
+    def __post_init__(self) -> None:
+        if self.grad_accum_steps < 1:
+            raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
+        if self.pp_num_microbatches < 1:
+            raise ValueError(f"pp_num_microbatches must be >= 1, got {self.pp_num_microbatches}")
+
+    @property
+    def accum_start(self) -> bool:
+        return self.microbatch_idx == 0 and self.pp_bwd_microbatch_idx == 0
+
+    @property
+    def is_step_boundary(self) -> bool:
+        return (
+            ((self.microbatch_idx + 1) % self.grad_accum_steps) == 0
+            and self.pp_bwd_microbatch_idx == (self.pp_num_microbatches - 1)
+        )
+
+    @property
+    def loss_divisor(self) -> float:
+        return float(self.grad_accum_steps)
+
+    def reset_pp_microbatches(self, count: int = 1) -> None:
+        if count < 1:
+            raise ValueError(f"pp_num_microbatches must be >= 1, got {count}")
+        self.pp_fwd_microbatch_idx = 0
+        self.pp_bwd_microbatch_idx = 0
+        self.pp_num_microbatches = count
+
+    def advance_pp_forward(self) -> None:
+        if self.pp_fwd_microbatch_idx + 1 < self.pp_num_microbatches:
+            self.pp_fwd_microbatch_idx += 1
+
+    def advance_pp_backward(self) -> None:
+        if self.pp_bwd_microbatch_idx + 1 < self.pp_num_microbatches:
+            self.pp_bwd_microbatch_idx += 1
+
+    def advance_micro_step(self) -> None:
+        self.microbatch_idx = (self.microbatch_idx + 1) % self.grad_accum_steps
+
+    def advance_step(self) -> None:
+        self.step += 1
 
 
 @dataclass
@@ -142,31 +166,43 @@ class RuntimeCore:
         context = self.state.step_context
         should_step = context.is_step_boundary
         self._run_phase(RuntimePhase.PRE_MICROBATCH)
-        loss = self.get_step_runner()(batch, context)
+        loss = self.get_step_runner()(batch)
         context.advance_micro_step()
         return loss, should_step
 
-    def _run_step_impl(
-        self,
-        batch: Any,
-        *,
-        context: StepContext,
-    ) -> torch.Tensor:
-        self.state.step_context = context
+    def _run_step_impl(self, batch: Any) -> torch.Tensor:
+        self._forward_step_impl(batch)
+        if not torch.is_tensor(self.state.loss):
+            raise TypeError("RuntimeCore expects model(batch) to return a Tensor loss during training.")
+        self._backward_step_impl()
+        assert self.state.loss is not None
+        return self.state.loss
+
+    def _forward_step_impl(self, batch: Any) -> None:
         self._run_phase(RuntimePhase.PRE_FORWARD)
         outputs = self.model(batch)
         self.state.outputs = outputs
         self.state.loss = outputs if torch.is_tensor(outputs) else None
         self._run_phase(RuntimePhase.POST_FORWARD)
+
+    def _backward_step_impl(
+        self,
+        *,
+        grad_output: torch.Tensor | None = None,
+    ) -> None:
         self._run_phase(RuntimePhase.PRE_BACKWARD)
-        if self.state.loss is None:
-            raise TypeError("RuntimeCore expects model(batch) to return a Tensor loss during training.")
-        loss_divisor = context.loss_divisor
-        if loss_divisor != 1:
-            self.state.loss = self.state.loss / loss_divisor
-        self.state.loss.backward()
+        if grad_output is None:
+            if self.state.loss is None:
+                raise TypeError("RuntimeCore expected self.state.loss to be a Tensor before backward()")
+            divisor = self.state.step_context.loss_divisor
+            if divisor != 1:
+                self.state.loss = self.state.loss / divisor
+            self.state.loss.backward()
+        else:
+            if not torch.is_tensor(self.state.outputs):
+                raise TypeError("RuntimeCore expected self.state.outputs Tensor for activation backward()")
+            self.state.outputs.backward(grad_output)
         self._run_phase(RuntimePhase.POST_BACKWARD)
-        return self.state.loss
 
     def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:
         assert self.group_manager is not None
@@ -206,7 +242,7 @@ class RuntimeCore:
             raise ValueError(f"RuntimeCore allows only one step runner plugin, got {names}")
         if runners:
             return runners[0][1]
-        return lambda batch, context: self._run_step_impl(batch, context=context)
+        return self._run_step_impl
 
     def step_optimizer(self) -> None:
         self._run_phase(RuntimePhase.PRE_STEP)

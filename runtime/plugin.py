@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import torch
 import torch.nn as nn
 
+from parallel.pipeline import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec
 from runtime.mesh import MeshAxis
 from state.state import ParamState
@@ -18,8 +19,13 @@ MetricValue = float | int | str | bool | None
 
 
 @runtime_checkable
-class ParallelizableModule(Protocol):
-    def parallelize_spec(self) -> TpSpParallelSpec: ...
+class TpSpParallelizableModule(Protocol):
+    def tpsp_parallelize_spec(self) -> TpSpParallelSpec: ...
+
+
+@runtime_checkable
+class PipelineParallelizableModule(Protocol):
+    def pipeline_parallel_spec(self) -> PipelineParallelSpec: ...
 
 
 @runtime_checkable

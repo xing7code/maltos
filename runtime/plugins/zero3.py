@@ -88,13 +88,15 @@ class Zero3Plugin(RuntimePlugin):
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
             assert self.runtime is not None
-            context = self.runtime.state.step_context
-            self._reset_buckets(
-                grad_accum_start=context.accum_start if context is not None else True,
-                grad_accum_end=context.is_step_boundary if context is not None else True,
-            )
             if self.enable_prefetch and self.buckets:
                 self._prefetch_bucket(self.buckets[0], direction="forward")
+        elif phase == RuntimePhase.PRE_BACKWARD:
+            assert self.runtime is not None
+            context = self.runtime.state.step_context
+            self._reset_buckets(
+                grad_accum_start=context.accum_start,
+                grad_accum_end=context.is_step_boundary,
+            )
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
             if self.runtime.state.step_context.is_step_boundary:
