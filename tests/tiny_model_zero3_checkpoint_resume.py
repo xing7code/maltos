@@ -95,14 +95,17 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     continuous_model = _build_model(args.seed, args.hidden_size)
     continuous_core, continuous_zero3 = _build_core(continuous_model, args.world_size)
-    continuous_core.run_train_step(first_local_batch)
+    _, should_step = continuous_core.run_step(first_local_batch)
+    continuous_core.step_optimizer()
     save_sharded_checkpoint(continuous_core.state_manager, args.checkpoint_dir)
-    continuous_core.run_train_step(second_local_batch)
+    _, should_step = continuous_core.run_step(second_local_batch)
+    continuous_core.step_optimizer()
 
     restored_model = _build_model(args.seed, args.hidden_size)
     restored_core, restored_zero3 = _build_core(restored_model, args.world_size)
     load_sharded_checkpoint(restored_core.state_manager, args.checkpoint_dir)
-    restored_core.run_train_step(second_local_batch)
+    _, should_step = restored_core.run_step(second_local_batch)
+    restored_core.step_optimizer()
 
     continuous_zero3.materialize_model()
     restored_zero3.materialize_model()

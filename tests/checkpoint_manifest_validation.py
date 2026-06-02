@@ -19,8 +19,8 @@ def _build_core(seed: int = 1234, hidden_size: int = 32, grad_accum_steps: int =
     model = TinyModel(hidden_size=hidden_size)
     core = RuntimeCore(
         model=model,
-        optimizer_factory=lambda params: torch.optim.SGD(params, lr=1e-2),
         grad_accum_steps=grad_accum_steps,
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=1e-2),
     )
     core.setup()
     return core
@@ -28,9 +28,10 @@ def _build_core(seed: int = 1234, hidden_size: int = 32, grad_accum_steps: int =
 
 def _save_base_checkpoint() -> tuple[Path, RuntimeCore]:
     checkpoint_dir = Path(tempfile.mkdtemp(prefix="manifest_validation_"))
-    core = _build_core()
+    core = _build_core(grad_accum_steps=2)
     batch = torch.randn(8, 32)
-    core.run_train_step(batch)
+    _, should_step = core.run_step(batch)
+    core.step_optimizer()
     save_sharded_checkpoint(core.state_manager, checkpoint_dir)
     return checkpoint_dir, core
 
@@ -111,7 +112,7 @@ def test_eval_only_manifest_load_succeeds() -> None:
     manifest["artifacts"] = [artifact for artifact in manifest["artifacts"] if artifact["kind"] != "optimizer"]
     _write_manifest(checkpoint_dir, manifest)
 
-    restored_core = _build_core()
+    restored_core = _build_core(grad_accum_steps=2)
     load_sharded_checkpoint(restored_core.state_manager, checkpoint_dir)
     if restored_core.state.step != saved_core.state.step:
         raise AssertionError(
@@ -123,18 +124,18 @@ def test_microbatch_idx_roundtrip_succeeds() -> None:
     checkpoint_dir = Path(tempfile.mkdtemp(prefix="manifest_validation_microbatch_"))
     core = _build_core(grad_accum_steps=2)
     batch = torch.randn(8, 32)
-    core.run_train_step(batch)
-    if core.state.microbatch_idx != 1:
-        raise AssertionError(f"expected saved microbatch_idx=1, got {core.state.microbatch_idx}")
+    _, should_step = core.run_step(batch)
+    if core.state.step_context.microbatch_idx != 1:
+        raise AssertionError(f"expected saved microbatch_idx=1, got {core.state.step_context.microbatch_idx}")
     save_sharded_checkpoint(core.state_manager, checkpoint_dir)
 
     restored_core = _build_core(grad_accum_steps=2)
     load_sharded_checkpoint(restored_core.state_manager, checkpoint_dir)
     if restored_core.state.step != core.state.step:
         raise AssertionError(f"expected restored step={core.state.step}, got {restored_core.state.step}")
-    if restored_core.state.microbatch_idx != core.state.microbatch_idx:
+    if restored_core.state.step_context.microbatch_idx != core.state.step_context.microbatch_idx:
         raise AssertionError(
-            f"expected restored microbatch_idx={core.state.microbatch_idx}, got {restored_core.state.microbatch_idx}"
+            f"expected restored microbatch_idx={core.state.step_context.microbatch_idx}, got {restored_core.state.step_context.microbatch_idx}"
         )
 
 

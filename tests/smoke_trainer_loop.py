@@ -53,13 +53,14 @@ class CaptureCheckpointUploader:
         self.closed = True
 
 
-def _make_runtime(seed: int = 1234) -> RuntimeCore:
+def _make_runtime(seed: int = 1234, grad_accum_steps: int = 1) -> RuntimeCore:
     torch.manual_seed(seed)
     model = LossModel()
     return RuntimeCore(
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
+        grad_accum_steps=grad_accum_steps,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=0.01),
     )
 
@@ -116,7 +117,8 @@ def test_trainer_aggregates_metrics_over_log_interval() -> None:
     expected_losses = []
     while runtime.state.step < 4:
         batch = trainer.dataloader.next_batch()
-        runtime.run_train_step(batch)
+        _, should_step = runtime.run_step(batch)
+        runtime.step_optimizer()
         expected_losses.append(float(runtime.state.loss.detach().float().item()))
     expected_log_losses = [
         sum(expected_losses[0:2]) / 2,
@@ -151,8 +153,8 @@ def test_trainer_collects_each_microbatch_metric() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer_factory=lambda params: torch.optim.SGD(params, lr=0.0),
         grad_accum_steps=2,
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=0.0),
     )
     logger = CaptureLogger()
     trainer = Trainer(

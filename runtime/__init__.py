@@ -1,4 +1,10 @@
-from .core import RuntimeCore, RuntimePhase, RuntimeState
+from .core import (
+    RuntimeCore,
+    RuntimePhase,
+    RuntimeState,
+    StepContext,
+    StepRunnerFn,
+)
 from .mesh import MeshAxis, MeshConfig, ProcessGroupManager
 from .plugin import MetricValue, ParallelizableModule, PluginId, RuntimePlugin
 
@@ -13,4 +19,6 @@ __all__ = [
     "RuntimePlugin",
     "RuntimePhase",
     "RuntimeState",
+    "StepContext",
+    "StepRunnerFn",
 ]

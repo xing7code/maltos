@@ -159,6 +159,7 @@ def _build_runtime(model: TinyTransformerTpSp, dp_size: int, tp_size: int) -> tu
         mesh=MeshConfig(dp=dp_size, tp=tp_size, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=3),
         model=model,
+        grad_accum_steps=2,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=[
             TensorParallelPlugin(),
@@ -167,7 +168,6 @@ def _build_runtime(model: TinyTransformerTpSp, dp_size: int, tp_size: int) -> tu
             PrecisionPlugin(compute_dtype=torch.bfloat16),
             GradClipPlugin(max_norm=1.0),
         ],
-        grad_accum_steps=2,
     )
     core.setup()
     return core, zero3
@@ -204,8 +204,9 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     restored_core.state_manager.bind_dataloader(restored_loader)
 
     first_batch = continuous_loader.next_batch()
-    loss0_cont = continuous_core.run_train_step(_batch_tuple(first_batch)).detach()
-    if continuous_core.state.step != 0 or continuous_core.state.microbatch_idx != 1:
+    loss0_cont, _ = continuous_core.run_step(_batch_tuple(first_batch))
+    loss0_cont = loss0_cont.detach()
+    if continuous_core.state.step != 0 or continuous_core.state.step_context.microbatch_idx != 1:
         raise AssertionError("continuous core must be at mid-step state before checkpoint")
     saved_loader_state = continuous_loader.state_dict()
     save_sharded_checkpoint(continuous_core.state_manager, args.checkpoint_dir)
@@ -215,11 +216,14 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     loss_pairs = []
     for tag in ("A1", "B0", "B1"):
         batch = continuous_loader.next_batch()
-        cont_loss = continuous_core.run_train_step(_batch_tuple(batch)).detach()
+        cont_loss, should_step = continuous_core.run_step(_batch_tuple(batch))
+        cont_loss = cont_loss.detach()
+        if should_step:
+            continuous_core.step_optimizer()
         loss_pairs.append((tag, cont_loss, batch["input_ids"].detach().clone()))
 
     load_sharded_checkpoint(restored_core.state_manager, args.checkpoint_dir)
-    if restored_core.state.step != 0 or restored_core.state.microbatch_idx != 1:
+    if restored_core.state.step != 0 or restored_core.state.step_context.microbatch_idx != 1:
         raise AssertionError("restored core must recover mid-step state")
     if restored_loader.state_dict() != saved_loader_state:
         raise AssertionError("restored dataloader did not recover saved cursor")
@@ -227,7 +231,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     restored_loss_pairs = []
     for tag in ("A1", "B0", "B1"):
         batch = restored_loader.next_batch()
-        restored_loss = restored_core.run_train_step(_batch_tuple(batch)).detach()
+        restored_loss, should_step = restored_core.run_step(_batch_tuple(batch))
+        restored_loss = restored_loss.detach()
+        if should_step:
+            restored_core.step_optimizer()
         restored_loss_pairs.append((tag, restored_loss, batch["input_ids"].detach().clone()))
 
     dp_group = continuous_core.get_group(MeshAxis.DP)

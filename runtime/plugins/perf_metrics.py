@@ -22,7 +22,8 @@ class PerfMetricsPlugin(RuntimePlugin):
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_MICROBATCH:
             assert self.runtime is not None
-            if bool(self.runtime.state.metadata.get("accum_start", True)):
+            context = self.runtime.state.step_context
+            if context is None or context.accum_start:
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
                 self._step_start = time.perf_counter()

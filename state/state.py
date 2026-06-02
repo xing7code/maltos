@@ -42,9 +42,8 @@ class RngState:
 
 @dataclass(frozen=True)
 class TrainerState:
-    step: int
     rng: RngState
-    microbatch_idx: int = 0
+    step_context: dict[str, Any] | None = None
     consumed_tokens: int | None = None
     dataloader: dict[str, Any] | None = None
     plugin_states: dict[str, dict[str, Any]] | None = None
@@ -259,8 +258,7 @@ class StateManager:
                 plugin_states[plugin.id.value] = state
         dataloader_state = self._export_dataloader_state()
         return TrainerState(
-            step=runtime.state.step,
-            microbatch_idx=runtime.state.microbatch_idx,
+            step_context=asdict(runtime.state.step_context) if runtime.state.step_context is not None else None,
             consumed_tokens=None if dataloader_state is None else int(dataloader_state["consumed_tokens"]),
             dataloader=dataloader_state,
             rng=rng_state,
@@ -271,8 +269,9 @@ class StateManager:
         if self._runtime is None:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
-        runtime.state.step = state.step
-        runtime.state.microbatch_idx = state.microbatch_idx
+        from runtime.core import StepContext
+
+        runtime.state.step_context = StepContext(**state.step_context) if state.step_context is not None else StepContext()
         torch.set_rng_state(state.rng.cpu)
         if state.rng.cuda is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state.rng.cuda)

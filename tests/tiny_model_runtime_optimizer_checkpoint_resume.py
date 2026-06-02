@@ -61,16 +61,19 @@ def main() -> None:
 
     continuous_model = _build_model(args.seed, args.hidden_size)
     continuous_core = _build_core(continuous_model)
-    continuous_core.run_train_step(first_batch)
+    _, should_step = continuous_core.run_step(first_batch)
+    continuous_core.step_optimizer()
     save_sharded_checkpoint(continuous_core.state_manager, checkpoint_dir)
     second_batch = torch.randn(args.batch_size, args.hidden_size)
-    continuous_core.run_train_step(second_batch)
+    _, should_step = continuous_core.run_step(second_batch)
+    continuous_core.step_optimizer()
 
     restored_model = _build_model(args.seed, args.hidden_size)
     restored_core = _build_core(restored_model)
     load_sharded_checkpoint(restored_core.state_manager, checkpoint_dir)
     restored_second_batch = torch.randn(args.batch_size, args.hidden_size)
-    restored_core.run_train_step(restored_second_batch)
+    _, should_step = restored_core.run_step(restored_second_batch)
+    restored_core.step_optimizer()
 
     param_name, param_diff = _max_param_diff(continuous_core.model, restored_core.model)
     assert continuous_core.scheduler is not None

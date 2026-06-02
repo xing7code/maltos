@@ -84,7 +84,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     trained_model = _build_model(args.seed, args.hidden_size)
     trained_core, trained_zero3 = _build_core(trained_model, args.world_size)
-    trained_core.run_train_step(local_batch)
+    _, should_step = trained_core.run_step(local_batch)
+    trained_core.step_optimizer()
     save_sharded_checkpoint(trained_core.state_manager, args.checkpoint_dir)
 
     restored_model = _build_model(args.seed, args.hidden_size)

@@ -97,14 +97,16 @@ def main() -> None:
     continuous_core = _build_core(args.seed)
     continuous_core.state_manager.bind_dataloader(continuous_loader)
     first_batch = continuous_loader.next_batch()
-    continuous_core.run_train_step(_batch_tuple(first_batch))
+    _, should_step = continuous_core.run_step(_batch_tuple(first_batch))
+    continuous_core.step_optimizer()
     saved_runtime_step = continuous_core.state.step
-    saved_microbatch_idx = continuous_core.state.microbatch_idx
+    saved_microbatch_idx = continuous_core.state.step_context.microbatch_idx
     saved_loader_state = continuous_loader.state_dict()
     save_sharded_checkpoint(continuous_core.state_manager, checkpoint_dir)
 
     continuous_second_batch = continuous_loader.next_batch()
-    continuous_core.run_train_step(_batch_tuple(continuous_second_batch))
+    _, should_step = continuous_core.run_step(_batch_tuple(continuous_second_batch))
+    continuous_core.step_optimizer()
 
     restored_loader = PretrainingDataLoader(
         dataset,
@@ -120,15 +122,16 @@ def main() -> None:
     restored_loader_state = restored_loader.state_dict()
     if restored_core.state.step != saved_runtime_step:
         raise AssertionError(f"runtime step restore failed: expected={saved_runtime_step}, got={restored_core.state.step}")
-    if restored_core.state.microbatch_idx != saved_microbatch_idx:
+    if restored_core.state.step_context.microbatch_idx != saved_microbatch_idx:
         raise AssertionError(
             "runtime microbatch_idx restore failed: "
-            f"expected={saved_microbatch_idx}, got={restored_core.state.microbatch_idx}"
+            f"expected={saved_microbatch_idx}, got={restored_core.state.step_context.microbatch_idx}"
         )
     if restored_loader_state != saved_loader_state:
         raise AssertionError(f"dataloader state restore failed: expected={saved_loader_state}, got={restored_loader_state}")
     restored_second_batch = restored_loader.next_batch()
-    restored_core.run_train_step(_batch_tuple(restored_second_batch))
+    _, should_step = restored_core.run_step(_batch_tuple(restored_second_batch))
+    restored_core.step_optimizer()
 
     batch_diff = (continuous_second_batch["input_ids"] - restored_second_batch["input_ids"]).abs().max().item()
     param_name, param_diff = _max_param_diff(continuous_core.model, restored_core.model)

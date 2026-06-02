@@ -190,12 +190,15 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     first_local = _local_tokens(first_tokens, dp_idx, args.dp_size)
     second_local = _local_tokens(second_tokens, dp_idx, args.dp_size)
 
-    continuous_core.run_train_step(causal_lm_batch(first_local))
+    _, should_step = continuous_core.run_step(causal_lm_batch(first_local))
+    continuous_core.step_optimizer()
     save_sharded_checkpoint(continuous_core.state_manager, args.checkpoint_dir)
-    continuous_second_loss = continuous_core.run_train_step(causal_lm_batch(second_local))
+    continuous_second_loss, _ = continuous_core.run_step(causal_lm_batch(second_local))
+    continuous_core.step_optimizer()
 
     load_sharded_checkpoint(restored_core.state_manager, args.checkpoint_dir)
-    restored_second_loss = restored_core.run_train_step(causal_lm_batch(second_local))
+    restored_second_loss, _ = restored_core.run_step(causal_lm_batch(second_local))
+    restored_core.step_optimizer()
 
     dp_group = continuous_core.get_group(MeshAxis.DP)
     continuous_loss = continuous_second_loss.detach().clone()

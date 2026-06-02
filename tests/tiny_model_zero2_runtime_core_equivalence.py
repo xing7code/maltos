@@ -90,16 +90,18 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         mesh=MeshConfig(dp=args.world_size, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=2),
         model=zero_model,
+        grad_accum_steps=args.grad_accum_steps,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=[Zero2Plugin(bucket_mb_size=args.bucket_mb_size)],
-        grad_accum_steps=args.grad_accum_steps,
     )
     core.setup()
     micro_batch_size = local_batch_size // args.grad_accum_steps
     local_loss = torch.zeros((), dtype=local_batch.dtype, device=local_batch.device)
     for micro_idx in range(args.grad_accum_steps):
         micro_batch = local_batch.narrow(0, micro_idx * micro_batch_size, micro_batch_size).contiguous()
-        local_loss = local_loss + core.run_train_step(micro_batch).detach()
+        loss, _ = core.run_step(micro_batch)
+        local_loss = local_loss + loss.detach()
+    core.step_optimizer()
     baseline_optimizer.step()
 
     avg_loss = local_loss.detach().clone()

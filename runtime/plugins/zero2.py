@@ -78,13 +78,14 @@ class Zero2Plugin(RuntimePlugin):
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
             assert self.runtime is not None
+            context = self.runtime.state.step_context
             self._reset_buckets(
-                grad_accum_start=bool(self.runtime.state.metadata.get("accum_start", True)),
-                grad_accum_end=bool(self.runtime.state.metadata.get("should_sync_grad", True)),
+                grad_accum_start=context.accum_start if context is not None else True,
+                grad_accum_end=context.is_step_boundary if context is not None else True,
             )
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
-            if bool(self.runtime.state.metadata.get("should_sync_grad", True)):
+            if self.runtime.state.step_context.is_step_boundary:
                 self._wait_last_grad_sync()
         elif phase == RuntimePhase.POST_STEP:
             self._gather_updated_params()

@@ -90,7 +90,27 @@ flowchart LR
 
 ## Runtime Step
 
-`RuntimeCore` runs one microbatch at a time. Plugins attach behavior around explicit phases:
+`Trainer` owns optimizer-step cadence. `RuntimeCore.run_step()` executes one
+logical training microstep: forward, backward, plugin phases, and gradient
+accumulation scaling. It returns `(loss, should_step)` so the trainer can
+decide whether to call `RuntimeCore.step_optimizer()` at the accumulation
+boundary. `StepContext` tracks only the execution cursor needed by the current
+runtime:
+
+```python
+loss, should_step = runtime.run_step(batch)
+if should_step:
+    runtime.step_optimizer()
+```
+
+`StepContext` currently carries:
+
+- `step`
+- `microbatch_idx`
+- `grad_accum_steps`
+
+Future parallel strategies such as PP can override `build_step_runner()`, but
+the default runtime path is still a single forward/backward implementation:
 
 ```mermaid
 sequenceDiagram
@@ -100,7 +120,7 @@ sequenceDiagram
     participant M as Model
     participant O as Optimizer
 
-    T->>R: run_train_step(batch)
+    T->>R: run_step(batch)
     R->>P: PRE_MICROBATCH
     R->>P: PRE_FORWARD
     R->>M: forward(batch)
@@ -109,15 +129,19 @@ sequenceDiagram
     R->>M: backward(loss / grad_accum_steps)
     R->>P: POST_BACKWARD
     alt accumulation boundary
+        T->>R: step_optimizer()
         R->>P: PRE_STEP
-        R->>O: optimizer_step()
+        R->>O: optimizer.step()
         R->>P: POST_STEP
         R->>R: step += 1
     end
     T->>R: collect_metrics()
 ```
 
-The trainer collects metrics every microbatch, but only logs/checkpoints on optimizer-step boundaries. This keeps gradient accumulation metrics honest without making checkpoints land mid-step unless explicitly requested by tests.
+The trainer collects metrics every microstep, but only logs/checkpoints on
+optimizer-step boundaries. This keeps gradient accumulation observability
+honest without making checkpoints land mid-step unless explicitly requested by
+tests.
 
 ## Batch Contract
 

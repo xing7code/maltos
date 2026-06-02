@@ -306,8 +306,7 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         optimizer_factory=optimizer_factory,
         scheduler_factory=scheduler_factory,
         plugins=plugins,
-        grad_accum_steps=args.grad_accum_steps,
-    )
+            )
 
 
 def _build_ddp(mode: str) -> DataParallelPlugin | BucketDataParallelPlugin:

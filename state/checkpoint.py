@@ -163,8 +163,7 @@ def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> No
     if trainer_state is not None:
         state_manager.import_trainer_state(
             TrainerState(
-                step=int(trainer_state.get("step", 0)),
-                microbatch_idx=int(trainer_state.get("microbatch_idx", 0)),
+                step_context=trainer_state.get("step_context"),
                 consumed_tokens=trainer_state.get("consumed_tokens"),
                 dataloader=trainer_state.get("dataloader"),
                 plugin_states=trainer_state.get("plugin_states"),

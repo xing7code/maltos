@@ -23,7 +23,7 @@ class DataParallelPlugin(RuntimePlugin):
         if phase != RuntimePhase.POST_BACKWARD:
             return
         assert self.runtime is not None
-        if not bool(self.runtime.state.metadata.get("should_sync_grad", True)):
+        if not self.runtime.state.step_context.is_step_boundary:
             return
         dp_group = self.runtime.get_group(MeshAxis.DP)
         if dp_group is None:
@@ -114,12 +114,15 @@ class BucketDataParallelPlugin(RuntimePlugin):
 
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
-            should_sync = bool(self.runtime.state.metadata.get("should_sync_grad", True))
-            accum_start = bool(self.runtime.state.metadata.get("accum_start", True))
+            assert self.runtime is not None
+            context = self.runtime.state.step_context
+            should_sync = context.is_step_boundary if context is not None else True
+            accum_start = context.accum_start if context is not None else True
             for bucket in self.buckets:
                 bucket.reset(grad_accum_start=accum_start, grad_accum_end=should_sync)
         elif phase == RuntimePhase.POST_BACKWARD:
-            if not bool(self.runtime.state.metadata.get("should_sync_grad", True)):
+            assert self.runtime is not None
+            if not self.runtime.state.step_context.is_step_boundary:
                 return
             for bucket in self.buckets:
                 if bucket.handle is None:

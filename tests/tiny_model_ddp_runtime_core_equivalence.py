@@ -131,7 +131,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         plugins=plugins,
     )
     core.setup()
-    local_loss = core.run_train_step(local_batch)
+    local_loss, _ = core.run_step(local_batch)
 
     avg_loss = local_loss.detach().clone()
     dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)

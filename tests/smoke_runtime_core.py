@@ -164,7 +164,8 @@ def test_scheduler_factory_supports_plugin_owned_optimizer() -> None:
     assert plugin.optimizer is not None
     assert plugin.scheduler is not None
     assert core.get_optimizer_and_scheduler() == (plugin.optimizer, plugin.scheduler)
-    core.run_train_step(torch.randn(2, 4))
+    _, should_step = core.run_step(torch.randn(2, 4))
+    core.step_optimizer()
     assert plugin.scheduler.last_epoch == 1
     assert plugin.optimizer.param_groups[0]["lr"] == 0.005
 
@@ -195,7 +196,8 @@ def test_train_step_phases_and_state_manager() -> None:
         plugins=[RecordingPlugin(PluginId.CHECKPOINT, events, name="recorder")],
     )
     core.setup()
-    loss = core.run_train_step(torch.ones(2, 4))
+    loss, _ = core.run_step(torch.ones(2, 4))
+    core.step_optimizer()
 
     assert loss.ndim == 0
     assert core.state.step == 1
@@ -305,7 +307,8 @@ def test_precision_plugin_metrics_and_clip() -> None:
         plugins=[PrecisionPlugin(compute_dtype=None), GradClipPlugin(max_norm=1.0)],
     )
     core.setup()
-    _ = core.run_train_step(torch.ones(2, 4))
+    _, _ = core.run_step(torch.ones(2, 4))
+    core.step_optimizer()
     assert "grad_norm" in core.state.metadata
     assert isinstance(core.state.metadata["overflow"], bool)
     assert core.state.metadata["overflow"] is False
@@ -330,7 +333,7 @@ def test_runtime_collects_plugin_metrics() -> None:
         plugins=[MetricsPlugin()],
     )
     core.setup()
-    core.run_train_step(torch.ones(2, 4))
+    _, should_step = core.run_step(torch.ones(2, 4))
     metrics = core.collect_metrics()
     assert metrics["perf_metrics/tokens_per_sec"] == 12.5
     assert metrics["perf_metrics/enabled"] is True
@@ -355,8 +358,10 @@ def test_torch_profiler_plugin_writes_trace() -> None:
             ],
         )
         core.setup()
-        core.run_train_step(torch.ones(2, 4))
-        core.run_train_step(torch.ones(2, 4))
+        _, should_step = core.run_step(torch.ones(2, 4))
+        core.step_optimizer()
+        _, should_step = core.run_step(torch.ones(2, 4))
+        core.step_optimizer()
         metrics = core.collect_metrics()
         core.close()
 
@@ -396,16 +401,16 @@ def test_trainer_state_plugin_states_roundtrip() -> None:
     )
     core.setup()
     echo.value = 7
-    core.state.microbatch_idx = 1
+    core.state.step_context.microbatch_idx = 1
     trainer_state = core.state_manager.export_trainer_state()
     assert trainer_state.plugin_states is not None
     assert trainer_state.plugin_states["checkpoint"]["value"] == 7
-    assert trainer_state.microbatch_idx == 1
+    assert trainer_state.step_context["microbatch_idx"] == 1
     echo.value = 0
-    core.state.microbatch_idx = 0
+    core.state.step_context.microbatch_idx = 0
     core.state_manager.import_trainer_state(trainer_state)
     assert echo.value == 7
-    assert core.state.microbatch_idx == 1
+    assert core.state.step_context.microbatch_idx == 1
 
 
 def test_grad_accumulation_runtime_step_cadence() -> None:
@@ -414,21 +419,26 @@ def test_grad_accumulation_runtime_step_cadence() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer_factory=_sgd_factory(),
         grad_accum_steps=2,
+        optimizer_factory=_sgd_factory(),
     )
     core.setup()
     w0 = model.proj.weight.detach().clone()
-    core.run_train_step(torch.ones(2, 4))
+    _, should_step = core.run_step(torch.ones(2, 4))
     w1 = model.proj.weight.detach().clone()
     assert core.state.step == 0
     assert torch.allclose(w0, w1)
-    assert core.state.metadata["should_step_optimizer"] is False
-    core.run_train_step(torch.ones(2, 4))
+    assert should_step is False
+    assert core.state.step_context is not None
+    assert core.state.step_context.microbatch_idx == 1
+    _, should_step = core.run_step(torch.ones(2, 4))
+    assert should_step is True
+    core.step_optimizer()
     w2 = model.proj.weight.detach().clone()
     assert core.state.step == 1
     assert not torch.allclose(w1, w2)
-    assert core.state.metadata["should_step_optimizer"] is True
+    assert core.state.step_context is not None
+    assert core.state.step_context.microbatch_idx == 0
 
 
 def test_grad_accumulation_resume_boundary_cadence() -> None:
@@ -437,28 +447,48 @@ def test_grad_accumulation_resume_boundary_cadence() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
-        optimizer_factory=_sgd_factory(),
         grad_accum_steps=2,
+        optimizer_factory=_sgd_factory(),
     )
     core.setup()
-    core.run_train_step(torch.ones(2, 4))
+    _, should_step = core.run_step(torch.ones(2, 4))
     trainer_state = core.state_manager.export_trainer_state()
     resumed_model = LossModel()
     resumed = RuntimeCore(
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=resumed_model,
-        optimizer_factory=_sgd_factory(),
         grad_accum_steps=2,
+        optimizer_factory=_sgd_factory(),
     )
     resumed.setup()
     resumed.state_manager.import_trainer_state(trainer_state)
-    resumed.run_train_step(torch.ones(2, 4))
-    assert resumed.state.metadata["should_step_optimizer"] is True
+    _, should_step = resumed.run_step(torch.ones(2, 4))
+    assert should_step is True
+    assert resumed.state.step_context is not None
+    assert resumed.state.step_context.microbatch_idx == 0
+    resumed.step_optimizer()
     assert resumed.state.step == 1
-    resumed.run_train_step(torch.ones(2, 4))
-    assert resumed.state.metadata["should_step_optimizer"] is False
+    _, should_step = resumed.run_step(torch.ones(2, 4))
+    assert should_step is False
+    assert resumed.state.step_context is not None
+    assert resumed.state.step_context.microbatch_idx == 1
     assert resumed.state.step == 1
+
+
+def test_step_optimizer_requires_optimizer() -> None:
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=LossModel(),
+    )
+    core.setup()
+    try:
+        core.step_optimizer()
+    except RuntimeError as exc:
+        assert "requires a runtime-owned or plugin-owned optimizer" in str(exc)
+    else:
+        raise AssertionError("expected step_optimizer() to fail without an optimizer")
 
 
 def test_llama_activation_checkpointing_train_step() -> None:
@@ -488,7 +518,8 @@ def test_llama_activation_checkpointing_train_step() -> None:
 
     core.setup()
     before = {name: param.detach().clone() for name, param in core.model.named_parameters()}
-    loss = core.run_train_step(batch)
+    loss, _ = core.run_step(batch)
+    core.step_optimizer()
 
     assert loss.ndim == 0
     assert core.state.step == 1

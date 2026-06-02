@@ -11,7 +11,7 @@ from runtime.mesh import MeshAxis
 from state.state import ParamState
 
 if TYPE_CHECKING:
-    from runtime.core import RuntimeCore, RuntimePhase
+    from runtime.core import RuntimeCore, RuntimePhase, StepRunnerFn
 
 
 MetricValue = float | int | str | bool | None
@@ -70,6 +70,9 @@ class RuntimePlugin:
 
     def on_phase(self, phase: "RuntimePhase") -> None:
         pass
+
+    def build_step_runner(self) -> StepRunnerFn | None:
+        return None
 
     def runtime_optimizer_replicated_axes(self) -> set[MeshAxis]:
         return set()

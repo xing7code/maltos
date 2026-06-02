@@ -72,17 +72,18 @@ class Trainer:
         self.runtime.state_manager.bind_dataloader(self.dataloader)
         if self.config.resume_from is not None:
             load_sharded_checkpoint(self.runtime.state_manager, self.config.resume_from)
-        self._last_logged_step = self.runtime.state.step
+        self._last_logged_step = self.runtime.state.step_context.step
 
     def fit(self) -> None:
         try:
-            while self.runtime.state.step < self.config.max_steps:
-                previous_step = self.runtime.state.step
+            while self.runtime.state.step_context.step < self.config.max_steps:
                 batch = self.dataloader.next_batch()
-                self.runtime.run_train_step(batch)
+                _, should_step = self.runtime.run_step(batch)
+                if should_step:
+                    self.runtime.step_optimizer()
                 metrics = self.runtime.collect_metrics()
                 self.metric_aggregator.update(metrics)
-                if self.runtime.state.step == previous_step:
+                if not should_step:
                     continue
                 self._maybe_log()
                 self._maybe_checkpoint()
@@ -92,7 +93,7 @@ class Trainer:
                 self.checkpoint_uploader.close()
 
     def _maybe_log(self) -> None:
-        step = self.runtime.state.step
+        step = self.runtime.state.step_context.step
         if step == 0 or step % self.config.log_every != 0:
             return
         step_delta = step - self._last_logged_step
@@ -108,7 +109,7 @@ class Trainer:
     def _maybe_checkpoint(self) -> None:
         if self.config.checkpoint_every is None:
             return
-        step = self.runtime.state.step
+        step = self.runtime.state.step_context.step
         if step == 0 or step % self.config.checkpoint_every != 0:
             return
         assert self.config.checkpoint_dir is not None

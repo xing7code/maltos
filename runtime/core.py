@@ -17,7 +17,36 @@ from state.state import StateManager
 
 OptimizerFactory = Callable[[Iterable[nn.Parameter]], torch.optim.Optimizer]
 SchedulerFactory = Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler.LRScheduler]
+StepRunnerFn = Callable[[Any, "StepContext"], torch.Tensor]
 
+
+@dataclass
+class StepContext:
+    step: int = 0
+    microbatch_idx: int = 0
+    grad_accum_steps: int = 1
+
+    def __post_init__(self) -> None:
+        if self.grad_accum_steps < 1:
+            raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
+
+    @property
+    def accum_start(self) -> bool:
+        return self.microbatch_idx == 0
+
+    @property
+    def is_step_boundary(self) -> bool:
+        return ((self.microbatch_idx + 1) % self.grad_accum_steps) == 0
+
+    @property
+    def loss_divisor(self) -> float:
+        return float(self.grad_accum_steps)
+
+    def advance_micro_step(self) -> None:
+        self.microbatch_idx = (self.microbatch_idx + 1) % self.grad_accum_steps
+
+    def advance_step(self) -> None:
+        self.step += 1
 
 class RuntimePhase(str, Enum):
     SETUP = "setup"
@@ -43,14 +72,21 @@ class RuntimeState:
     Durable training state should be declared through checkpoint/state APIs.
     """
 
-    step: int = 0
-    microbatch_idx: int = 0
+    step_context: StepContext = field(default_factory=StepContext)
     loss: torch.Tensor | None = None
     batch: Any = None
     outputs: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
     static_metrics: dict[str, MetricValue] = field(default_factory=dict)
     scaler: torch.amp.GradScaler | None = None
+
+    @property
+    def step(self) -> int:
+        return self.step_context.step
+
+    @step.setter
+    def step(self, value: int) -> None:
+        self.step_context.step = value
 
 
 @dataclass
@@ -59,19 +95,19 @@ class RuntimeCore:
     mesh: MeshConfig = field(default_factory=MeshConfig)
     plan: ParallelPlan = field(default_factory=ParallelPlan)
     device: torch.device | str | None = None
+    grad_accum_steps: int = 1
     optimizer_factory: OptimizerFactory | None = None
     scheduler_factory: SchedulerFactory | None = None
     plugins: list[RuntimePlugin] = field(default_factory=list)
     group_manager: ProcessGroupManager | None = None
     state_manager: StateManager = field(default_factory=StateManager)
     state: RuntimeState = field(default_factory=RuntimeState)
-    grad_accum_steps: int = 1
     optimizer: torch.optim.Optimizer | None = field(default=None, init=False)
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False)
-
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
             raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
+        self.state.step_context = StepContext(grad_accum_steps=self.grad_accum_steps)
         self._validate_mesh_and_plan()
         if self.group_manager is None:
             self.group_manager = ProcessGroupManager.from_mesh(self.mesh)
@@ -92,25 +128,31 @@ class RuntimeCore:
         self._populate_static_model_metrics()
         self._maybe_build_runtime_optimizer()
         self._validate_optimizer_owner()
-
     def close(self) -> None:
         for plugin in reversed(self.plugins):
             plugin.close()
 
-    def run_train_step(self, batch: Any) -> torch.Tensor:
+    def run_step(self, batch: Any) -> tuple[torch.Tensor, bool]:
         if self.device is not None:
             batch = _move_to_device(batch, torch.device(self.device))
         self.state.batch = batch
         tokens = _count_batch_tokens(batch)
         if tokens is not None:
             self.state.metadata["tokens"] = tokens
-        accum_idx = self.state.microbatch_idx
-        should_step = ((accum_idx + 1) % self.grad_accum_steps) == 0
-        accum_start = accum_idx == 0
-        self.state.metadata["should_sync_grad"] = should_step
-        self.state.metadata["should_step_optimizer"] = should_step
-        self.state.metadata["accum_start"] = accum_start
+        context = self.state.step_context
+        should_step = context.is_step_boundary
         self._run_phase(RuntimePhase.PRE_MICROBATCH)
+        loss = self.get_step_runner()(batch, context)
+        context.advance_micro_step()
+        return loss, should_step
+
+    def _run_step_impl(
+        self,
+        batch: Any,
+        *,
+        context: StepContext,
+    ) -> torch.Tensor:
+        self.state.step_context = context
         self._run_phase(RuntimePhase.PRE_FORWARD)
         outputs = self.model(batch)
         self.state.outputs = outputs
@@ -119,16 +161,11 @@ class RuntimeCore:
         self._run_phase(RuntimePhase.PRE_BACKWARD)
         if self.state.loss is None:
             raise TypeError("RuntimeCore expects model(batch) to return a Tensor loss during training.")
-        if self.grad_accum_steps > 1:
-            self.state.loss = self.state.loss / self.grad_accum_steps
+        loss_divisor = context.loss_divisor
+        if loss_divisor != 1:
+            self.state.loss = self.state.loss / loss_divisor
         self.state.loss.backward()
         self._run_phase(RuntimePhase.POST_BACKWARD)
-        if should_step:
-            self._run_phase(RuntimePhase.PRE_STEP)
-            self.optimizer_step()
-            self._run_phase(RuntimePhase.POST_STEP)
-            self.state.step += 1
-        self.state.microbatch_idx = (accum_idx + 1) % self.grad_accum_steps
         return self.state.loss
 
     def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:
@@ -158,10 +195,24 @@ class RuntimeCore:
             return None
         return self.scheduler_factory(optimizer)
 
-    def optimizer_step(self) -> None:
+    def get_step_runner(self) -> StepRunnerFn:
+        runners = []
+        for plugin in self.plugins:
+            runner = plugin.build_step_runner()
+            if runner is not None:
+                runners.append((plugin.id.value, runner))
+        if len(runners) > 1:
+            names = [name for name, _ in runners]
+            raise ValueError(f"RuntimeCore allows only one step runner plugin, got {names}")
+        if runners:
+            return runners[0][1]
+        return lambda batch, context: self._run_step_impl(batch, context=context)
+
+    def step_optimizer(self) -> None:
+        self._run_phase(RuntimePhase.PRE_STEP)
         optimizer, scheduler = self.get_optimizer_and_scheduler()
         if optimizer is None:
-            return
+            raise RuntimeError("step_optimizer() requires a runtime-owned or plugin-owned optimizer")
         scaler = self.state.scaler
         if scaler is not None:
             prev_scale = scaler.get_scale()
@@ -177,13 +228,13 @@ class RuntimeCore:
         if scheduler is not None:
             scheduler.step()
         optimizer.zero_grad(set_to_none=True)
+        self._run_phase(RuntimePhase.POST_STEP)
+        self.state.step_context.advance_step()
 
     def collect_metrics(self) -> dict[str, MetricValue]:
+        context = self.state.step_context
         metrics: dict[str, MetricValue] = {
-            "step": self.state.step,
-            "microbatch_idx": self.state.microbatch_idx,
-            "grad_accum_steps": self.grad_accum_steps,
-            "should_step_optimizer": bool(self.state.metadata.get("should_step_optimizer", True)),
+            "step": context.step,
         }
         metrics.update(self.state.static_metrics)
         if self.state.loss is not None:
@@ -314,7 +365,6 @@ def _count_batch_tokens(batch: Any) -> int | None:
     if torch.is_tensor(batch):
         return int(batch.numel())
     return None
-
 
 def _move_to_device(value: Any, device: torch.device) -> Any:
     if torch.is_tensor(value):

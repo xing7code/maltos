@@ -238,9 +238,9 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=zero_stage),
         model=sharded_model,
+        grad_accum_steps=grad_accum_steps,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=plugins,
-        grad_accum_steps=grad_accum_steps,
     )
     core.setup()
 
@@ -263,13 +263,15 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
             return
 
     if grad_accum_steps == 1:
-        sharded_train_loss = core.run_train_step(causal_lm_batch(local_tokens))
+        sharded_train_loss, _ = core.run_step(causal_lm_batch(local_tokens))
     else:
         micro_batch_size = local_batch_size // grad_accum_steps
         sharded_train_loss = torch.zeros((), dtype=torch.float32, device=local_tokens.device)
         for micro_idx in range(grad_accum_steps):
             micro_tokens = local_tokens.narrow(0, micro_idx * micro_batch_size, micro_batch_size).contiguous()
-            sharded_train_loss = sharded_train_loss + core.run_train_step(causal_lm_batch(micro_tokens)).detach()
+            loss, _ = core.run_step(causal_lm_batch(micro_tokens))
+            sharded_train_loss = sharded_train_loss + loss.detach()
+    core.step_optimizer()
     baseline_optimizer.step()
 
     dp_group = core.get_group(MeshAxis.DP)
