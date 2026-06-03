@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
@@ -28,7 +28,23 @@ class _AllReduceShardWork:
 
     def wait(self) -> None:
         self.work.wait()
-        self.local_grad.copy_(self.grad_buffer[self.shard_start : self.shard_end])
+        self.local_grad.add_(self.grad_buffer[self.shard_start : self.shard_end])
+
+
+class _ReduceScatterShardWork:
+    def __init__(
+        self,
+        work: dist.Work,
+        shard_buffer: torch.Tensor,
+        local_grad: torch.Tensor,
+    ):
+        self.work = work
+        self.shard_buffer = shard_buffer
+        self.local_grad = local_grad
+
+    def wait(self) -> None:
+        self.work.wait()
+        self.local_grad.add_(self.shard_buffer)
 
 
 @dataclass
@@ -39,9 +55,15 @@ class _Bucket:
     shard_start: int
     shard_end: int
     local_param: nn.Parameter
+    exec_states: list["_BucketExecState"] = field(default_factory=list)
+
+
+@dataclass
+class _BucketExecState:
     grad_buffer: torch.Tensor
-    pending: int
-    handle: dist.Work | _AllReduceShardWork | None = None
+    shard_buffer: torch.Tensor
+    pending: int = 0
+    handle: dist.Work | _AllReduceShardWork | _ReduceScatterShardWork | None = None
     attached: bool = False
 
 
@@ -121,8 +143,13 @@ class Zero2Plugin(RuntimePlugin):
                     shard_start=shard_start,
                     shard_end=shard_end,
                     local_param=nn.Parameter(self.data_buffer[shard_start:shard_end].clone()),
-                    grad_buffer=torch.zeros(padded_size, dtype=dtype, device=device),
-                    pending=len(bucket_params),
+                    exec_states=[
+                        _BucketExecState(
+                            grad_buffer=torch.zeros(padded_size, dtype=dtype, device=device),
+                            shard_buffer=torch.zeros(per_rank_size, dtype=dtype, device=device),
+                        )
+                        for _ in range(self.runtime.state.step_context.pp_num_microbatches)
+                    ],
                 )
             )
             offset += padded_size
@@ -154,47 +181,54 @@ class Zero2Plugin(RuntimePlugin):
 
     def _make_attach_hook(self, bucket: _Bucket):
         def hook(grad: torch.Tensor) -> torch.Tensor:
-            if not bucket.attached:
-                self._attach_bucket_grad_buffer(bucket)
-                bucket.attached = True
+            state = self._exec_state(bucket)
+            if not state.attached:
+                self._attach_bucket_grad_buffer(bucket, state)
+                state.attached = True
             return grad
 
         return hook
 
-    def _attach_bucket_grad_buffer(self, bucket: _Bucket) -> None:
+    def _attach_bucket_grad_buffer(self, bucket: _Bucket, state: _BucketExecState) -> None:
         offset = 0
         for param in bucket.params:
-            param.grad = bucket.grad_buffer[offset : offset + param.numel()].view_as(param)
+            param.grad = state.grad_buffer[offset : offset + param.numel()].view_as(param)
             offset += param.numel()
 
     def _make_grad_sync_hook(self, bucket: _Bucket):
         def hook(_param: nn.Parameter) -> None:
-            bucket.pending -= 1
-            if bucket.pending == 0:
+            state = self._exec_state(bucket)
+            state.pending -= 1
+            if state.pending == 0:
                 if bucket.local_param.grad is None:
                     bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
-                bucket.handle = self._reduce_scatter_avg(bucket)
+                state.handle = self._reduce_scatter_avg(bucket, state)
 
         return hook
 
-    def _reduce_scatter_avg(self, bucket: _Bucket) -> dist.Work | _AllReduceShardWork:
+    def _reduce_scatter_avg(
+        self,
+        bucket: _Bucket,
+        state: _BucketExecState,
+    ) -> dist.Work | _AllReduceShardWork | _ReduceScatterShardWork:
         assert self.dp_group is not None
         assert bucket.local_param.grad is not None
         bucket_numel = bucket.end - bucket.start
-        full_grad = bucket.grad_buffer[:bucket_numel]
+        full_grad = state.grad_buffer[:bucket_numel]
         if dist.get_backend(self.dp_group) == "gloo":
             work = dist.all_reduce(full_grad, op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
             shard_len = bucket.local_param.numel()
             shard_start = self.rank * shard_len
             shard_end = (self.rank + 1) * shard_len
             return _AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end)
-        return dist.reduce_scatter_tensor(
-            bucket.local_param.grad,
+        work = dist.reduce_scatter_tensor(
+            state.shard_buffer,
             full_grad,
             op=dist.ReduceOp.AVG,
             group=self.dp_group,
             async_op=True,
         )
+        return _ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad)
 
     def _gather_updated_params(self) -> None:
         assert self.dp_group is not None
@@ -215,18 +249,32 @@ class Zero2Plugin(RuntimePlugin):
 
     def _wait_last_grad_sync(self) -> None:
         for bucket in self.buckets:
-            if bucket.handle is None:
+            waited = False
+            for state in bucket.exec_states:
+                if state.handle is None:
+                    continue
+                state.handle.wait()
+                state.handle = None
+                waited = True
+            if not waited:
                 raise RuntimeError("ZeRO2 bucket handle is None after backward")
-            bucket.handle.wait()
 
     def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
         if grad_accum_start:
             for bucket in self.buckets:
-                bucket.grad_buffer.zero_()
+                if bucket.local_param.grad is None:
+                    bucket.local_param.grad = torch.zeros_like(bucket.local_param.data)
+                else:
+                    bucket.local_param.grad.zero_()
         for bucket in self.buckets:
-            bucket.pending = len(bucket.params) if grad_accum_end else 0
-            bucket.handle = None
-            bucket.attached = False
+            state = self._exec_state(bucket)
+            if state.handle is not None:
+                state.handle.wait()
+                state.handle = None
+            state.grad_buffer.zero_()
+            state.shard_buffer.zero_()
+            state.pending = len(bucket.params)
+            state.attached = False
 
     def _sync_local_params_from_data_buffer(self) -> None:
         assert self.data_buffer is not None
@@ -236,3 +284,8 @@ class Zero2Plugin(RuntimePlugin):
 
     def _padded_len(self, numel: int) -> int:
         return (numel + self.world_size - 1) // self.world_size * self.world_size
+
+    def _exec_state(self, bucket: _Bucket) -> _BucketExecState:
+        assert self.runtime is not None
+        context = self.runtime.state.step_context
+        return bucket.exec_states[context.pp_bwd_microbatch_idx]
