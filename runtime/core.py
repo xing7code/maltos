@@ -34,59 +34,52 @@ class RuntimePhase(str, Enum):
     POST_LOAD = "post_load"
 
 
+class PpStatus(str, Enum):
+    IDLE = "idle"
+    FORWARD = "forward"
+    BACKWARD_START = "backward_start"
+    BACKWARD_MIDDLE = "backward_middle"
+    BACKWARD_END = "backward_end"
+
+
 @dataclass
 class StepContext:
     step: int = 0
     microbatch_idx: int = 0
     grad_accum_steps: int = 1
-    pp_fwd_microbatch_idx: int = 0
-    pp_bwd_microbatch_idx: int = 0
-    pp_num_microbatches: int = 1
+    pp_cur_microbatch_idx: int = 0
+    pp_status: PpStatus = PpStatus.IDLE
 
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
             raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
-        if self.pp_num_microbatches < 1:
-            raise ValueError(f"pp_num_microbatches must be >= 1, got {self.pp_num_microbatches}")
-        if not 0 <= self.pp_fwd_microbatch_idx < self.pp_num_microbatches:
-            raise ValueError(
-                "pp_fwd_microbatch_idx must be within [0, pp_num_microbatches), "
-                f"got idx={self.pp_fwd_microbatch_idx}, count={self.pp_num_microbatches}"
-            )
-        if not 0 <= self.pp_bwd_microbatch_idx < self.pp_num_microbatches:
-            raise ValueError(
-                "pp_bwd_microbatch_idx must be within [0, pp_num_microbatches), "
-                f"got idx={self.pp_bwd_microbatch_idx}, count={self.pp_num_microbatches}"
-            )
 
     @property
     def accum_start(self) -> bool:
-        return self.microbatch_idx == 0 and self.pp_bwd_microbatch_idx == (self.pp_num_microbatches - 1)
+        return self.microbatch_idx == 0 and self.pp_status in {PpStatus.IDLE, PpStatus.BACKWARD_START}
 
     @property
     def is_step_boundary(self) -> bool:
         return (
             ((self.microbatch_idx + 1) % self.grad_accum_steps) == 0
-            and self.pp_bwd_microbatch_idx == 0
+            and self.pp_status in {PpStatus.IDLE, PpStatus.BACKWARD_END}
         )
 
     @property
     def loss_divisor(self) -> float:
         return float(self.grad_accum_steps)
 
-    def advance_pp_forward(self) -> None:
-        if self.pp_fwd_microbatch_idx + 1 < self.pp_num_microbatches:
-            self.pp_fwd_microbatch_idx += 1
-
-    def advance_pp_backward(self) -> None:
-        if self.pp_bwd_microbatch_idx > 0:
-            self.pp_bwd_microbatch_idx -= 1
+    def set_pp_state(self, *, microbatch_idx: int, status: PpStatus) -> None:
+        if microbatch_idx < 0:
+            raise ValueError(f"pp_cur_microbatch_idx must be >= 0, got {microbatch_idx}")
+        self.pp_cur_microbatch_idx = microbatch_idx
+        self.pp_status = status
 
     def advance_micro_step(self) -> bool:
         should_step = self.is_step_boundary
         self.microbatch_idx = (self.microbatch_idx + 1) % self.grad_accum_steps
-        self.pp_fwd_microbatch_idx = 0
-        self.pp_bwd_microbatch_idx = self.pp_num_microbatches - 1
+        self.pp_cur_microbatch_idx = 0
+        self.pp_status = PpStatus.IDLE
         return should_step
 
     def advance_step(self) -> None:
@@ -138,11 +131,8 @@ class RuntimeCore:
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
             raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
-        pp_num_microbatches = self.plan.pp_schedule.microbatches
         self.state.step_context = StepContext(
             grad_accum_steps=self.grad_accum_steps,
-            pp_num_microbatches=pp_num_microbatches,
-            pp_bwd_microbatch_idx=pp_num_microbatches - 1,
         )
         self._validate_mesh_and_plan()
         if self.group_manager is None:

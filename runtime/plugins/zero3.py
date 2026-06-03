@@ -208,7 +208,7 @@ class Zero3Plugin(RuntimePlugin):
         shard_end = (self.rank + 1) * shard_len
         local_param = nn.Parameter(full_param[shard_start:shard_end].clone())
         shard_buffer = torch.empty(shard_len, dtype=dtype, device=device)
-        exec_state_count = self.runtime.state.step_context.pp_num_microbatches
+        exec_state_count = self.runtime.plan.pp_schedule.microbatches
         exec_states = [
             _BucketExecState(
                 data_buffer=torch.empty(buffer_size, dtype=dtype, device=device),
@@ -492,13 +492,7 @@ class Zero3Plugin(RuntimePlugin):
             return bucket.exec_states[0]
         assert self.runtime is not None
         context = self.runtime.state.step_context
-        if direction == _ExecDirection.FORWARD:
-            slot = context.pp_fwd_microbatch_idx
-        elif direction == _ExecDirection.BACKWARD:
-            slot = context.pp_bwd_microbatch_idx
-        else:
-            raise ValueError(f"unknown ZeRO3 execution direction={direction}")
-        return bucket.exec_states[slot]
+        return bucket.exec_states[context.pp_cur_microbatch_idx]
 
     def _uses_pp_execute_states(self) -> bool:
         return bool(self.buckets) and len(self.buckets[0].exec_states) > 1

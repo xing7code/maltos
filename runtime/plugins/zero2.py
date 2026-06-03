@@ -153,7 +153,7 @@ class Zero2Plugin(RuntimePlugin):
                             grad_buffer=torch.zeros(padded_size, dtype=dtype, device=device),
                             shard_buffer=torch.zeros(per_rank_size, dtype=dtype, device=device),
                         )
-                        for _ in range(self.runtime.state.step_context.pp_num_microbatches)
+                        for _ in range(self.runtime.plan.pp_schedule.microbatches)
                     ],
                 )
             )
@@ -293,4 +293,4 @@ class Zero2Plugin(RuntimePlugin):
     def _exec_state(self, bucket: _Bucket) -> _BucketExecState:
         assert self.runtime is not None
         context = self.runtime.state.step_context
-        return bucket.exec_states[context.pp_bwd_microbatch_idx]
+        return bucket.exec_states[context.pp_cur_microbatch_idx]

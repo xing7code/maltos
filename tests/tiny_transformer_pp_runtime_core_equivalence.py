@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pp-size", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--pp-microbatches", type=int, default=2)
+    parser.add_argument("--pp-schedule", choices=("afab", "1f1b"), default="afab")
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29556)
     parser.add_argument("--backend", type=str, default="gloo")
@@ -140,6 +141,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     if rank == 0:
         print(f"Case             : {args.case}")
+        print(f"PP schedule      : {args.pp_schedule}")
         print(f"Baseline loss    : {baseline_loss:.6f}")
         print(f"RuntimeCore PP   : {avg_loss.item():.6f}")
         print(f"Loss diff        : {loss_diff_tensor.item():.2e}  (atol={_LOSS_ATOL:.2e})")
@@ -159,23 +161,23 @@ def _make_plugins(args: argparse.Namespace):
     case = args.case
     zero3: Zero3Plugin | None = None
     if case == "pp":
-        return [PipelineParallelPlugin()], zero3
+        return [PipelineParallelPlugin(schedule=args.pp_schedule)], zero3
     if case == "pp_ddp_sync":
-        return [PipelineParallelPlugin(), DataParallelPlugin(async_op=False)], zero3
+        return [PipelineParallelPlugin(schedule=args.pp_schedule), DataParallelPlugin(async_op=False)], zero3
     if case == "pp_zero1":
-        return [PipelineParallelPlugin(), Zero1Plugin(bucket_mb_size=0)], zero3
+        return [PipelineParallelPlugin(schedule=args.pp_schedule), Zero1Plugin(bucket_mb_size=0)], zero3
     if case == "pp_zero2":
-        return [PipelineParallelPlugin(), Zero2Plugin(bucket_mb_size=0)], zero3
+        return [PipelineParallelPlugin(schedule=args.pp_schedule), Zero2Plugin(bucket_mb_size=0)], zero3
     if case == "pp_zero3":
         zero3 = Zero3Plugin(
             wrap_cls={torch.nn.Linear, torch.nn.Embedding, RmsNorm},
             enable_prefetch=not args.zero3_disable_prefetch,
         )
-        return [PipelineParallelPlugin(), zero3], zero3
+        return [PipelineParallelPlugin(schedule=args.pp_schedule), zero3], zero3
     if case == "pp_tp":
-        return [TensorParallelPlugin(), PipelineParallelPlugin()], zero3
+        return [TensorParallelPlugin(), PipelineParallelPlugin(schedule=args.pp_schedule)], zero3
     if case == "pp_tp_sp":
-        return [TensorParallelPlugin(), SequenceParallelPlugin(), PipelineParallelPlugin()], zero3
+        return [TensorParallelPlugin(), SequenceParallelPlugin(), PipelineParallelPlugin(schedule=args.pp_schedule)], zero3
     raise ValueError(f"unknown case={case}")
 
 

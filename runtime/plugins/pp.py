@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from types import MethodType
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from runtime.core import PpStatus
 from parallel.specs import TpSpParallelSpec
 from runtime.mesh import MeshAxis
 from runtime.plugin import PipelineParallelizableModule, PluginId, RuntimePlugin, TpSpParallelizableModule
@@ -23,8 +25,25 @@ class _PipelineMicroState:
     grad_send_work: dist.Work | None = None
 
 
+class _PipelineScheduleKind(str, Enum):
+    AFAB = "afab"
+    ONE_FWD_ONE_BWD = "1f1b"
+
+
+class _PipelineActionKind(str, Enum):
+    FORWARD = "forward"
+    BACKWARD = "backward"
+
+
+@dataclass(frozen=True)
+class _PipelineAction:
+    kind: _PipelineActionKind
+    microbatch_idx: int
+    backward_step_idx: int = 0
+
+
 class PipelineParallelPlugin(RuntimePlugin):
-    def __init__(self) -> None:
+    def __init__(self, schedule: str = "afab") -> None:
         super().__init__(
             id=PluginId.PP,
             name="pipeline_parallel",
@@ -47,6 +66,7 @@ class PipelineParallelPlugin(RuntimePlugin):
         self.pp_group: dist.ProcessGroup | None = None
         self.sequence_parallel_enabled = False
         self.sequence_parallel_world_size = 1
+        self.schedule = _PipelineScheduleKind(schedule)
 
     def bind(self, runtime) -> None:
         super().bind(runtime)
@@ -85,81 +105,30 @@ class PipelineParallelPlugin(RuntimePlugin):
     def _run_pipeline_step(self, batch) -> torch.Tensor:
         assert self.runtime is not None
         context = self.runtime.state.step_context
-        micro_batches = _split_batch(batch, context.pp_num_microbatches)
-        if len(micro_batches) != context.pp_num_microbatches:
+        num_microbatches = self.runtime.plan.pp_schedule.microbatches
+        micro_batches = _split_batch(batch, num_microbatches)
+        if len(micro_batches) != num_microbatches:
             raise ValueError(
-                "PipelineParallelPlugin microbatch split count does not match StepContext.pp_num_microbatches: "
-                f"{len(micro_batches)} vs {context.pp_num_microbatches}"
+                "PipelineParallelPlugin microbatch split count does not match plan.pp_schedule.microbatches: "
+                f"{len(micro_batches)} vs {num_microbatches}"
             )
-        states: list[_PipelineMicroState] = []
+        states = [_PipelineMicroState() for _ in range(num_microbatches)]
         total_loss: torch.Tensor | None = None
 
-        for micro_idx, micro_batch in enumerate(micro_batches):
-            if self.prev_global_rank is None:
-                model_input = micro_batch
-                input_activation = None
-            else:
-                input_activation, recv_work = self._recv_activation_async(micro_batch)
-                recv_work.wait()
-                input_activation.requires_grad_(True)
-                model_input = {"hidden_states": input_activation}
-                if self.next_global_rank is None:
-                    model_input["labels"] = _extract_labels(micro_batch)
-
-            self.runtime._forward_step_impl(model_input)
-
-            if self.next_global_rank is None:
-                if not torch.is_tensor(self.runtime.state.loss):
-                    raise TypeError("last PP stage must return a Tensor loss")
-                total_loss = (
-                    self.runtime.state.loss.detach()
-                    if total_loss is None
-                    else total_loss + self.runtime.state.loss.detach()
+        for action in self._build_schedule(num_microbatches):
+            if action.kind == _PipelineActionKind.FORWARD:
+                total_loss = self._run_forward_action(
+                    micro_batches=micro_batches,
+                    states=states,
+                    action=action,
+                    total_loss=total_loss,
                 )
-                states.append(_PipelineMicroState(input_activation=input_activation, raw_loss=self.runtime.state.loss))
             else:
-                if not torch.is_tensor(self.runtime.state.outputs):
-                    raise TypeError("non-last PP stage must return Tensor activations")
-                assert torch.is_tensor(self.runtime.state.outputs)
-                send_buffer, send_work = self._send_activation_async(self.runtime.state.outputs.detach())
-                states.append(
-                    _PipelineMicroState(
-                        input_activation=input_activation,
-                        output_activation=self.runtime.state.outputs,
-                        activation_send_buffer=send_buffer,
-                        activation_send_work=send_work,
-                    )
-                )
-            context.advance_pp_forward()
+                self._run_backward_action(states=states, action=action)
 
         for state in states:
             if state.activation_send_work is not None:
                 state.activation_send_work.wait()
-
-        for backward_exec_idx, state in enumerate(reversed(states)):
-            if self.next_global_rank is None:
-                assert state.raw_loss is not None
-                self.runtime.state.loss = state.raw_loss / float(context.pp_num_microbatches)
-                self.runtime._backward_step_impl()
-                if self.prev_global_rank is not None:
-                    assert state.input_activation is not None and state.input_activation.grad is not None
-                    send_buffer, send_work = self._send_grad_async(state.input_activation.grad.detach())
-                    state.grad_send_buffer = send_buffer
-                    state.grad_send_work = send_work
-            else:
-                assert state.output_activation is not None
-                self.runtime.state.outputs = state.output_activation
-                grad_output, recv_work = self._recv_grad_async(state.output_activation)
-                recv_work.wait()
-                self.runtime._backward_step_impl(grad_output=grad_output)
-                if self.prev_global_rank is not None:
-                    assert state.input_activation is not None and state.input_activation.grad is not None
-                    send_buffer, send_work = self._send_grad_async(state.input_activation.grad.detach())
-                    state.grad_send_buffer = send_buffer
-                    state.grad_send_work = send_work
-            context.advance_pp_backward()
-
-        for state in states:
             if state.grad_send_work is not None:
                 state.grad_send_work.wait()
 
@@ -167,13 +136,152 @@ class PipelineParallelPlugin(RuntimePlugin):
         self.runtime.state.loss = loss_out
         return loss_out
 
+    def _build_schedule(self, num_microbatches: int) -> list[_PipelineAction]:
+        if self.schedule == _PipelineScheduleKind.AFAB:
+            return self._build_afab_schedule(num_microbatches)
+        if self.schedule == _PipelineScheduleKind.ONE_FWD_ONE_BWD:
+            return self._build_1f1b_schedule(num_microbatches)
+        raise ValueError(f"unsupported pipeline schedule={self.schedule.value}")
+
+    def _build_afab_schedule(self, num_microbatches: int) -> list[_PipelineAction]:
+        actions = [
+            _PipelineAction(kind=_PipelineActionKind.FORWARD, microbatch_idx=micro_idx)
+            for micro_idx in range(num_microbatches)
+        ]
+        actions.extend(
+            _PipelineAction(
+                kind=_PipelineActionKind.BACKWARD,
+                microbatch_idx=micro_idx,
+                backward_step_idx=backward_step_idx,
+            )
+            for backward_step_idx, micro_idx in enumerate(range(num_microbatches - 1, -1, -1))
+        )
+        return actions
+
+    def _build_1f1b_schedule(self, num_microbatches: int) -> list[_PipelineAction]:
+        warmup = min(self.stage_count - self.stage_index - 1, num_microbatches)
+        remaining = num_microbatches - warmup
+        actions: list[_PipelineAction] = []
+        for micro_idx in range(warmup):
+            actions.append(_PipelineAction(kind=_PipelineActionKind.FORWARD, microbatch_idx=micro_idx))
+        for backward_step_idx in range(remaining):
+            forward_microbatch_idx = warmup + backward_step_idx
+            if forward_microbatch_idx < num_microbatches:
+                actions.append(
+                    _PipelineAction(
+                        kind=_PipelineActionKind.FORWARD,
+                        microbatch_idx=forward_microbatch_idx,
+                    )
+                )
+            actions.append(
+                _PipelineAction(
+                    kind=_PipelineActionKind.BACKWARD,
+                    microbatch_idx=backward_step_idx,
+                    backward_step_idx=backward_step_idx,
+                )
+            )
+        for backward_step_idx in range(remaining, num_microbatches):
+            actions.append(
+                _PipelineAction(
+                    kind=_PipelineActionKind.BACKWARD,
+                    microbatch_idx=backward_step_idx,
+                    backward_step_idx=backward_step_idx,
+                )
+            )
+        return actions
+
+    def _run_forward_action(
+        self,
+        *,
+        micro_batches,
+        states: list[_PipelineMicroState],
+        action: _PipelineAction,
+        total_loss: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        assert self.runtime is not None
+        context = self.runtime.state.step_context
+        context.set_pp_state(microbatch_idx=action.microbatch_idx, status=PpStatus.FORWARD)
+        micro_batch = micro_batches[action.microbatch_idx]
+        state = states[action.microbatch_idx]
+
+        if self.prev_global_rank is None:
+            model_input = micro_batch
+            input_activation = None
+        else:
+            input_activation, recv_work = self._recv_activation_async(micro_batch)
+            recv_work.wait()
+            input_activation.requires_grad_(True)
+            model_input = {"hidden_states": input_activation}
+            if self.next_global_rank is None:
+                model_input["labels"] = _extract_labels(micro_batch)
+
+        self.runtime._forward_step_impl(model_input)
+        state.input_activation = input_activation
+
+        if self.next_global_rank is None:
+            if not torch.is_tensor(self.runtime.state.loss):
+                raise TypeError("last PP stage must return a Tensor loss")
+            state.raw_loss = self.runtime.state.loss
+            return self.runtime.state.loss.detach() if total_loss is None else total_loss + self.runtime.state.loss.detach()
+
+        if not torch.is_tensor(self.runtime.state.outputs):
+            raise TypeError("non-last PP stage must return Tensor activations")
+        assert torch.is_tensor(self.runtime.state.outputs)
+        state.output_activation = self.runtime.state.outputs
+        send_buffer, send_work = self._send_activation_async(self.runtime.state.outputs.detach())
+        state.activation_send_buffer = send_buffer
+        state.activation_send_work = send_work
+        return total_loss
+
+    def _run_backward_action(
+        self,
+        *,
+        states: list[_PipelineMicroState],
+        action: _PipelineAction,
+    ) -> None:
+        assert self.runtime is not None
+        context = self.runtime.state.step_context
+        num_microbatches = self.runtime.plan.pp_schedule.microbatches
+        if action.backward_step_idx == 0:
+            status = PpStatus.BACKWARD_START
+        elif action.backward_step_idx == num_microbatches - 1:
+            status = PpStatus.BACKWARD_END
+        else:
+            status = PpStatus.BACKWARD_MIDDLE
+        context.set_pp_state(
+            microbatch_idx=action.microbatch_idx,
+            status=status,
+        )
+        state = states[action.microbatch_idx]
+        if self.next_global_rank is None:
+            assert state.raw_loss is not None
+            self.runtime.state.loss = state.raw_loss / float(num_microbatches)
+            self.runtime._backward_step_impl()
+            if self.prev_global_rank is not None:
+                assert state.input_activation is not None and state.input_activation.grad is not None
+                send_buffer, send_work = self._send_grad_async(state.input_activation.grad.detach())
+                state.grad_send_buffer = send_buffer
+                state.grad_send_work = send_work
+            return
+
+        assert state.output_activation is not None
+        self.runtime.state.outputs = state.output_activation
+        grad_output, recv_work = self._recv_grad_async(state.output_activation)
+        recv_work.wait()
+        self.runtime._backward_step_impl(grad_output=grad_output)
+        if self.prev_global_rank is not None:
+            assert state.input_activation is not None and state.input_activation.grad is not None
+            send_buffer, send_work = self._send_grad_async(state.input_activation.grad.detach())
+            state.grad_send_buffer = send_buffer
+            state.grad_send_work = send_work
+
     def _broadcast_loss(self, total_loss: torch.Tensor | None, batch) -> torch.Tensor:
         assert self.runtime is not None
         device = _model_device(self.runtime.model)
         dtype = torch.float32 if total_loss is None else total_loss.dtype
         if self.next_global_rank is None:
             assert total_loss is not None
-            loss = total_loss / float(self.runtime.state.step_context.pp_num_microbatches)
+            loss = total_loss / float(self.runtime.plan.pp_schedule.microbatches)
         else:
             loss = torch.zeros((), device=device, dtype=dtype)
         if self.pp_group is not None and self.stage_count > 1:

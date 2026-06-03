@@ -58,6 +58,14 @@ done
 echo "=== tiny transformer full-stack equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py
 
+echo "=== tiny transformer pp 1f1b equivalence ==="
+"${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case pp --pp-schedule 1f1b --world-size 2 --dp-size 1 --pp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case pp_zero2 --pp-schedule 1f1b --world-size 4 --dp-size 2 --pp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case pp_zero3 --pp-schedule 1f1b --world-size 4 --dp-size 2 --pp-size 2
+
+echo "=== tiny transformer full-stack 1f1b equivalence ==="
+"${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py --pp-schedule 1f1b
+
 echo "=== tp+sp+zero3+bf16+clip checkpoint resume ==="
 "${PYTHON_BIN}" tests/tiny_transformer_tp_sp_zero3_bf16_clip_checkpoint_resume.py
 

@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pp-size", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=2)
     parser.add_argument("--pp-microbatches", type=int, default=2)
+    parser.add_argument("--pp-schedule", choices=("afab", "1f1b"), default="afab")
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29569)
     parser.add_argument("--backend", type=str, default="gloo")
@@ -194,7 +195,7 @@ def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespac
         plugins=[
             TensorParallelPlugin(),
             SequenceParallelPlugin(),
-            PipelineParallelPlugin(),
+            PipelineParallelPlugin(schedule=args.pp_schedule),
             Zero3Plugin(
                 wrap_cls=_ZERO3_WRAP_CLS,
                 enable_prefetch=not args.zero3_disable_prefetch,
@@ -269,6 +270,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     if rank == 0:
         print("Case             : full_stack_pp_tp_sp_zero3")
+        print(f"PP schedule      : {args.pp_schedule}")
         print(f"Baseline loss    : {avg_baseline_loss.item():.6f}")
         print(f"RuntimeCore loss : {avg_runtime_loss.item():.6f}")
         print(f"Loss diff        : {loss_diff_tensor.item():.2e}  (atol={_LOSS_ATOL:.2e})")

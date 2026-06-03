@@ -135,6 +135,8 @@ def _save_sharded_checkpoint_contents(state_manager: StateManager, checkpoint_di
 
 def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> None:
     runtime = state_manager.runtime
+    from runtime.core import PpStatus
+
     checkpoint_dir = Path(path)
     rank = dist.get_rank() if dist.is_initialized() else 0
     manifest = _load_manifest(checkpoint_dir)
@@ -148,7 +150,8 @@ def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> No
     trainer_artifact = _find_artifact(manifest, kind="trainer", rank=rank)
     if trainer_artifact is None:
         raise ValueError(f"manifest missing trainer artifact for rank={rank}")
-    trainer_state = torch.load(checkpoint_dir / trainer_artifact.path, map_location="cpu")
+    with torch.serialization.safe_globals([PpStatus]):
+        trainer_state = torch.load(checkpoint_dir / trainer_artifact.path, map_location="cpu")
 
     optim_source_rank = manifest.optimizer_source_ranks[rank]
     optimizer_artifact = _find_artifact(manifest, kind="optimizer", rank=optim_source_rank)
