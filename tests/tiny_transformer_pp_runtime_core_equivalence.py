@@ -11,19 +11,22 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from helpers import causal_lm_batch
-from models import TinyTransformer
+from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
+from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
+from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.ddp import DataParallelPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
+from runtime.plugins.sp import SequenceParallelPlugin
+from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
@@ -47,10 +50,15 @@ _LR = 1e-2
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--case", choices=("pp", "pp_ddp_sync", "pp_zero1", "pp_zero2", "pp_zero3"), default="pp")
+    parser.add_argument(
+        "--case",
+        choices=("pp", "pp_ddp_sync", "pp_zero1", "pp_zero2", "pp_zero3", "pp_tp", "pp_tp_sp"),
+        default="pp",
+    )
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--pp-size", type=int, default=2)
+    parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--pp-microbatches", type=int, default=2)
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29556)
@@ -58,7 +66,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
 
@@ -70,60 +77,52 @@ def _build_reference(seed: int, batch_size: int, seq_len: int) -> tuple[TinyTran
 
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
-    _log(rank, args.debug, "init_process_group")
     dist.init_process_group(
         backend=args.backend,
         init_method=f"tcp://{args.master_addr}:{args.master_port}",
         rank=rank,
         world_size=args.world_size,
     )
-    if args.world_size != args.dp_size * args.pp_size:
-        raise ValueError("PP equivalence test expects world_size == dp_size * pp_size")
+    if args.world_size != args.dp_size * args.pp_size * args.tp_size:
+        raise ValueError("PP equivalence test expects world_size == dp_size * pp_size * tp_size")
 
-    baseline_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
-    pp_model = TinyTransformer(**_MODEL_KWARGS)
-    pp_model.load_state_dict(baseline_model.state_dict())
+    baseline_loss, baseline_params = _run_baseline(rank, args)
+
+    _baseline_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
+    pp_model = _build_runtime_model(args.case)
+    pp_model.load_state_dict(_baseline_model.state_dict())
 
     if args.batch_size % args.dp_size != 0:
         raise ValueError("batch_size must be divisible by dp_size")
-    dp_idx = rank // args.pp_size
+    dp_idx = rank // (args.pp_size * args.tp_size)
     local_batch_size = args.batch_size // args.dp_size
     local_tokens = tokens.narrow(0, dp_idx * local_batch_size, local_batch_size).contiguous()
 
-    baseline_optimizer = torch.optim.SGD(baseline_model.parameters(), lr=_LR)
-    baseline_optimizer.zero_grad(set_to_none=True)
-    _log(rank, args.debug, "baseline_forward")
-    baseline_loss = baseline_model(causal_lm_batch(tokens))
-    _log(rank, args.debug, "baseline_backward")
-    baseline_loss.backward()
-    baseline_optimizer.step()
-
     plugins, zero3 = _make_plugins(args.case)
     core = RuntimeCore(
-        mesh=MeshConfig(dp=args.dp_size, tp=1, pp=args.pp_size, cp=1, ep=1),
+        mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=1, ep=1),
         plan=ParallelPlan(pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches)),
         model=pp_model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=plugins,
     )
-    _log(rank, args.debug, "core.setup")
     core.setup()
-    _log(rank, args.debug, "core.run_step")
     runtime_loss, should_step = core.run_step(causal_lm_batch(local_tokens))
     if not should_step:
         raise AssertionError("PP v0 test expects grad_accum_steps=1, should_step must be True")
-    _log(rank, args.debug, "core.step_optimizer")
     core.step_optimizer()
-    _log(rank, args.debug, "after_step_optimizer")
 
     if zero3 is not None:
         zero3.materialize_model()
 
+    tp_group = core.get_group(MeshAxis.TP)
+    shard_rules = _rule_by_param_name(core.model)
+    logical_params = _logical_named_tensors(core.model, shard_rules, tp_group)
+
     local_param_diff = 0.0
     local_param_name = ""
-    baseline_params = {name: param.detach() for name, param in baseline_model.named_parameters()}
-    for name, param in core.model.named_parameters():
-        diff = (param.detach() - baseline_params[name]).abs().max().item()
+    for name, param in logical_params.items():
+        diff = (param - baseline_params[name]).abs().max().item()
         if diff > local_param_diff:
             local_param_diff = diff
             local_param_name = name
@@ -133,14 +132,14 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if dp_group is not None:
         dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG, group=dp_group)
 
-    loss_diff_tensor = torch.tensor(abs(avg_loss.item() - baseline_loss.item()), dtype=torch.float64)
+    loss_diff_tensor = torch.tensor(abs(avg_loss.item() - baseline_loss), dtype=torch.float64)
     param_diff_tensor = torch.tensor(local_param_diff, dtype=torch.float64)
     dist.all_reduce(loss_diff_tensor, op=dist.ReduceOp.MAX)
     dist.all_reduce(param_diff_tensor, op=dist.ReduceOp.MAX)
 
     if rank == 0:
         print(f"Case             : {args.case}")
-        print(f"Baseline loss    : {baseline_loss.item():.6f}")
+        print(f"Baseline loss    : {baseline_loss:.6f}")
         print(f"RuntimeCore PP   : {avg_loss.item():.6f}")
         print(f"Loss diff        : {loss_diff_tensor.item():.2e}  (atol={_LOSS_ATOL:.2e})")
         print(f"Local param diff : {param_diff_tensor.item():.2e}  ({local_param_name}, atol={_STEP_ATOL:.2e})")
@@ -155,13 +154,6 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if zero3 is not None:
         zero3.reshard_model()
     dist.destroy_process_group()
-
-
-def _log(rank: int, enabled: bool, message: str) -> None:
-    if enabled:
-        print(f"[rank {rank}] {message}", flush=True)
-
-
 def _make_plugins(case: str):
     zero3: Zero3Plugin | None = None
     if case == "pp":
@@ -173,14 +165,116 @@ def _make_plugins(case: str):
     if case == "pp_zero2":
         return [PipelineParallelPlugin(), Zero2Plugin(bucket_mb_size=0)], zero3
     if case == "pp_zero3":
-        zero3 = Zero3Plugin(wrap_cls={torch.nn.Linear}, enable_prefetch=True)
+        zero3 = Zero3Plugin(wrap_cls={torch.nn.Linear, torch.nn.Embedding, RmsNorm})
         return [PipelineParallelPlugin(), zero3], zero3
+    if case == "pp_tp":
+        return [TensorParallelPlugin(), PipelineParallelPlugin()], zero3
+    if case == "pp_tp_sp":
+        return [TensorParallelPlugin(), SequenceParallelPlugin(), PipelineParallelPlugin()], zero3
     raise ValueError(f"unknown case={case}")
+
+
+def _make_baseline_plugins(case: str):
+    if case == "pp_tp":
+        return [TensorParallelPlugin()]
+    if case == "pp_tp_sp":
+        return [TensorParallelPlugin(), SequenceParallelPlugin()]
+    return None
+
+
+def _build_runtime_model(case: str):
+    if case == "pp_tp":
+        return TinyTransformerTp(**_MODEL_KWARGS)
+    if case == "pp_tp_sp":
+        return TinyTransformerTpSp(**_MODEL_KWARGS)
+    return TinyTransformer(**_MODEL_KWARGS)
+
+
+def _build_baseline_model(case: str):
+    if case == "pp_tp":
+        return TinyTransformerTp(**_MODEL_KWARGS)
+    if case == "pp_tp_sp":
+        return TinyTransformerTpSp(**_MODEL_KWARGS)
+    return TinyTransformer(**_MODEL_KWARGS)
+
+
+def _run_baseline(rank: int, args: argparse.Namespace) -> tuple[float, dict[str, torch.Tensor]]:
+    baseline_plugins = _make_baseline_plugins(args.case)
+    baseline_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
+    if baseline_plugins is None:
+        optimizer = torch.optim.SGD(baseline_model.parameters(), lr=_LR)
+        optimizer.zero_grad(set_to_none=True)
+        baseline_loss = baseline_model(causal_lm_batch(tokens))
+        baseline_loss.backward()
+        optimizer.step()
+        return baseline_loss.item(), {name: param.detach() for name, param in baseline_model.named_parameters()}
+
+    sharded_baseline = _build_baseline_model(args.case)
+    sharded_baseline.load_state_dict(baseline_model.state_dict())
+    baseline_core = RuntimeCore(
+        mesh=MeshConfig(dp=args.pp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
+        plan=ParallelPlan(),
+        model=sharded_baseline,
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
+        plugins=baseline_plugins,
+    )
+    baseline_core.setup()
+    baseline_loss, should_step = baseline_core.run_step(causal_lm_batch(tokens))
+    if not should_step:
+        raise AssertionError("baseline TP/SP test expects grad_accum_steps=1, should_step must be True")
+    baseline_core.step_optimizer()
+    baseline_tp_group = baseline_core.get_group(MeshAxis.TP)
+    shard_rules = _rule_by_param_name(baseline_core.model)
+    baseline_params = _logical_named_tensors(baseline_core.model, shard_rules, baseline_tp_group)
+    return baseline_loss.item(), baseline_params
+
+
+def _rule_by_param_name(model) -> dict[str, str]:
+    if not hasattr(model, "tpsp_parallelize_spec"):
+        return {}
+    rules = {}
+    for rule in model.tpsp_parallelize_spec().rules:
+        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
+            rules[f"{rule.module_path}.weight"] = rule.shard_axis
+            rules[f"{rule.module_path}.bias"] = rule.shard_axis
+    return rules
+
+
+def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[torch.Tensor]:
+    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(gathered, tensor.contiguous(), group=group)
+    return gathered
+
+
+def _logical_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    shard_rules: dict[str, str],
+    tp_group: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    shard_axis = shard_rules.get(name)
+    if shard_axis == TpSpShardAxis.PARAM_OUT:
+        assert tp_group is not None
+        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=0)
+    if shard_axis == TpSpShardAxis.PARAM_IN:
+        assert tp_group is not None
+        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=1)
+    return tensor.detach().clone()
+
+
+def _logical_named_tensors(
+    model: torch.nn.Module,
+    shard_rules: dict[str, str],
+    tp_group: dist.ProcessGroup | None,
+) -> dict[str, torch.Tensor]:
+    return {
+        name: _logical_tensor(name, param.detach(), shard_rules, tp_group)
+        for name, param in model.named_parameters()
+    }
 
 
 def main() -> None:
     args = parse_args()
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
     mp.spawn(_run_worker, args=(args,), nprocs=args.world_size, join=True)
 
 

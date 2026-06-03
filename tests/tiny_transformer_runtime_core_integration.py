@@ -16,13 +16,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
+from models.tiny_transformer import RmsNorm
 from helpers import causal_lm_batch
 from parallel.specs import TpSpShardAxis
 from parallel import ParallelPlan
@@ -31,7 +31,6 @@ from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
-from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
@@ -52,6 +51,7 @@ _MODEL_KWARGS = dict(
 _LOSS_ATOL = 1e-3
 _STEP_ATOL = 8e-4
 _LR = 1e-2
+_ZERO3_WRAP_CLS = {torch.nn.Linear, torch.nn.Embedding, RmsNorm}
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,13 +172,13 @@ def _make_plugins(case: str):
     if case == "tp_sp_zero3":
         return plugins + [
             Zero3Plugin(
-                wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
+                wrap_cls=_ZERO3_WRAP_CLS,
             )
         ], 3
     if case in {"tp_sp_zero3_bf16_clip", "tp_sp_zero3_bf16_clip_accum2"}:
         return plugins + [
             Zero3Plugin(
-                wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
+                wrap_cls=_ZERO3_WRAP_CLS,
             ),
             PrecisionPlugin(compute_dtype=torch.bfloat16),
             GradClipPlugin(max_norm=1.0),
@@ -187,7 +187,7 @@ def _make_plugins(case: str):
         return [
             TensorParallelPlugin(),
             Zero3Plugin(
-                wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
+                wrap_cls=_ZERO3_WRAP_CLS,
             ),
             PrecisionPlugin(compute_dtype=torch.bfloat16),
             GradClipPlugin(max_norm=1.0),

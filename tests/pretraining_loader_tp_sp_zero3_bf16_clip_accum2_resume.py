@@ -13,10 +13,10 @@ import torch.multiprocessing as mp
 
 from data import PretrainingDataLoader, TokenShardDataset
 from models import TinyTransformer, TinyTransformerTpSp
+from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
 from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
-from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
@@ -38,6 +38,7 @@ _MODEL_KWARGS = dict(
 _LOSS_ATOL = 5e-2
 _STEP_ATOL = 5e-2
 _LR = 1e-2
+_ZERO3_WRAP_CLS = {torch.nn.Linear, torch.nn.Embedding, RmsNorm}
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,7 +154,7 @@ def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tup
 
 def _build_runtime(model: TinyTransformerTpSp, dp_size: int, tp_size: int) -> tuple[RuntimeCore, Zero3Plugin]:
     zero3 = Zero3Plugin(
-        wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
+        wrap_cls=_ZERO3_WRAP_CLS,
     )
     core = RuntimeCore(
         mesh=MeshConfig(dp=dp_size, tp=tp_size, pp=1, cp=1, ep=1),

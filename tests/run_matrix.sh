@@ -38,10 +38,12 @@ echo "=== tp checkpoint manifest ==="
 "${PYTHON_BIN}" tests/tiny_transformer_tp_checkpoint_manifest.py
 
 echo "=== tiny transformer pp equivalence ==="
-for c in pp pp_ddp_sync pp_zero1 pp_zero2 pp_zero3; do
+for c in pp pp_ddp_sync pp_zero1 pp_zero2 pp_zero3 pp_tp pp_tp_sp; do
   echo "--- pp case: ${c} ---"
   if [ "${c}" = "pp" ]; then
     "${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case "${c}" --world-size 2 --dp-size 1 --pp-size 2
+  elif [ "${c}" = "pp_tp" ] || [ "${c}" = "pp_tp_sp" ]; then
+    "${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case "${c}" --world-size 4 --dp-size 1 --pp-size 2 --tp-size 2
   else
     "${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case "${c}" --world-size 4 --dp-size 2 --pp-size 2
   fi

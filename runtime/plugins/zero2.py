@@ -39,6 +39,7 @@ class _Bucket:
     shard_start: int
     shard_end: int
     local_param: nn.Parameter
+    grad_buffer: torch.Tensor
     pending: int
     handle: dist.Work | _AllReduceShardWork | None = None
     attached: bool = False
@@ -57,9 +58,7 @@ class Zero2Plugin(RuntimePlugin):
         self.world_size = 1
         self.rank = 0
         self.data_buffer: torch.Tensor | None = None
-        self.grad_buffer: torch.Tensor | None = None
         self.buckets: list[_Bucket] = []
-        self.active_grad_handle: dist.Work | _AllReduceShardWork | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
 
@@ -101,7 +100,6 @@ class Zero2Plugin(RuntimePlugin):
         param_buckets = self._build_param_buckets(params)
         padded_sizes = [self._padded_len(sum(param.numel() for param in bucket)) for bucket in param_buckets]
         self.data_buffer = torch.zeros(sum(padded_sizes), dtype=dtype, device=device)
-        self.grad_buffer = torch.zeros(max(padded_sizes), dtype=dtype, device=device)
 
         offset = 0
         for bucket_params, padded_size in zip(param_buckets, padded_sizes):
@@ -123,6 +121,7 @@ class Zero2Plugin(RuntimePlugin):
                     shard_start=shard_start,
                     shard_end=shard_end,
                     local_param=nn.Parameter(self.data_buffer[shard_start:shard_end].clone()),
+                    grad_buffer=torch.zeros(padded_size, dtype=dtype, device=device),
                     pending=len(bucket_params),
                 )
             )
@@ -156,9 +155,6 @@ class Zero2Plugin(RuntimePlugin):
     def _make_attach_hook(self, bucket: _Bucket):
         def hook(grad: torch.Tensor) -> torch.Tensor:
             if not bucket.attached:
-                if self.active_grad_handle is not None:
-                    self.active_grad_handle.wait()
-                    self.active_grad_handle = None
                 self._attach_bucket_grad_buffer(bucket)
                 bucket.attached = True
             return grad
@@ -166,10 +162,9 @@ class Zero2Plugin(RuntimePlugin):
         return hook
 
     def _attach_bucket_grad_buffer(self, bucket: _Bucket) -> None:
-        assert self.grad_buffer is not None
         offset = 0
         for param in bucket.params:
-            param.grad = self.grad_buffer[offset : offset + param.numel()].view_as(param)
+            param.grad = bucket.grad_buffer[offset : offset + param.numel()].view_as(param)
             offset += param.numel()
 
     def _make_grad_sync_hook(self, bucket: _Bucket):
@@ -179,16 +174,14 @@ class Zero2Plugin(RuntimePlugin):
                 if bucket.local_param.grad is None:
                     bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
                 bucket.handle = self._reduce_scatter_avg(bucket)
-                self.active_grad_handle = bucket.handle
 
         return hook
 
     def _reduce_scatter_avg(self, bucket: _Bucket) -> dist.Work | _AllReduceShardWork:
         assert self.dp_group is not None
-        assert self.grad_buffer is not None
         assert bucket.local_param.grad is not None
         bucket_numel = bucket.end - bucket.start
-        full_grad = self.grad_buffer[:bucket_numel]
+        full_grad = bucket.grad_buffer[:bucket_numel]
         if dist.get_backend(self.dp_group) == "gloo":
             work = dist.all_reduce(full_grad, op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
             shard_len = bucket.local_param.numel()
@@ -221,25 +214,15 @@ class Zero2Plugin(RuntimePlugin):
                 handle.wait()
 
     def _wait_last_grad_sync(self) -> None:
-        if not self.buckets:
-            return
-        last_bucket = self.buckets[-1]
-        if last_bucket.handle is None:
-            if self.active_grad_handle is None:
-                raise RuntimeError("no ZeRO2 bucket handle was launched after backward")
-            self.active_grad_handle.wait()
-            self.active_grad_handle = None
-            return
-        last_bucket.handle.wait()
-        if self.active_grad_handle is not None and self.active_grad_handle is not last_bucket.handle:
-            self.active_grad_handle.wait()
-        self.active_grad_handle = None
+        for bucket in self.buckets:
+            if bucket.handle is None:
+                raise RuntimeError("ZeRO2 bucket handle is None after backward")
+            bucket.handle.wait()
 
     def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
-        self.active_grad_handle = None
         if grad_accum_start:
-            assert self.grad_buffer is not None
-            self.grad_buffer.zero_()
+            for bucket in self.buckets:
+                bucket.grad_buffer.zero_()
         for bucket in self.buckets:
             bucket.pending = len(bucket.params) if grad_accum_end else 0
             bucket.handle = None

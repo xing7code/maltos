@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
+from types import MethodType
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from runtime.core import RuntimePhase
+from parallel.specs import TpSpParallelSpec
 from runtime.mesh import MeshAxis
-from runtime.plugin import PipelineParallelizableModule, PluginId, RuntimePlugin
+from runtime.plugin import PipelineParallelizableModule, PluginId, RuntimePlugin, TpSpParallelizableModule
 
 
 @dataclass
@@ -46,6 +46,14 @@ class PipelineParallelPlugin(RuntimePlugin):
         self.hidden_size = 0
         self.pipeline_microbatches = 1
         self.pp_group: dist.ProcessGroup | None = None
+        self.sequence_parallel_enabled = False
+        self.sequence_parallel_world_size = 1
+
+    def bind(self, runtime) -> None:
+        super().bind(runtime)
+        active_plugins = {plugin.id for plugin in runtime.plugins if plugin is not self}
+        self.sequence_parallel_enabled = PluginId.SP in active_plugins
+        self.sequence_parallel_world_size = runtime.mesh.tp if self.sequence_parallel_enabled else 1
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
@@ -70,6 +78,7 @@ class PipelineParallelPlugin(RuntimePlugin):
         spec = model.pipeline_parallel_spec()
         self.hidden_size = _infer_hidden_size(model, spec)
         self._partition_model(model, spec, pp_idx, self.stage_count)
+        self._filter_tpsp_spec(model, spec, pp_idx, self.stage_count)
         return model
 
     def build_step_runner(self):
@@ -84,22 +93,18 @@ class PipelineParallelPlugin(RuntimePlugin):
         total_loss: torch.Tensor | None = None
 
         for micro_idx, micro_batch in enumerate(micro_batches):
-            self._debug(f"fwd[{micro_idx}] start")
             if self.prev_global_rank is None:
                 model_input = micro_batch
                 input_activation = None
             else:
-                self._debug(f"fwd[{micro_idx}] recv_activation wait")
                 input_activation, recv_work = self._recv_activation_async(micro_batch)
                 recv_work.wait()
-                self._debug(f"fwd[{micro_idx}] recv_activation done")
                 input_activation.requires_grad_(True)
                 model_input = {"hidden_states": input_activation}
                 if self.next_global_rank is None:
                     model_input["labels"] = _extract_labels(micro_batch)
 
             self.runtime._forward_step_impl(model_input)
-            self._debug(f"fwd[{micro_idx}] forward done")
 
             if self.next_global_rank is None:
                 if not torch.is_tensor(self.runtime.state.loss):
@@ -115,7 +120,6 @@ class PipelineParallelPlugin(RuntimePlugin):
                     raise TypeError("non-last PP stage must return Tensor activations")
                 assert torch.is_tensor(self.runtime.state.outputs)
                 send_buffer, send_work = self._send_activation_async(self.runtime.state.outputs.detach())
-                self._debug(f"fwd[{micro_idx}] send_activation launched")
                 states.append(
                     _PipelineMicroState(
                         input_activation=input_activation,
@@ -129,35 +133,27 @@ class PipelineParallelPlugin(RuntimePlugin):
         for state in states:
             if state.activation_send_work is not None:
                 state.activation_send_work.wait()
-        self._debug("forward send waits done")
 
         context.pp_bwd_microbatch_idx = 0
         for backward_exec_idx, state in enumerate(reversed(states)):
-            self._debug(f"bwd[{backward_exec_idx}] start")
             if self.next_global_rank is None:
                 assert state.raw_loss is not None
                 self.runtime.state.loss = state.raw_loss / float(self.pipeline_microbatches)
                 self.runtime._backward_step_impl()
-                self._debug(f"bwd[{backward_exec_idx}] loss backward done")
                 if self.prev_global_rank is not None:
                     assert state.input_activation is not None and state.input_activation.grad is not None
                     send_buffer, send_work = self._send_grad_async(state.input_activation.grad.detach())
-                    self._debug(f"bwd[{backward_exec_idx}] send_grad launched")
                     state.grad_send_buffer = send_buffer
                     state.grad_send_work = send_work
             else:
                 assert state.output_activation is not None
                 self.runtime.state.outputs = state.output_activation
-                self._debug(f"bwd[{backward_exec_idx}] recv_grad wait")
                 grad_output, recv_work = self._recv_grad_async(state.output_activation)
                 recv_work.wait()
-                self._debug(f"bwd[{backward_exec_idx}] recv_grad done")
                 self.runtime._backward_step_impl(grad_output=grad_output)
-                self._debug(f"bwd[{backward_exec_idx}] activation backward done")
                 if self.prev_global_rank is not None:
                     assert state.input_activation is not None and state.input_activation.grad is not None
                     send_buffer, send_work = self._send_grad_async(state.input_activation.grad.detach())
-                    self._debug(f"bwd[{backward_exec_idx}] send_grad launched")
                     state.grad_send_buffer = send_buffer
                     state.grad_send_work = send_work
             context.advance_pp_backward()
@@ -165,12 +161,10 @@ class PipelineParallelPlugin(RuntimePlugin):
         for state in states:
             if state.grad_send_work is not None:
                 state.grad_send_work.wait()
-        self._debug("backward send waits done")
 
         context.reset_pp_microbatches()
         loss_out = self._broadcast_loss(total_loss, micro_batches[0])
         self.runtime.state.loss = loss_out
-        self._debug("loss broadcast done")
         return loss_out
 
     def _broadcast_loss(self, total_loss: torch.Tensor | None, batch) -> torch.Tensor:
@@ -189,7 +183,11 @@ class PipelineParallelPlugin(RuntimePlugin):
     def _recv_activation_async(self, batch) -> tuple[torch.Tensor, dist.Work]:
         assert self.prev_global_rank is not None
         buffer = torch.empty(
-            _activation_shape(batch, self.hidden_size),
+            _activation_shape(
+                batch,
+                self.hidden_size,
+                sequence_parallel_world_size=self.sequence_parallel_world_size,
+            ),
             device=_model_device(self.runtime.model),
             dtype=_activation_dtype(self.runtime),
         )
@@ -219,11 +217,6 @@ class PipelineParallelPlugin(RuntimePlugin):
         global_rank = dist.get_rank()
         dp_idx, _, cp_idx, tp_idx = self.runtime.mesh.rank_coordinates(global_rank)
         return self.runtime.mesh.rank_id(dp=dp_idx, pp=stage_index, cp=cp_idx, tp=tp_idx)
-
-    def _debug(self, message: str) -> None:
-        if os.getenv("MALTOS_PP_DEBUG") != "1":
-            return
-        print(f"[pp rank {dist.get_rank()}] {message}", flush=True)
 
     def _validate_runtime_support(self) -> None:
         assert self.runtime is not None
@@ -262,12 +255,45 @@ class PipelineParallelPlugin(RuntimePlugin):
             )
             _replace_module_path(model, path, partitioned)
 
+    def _filter_tpsp_spec(self, model: nn.Module, pp_spec, stage_index: int, stage_count: int) -> None:
+        if not isinstance(model, TpSpParallelizableModule):
+            return
+        tpsp_spec = model.tpsp_parallelize_spec()
+        keep_prefixes: list[str] = []
+        if stage_index == 0:
+            keep_prefixes.extend(pp_spec.head_layers)
+        if stage_index == stage_count - 1:
+            keep_prefixes.extend(pp_spec.tail_layers)
+        for path in pp_spec.pipe_layers:
+            module = model.get_submodule(path)
+            if not isinstance(module, nn.ModuleList):
+                continue
+            start, end = _layer_range(len(module), stage_index, stage_count)
+            keep_prefixes.extend(f"{path}.{layer_idx}" for layer_idx in range(start, end))
+
+        filtered_rules = [rule for rule in tpsp_spec.rules if _path_matches_any_prefix(rule.module_path, keep_prefixes)]
+        filtered_tie_rules = [
+            tie_rule
+            for tie_rule in tpsp_spec.tie_rules
+            if _path_matches_any_prefix(tie_rule[0], keep_prefixes)
+            and _path_matches_any_prefix(tie_rule[1], keep_prefixes)
+        ]
+        filtered_spec = TpSpParallelSpec(rules=filtered_rules, tie_rules=filtered_tie_rules)
+        model.tpsp_parallelize_spec = MethodType(lambda _self: filtered_spec, model)
+
 
 def _layer_range(num_layers: int, stage_index: int, stage_count: int) -> tuple[int, int]:
     base, remainder = divmod(num_layers, stage_count)
     start = stage_index * base + min(stage_index, remainder)
     width = base + (1 if stage_index < remainder else 0)
     return start, start + width
+
+
+def _path_matches_any_prefix(path: str, prefixes: list[str]) -> bool:
+    for prefix in prefixes:
+        if path == prefix or path.startswith(prefix + "."):
+            return True
+    return False
 
 
 class _IdentityPipeLayer(nn.Module):
@@ -340,9 +366,22 @@ def _extract_labels(batch) -> torch.Tensor | None:
     return labels
 
 
-def _activation_shape(batch, hidden_size: int) -> tuple[int, int, int]:
+def _activation_shape(
+    batch,
+    hidden_size: int,
+    *,
+    sequence_parallel_world_size: int = 1,
+) -> tuple[int, int, int]:
     input_ids, _labels = _unpack_batch(batch)
-    return int(input_ids.size(0)), int(input_ids.size(1)), hidden_size
+    seq_len = int(input_ids.size(1))
+    if sequence_parallel_world_size > 1:
+        if seq_len % sequence_parallel_world_size != 0:
+            raise ValueError(
+                "PP+SP activation shape requires sequence length divisible by tp world size, "
+                f"got seq_len={seq_len}, tp={sequence_parallel_world_size}"
+            )
+        seq_len //= sequence_parallel_world_size
+    return int(input_ids.size(0)), seq_len, hidden_size
 
 
 def _model_device(model: nn.Module) -> torch.device:

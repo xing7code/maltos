@@ -24,10 +24,11 @@ from models import (
     TinyTransformerTp,
     TinyTransformerTpSp,
 )
+from models.llama import LlamaRMSNorm
+from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
 from runtime import MeshConfig, RuntimeCore
-from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.perf_metrics import PerfMetricsPlugin
@@ -48,6 +49,15 @@ from utils.metrics import (
     WandbMetricLogger,
 )
 from utils.distributed import distributed_barrier
+
+
+_ZERO3_WRAP_CLS = {
+    torch.nn.Linear,
+    torch.nn.Embedding,
+    torch.nn.LayerNorm,
+    RmsNorm,
+    LlamaRMSNorm,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -281,7 +291,7 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
     else:
         plugins.append(
             Zero3Plugin(
-                wrap_cls={torch.nn.Linear, ColumnParallelLinear, RowParallelLinear},
+                wrap_cls=_ZERO3_WRAP_CLS,
             )
         )
     compute_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]

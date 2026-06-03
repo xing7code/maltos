@@ -9,6 +9,7 @@ import torch.nn as nn
 from runtime.core import RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
+from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
 from state.state import ParamState
 
 
@@ -62,16 +63,29 @@ class Zero3Plugin(RuntimePlugin):
         enable_prefetch: bool = True,
     ):
         super().__init__(id=PluginId.ZERO3, name="zero3", owns_optimizer=True)
-        self.wrap_cls = wrap_cls or {nn.Linear}
+        self.wrap_cls = set(wrap_cls or {nn.Linear})
         self.enable_prefetch = enable_prefetch
+        self.pipeline_parallel_enabled = False
         self.dp_group: dist.ProcessGroup | None = None
         self.world_size = 1
         self.rank = 0
         self.buckets: list[_Bucket] = []
         self.data_buffers: list[torch.Tensor] = []
         self._materialized_buffers: list[torch.Tensor] = []
+        self.bucket_order_checked = False
+        self._observed_forward_order: list[_Bucket] = []
+        self._observed_forward_set: set[int] = set()
+        self._first_bucket: _Bucket | None = None
+        self._last_bucket: _Bucket | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+
+    def bind(self, runtime) -> None:
+        super().bind(runtime)
+        active_plugins = {plugin.id for plugin in runtime.plugins if plugin is not self}
+        self.pipeline_parallel_enabled = runtime.mesh.pp > 1
+        if PluginId.TP in active_plugins and nn.Linear in self.wrap_cls:
+            self.wrap_cls.update({ColumnParallelLinear, RowParallelLinear})
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
@@ -88,8 +102,10 @@ class Zero3Plugin(RuntimePlugin):
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
             assert self.runtime is not None
-            if self.enable_prefetch and self.buckets:
-                self._prefetch_bucket(self.buckets[0], direction="forward")
+            if self.enable_prefetch and self.bucket_order_checked and self._first_bucket is not None:
+                self._prefetch_bucket(self._first_bucket, direction="forward")
+        elif phase == RuntimePhase.POST_FORWARD:
+            self._finalize_bucket_order()
         elif phase == RuntimePhase.PRE_BACKWARD:
             assert self.runtime is not None
             context = self.runtime.state.step_context
@@ -97,6 +113,8 @@ class Zero3Plugin(RuntimePlugin):
                 grad_accum_start=context.accum_start,
                 grad_accum_end=context.is_step_boundary,
             )
+            if self.enable_prefetch and not self.pipeline_parallel_enabled and self.bucket_order_checked and self._last_bucket is not None:
+                self._prefetch_bucket(self._last_bucket, direction="backward")
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
             if self.runtime.state.step_context.is_step_boundary:
@@ -105,6 +123,7 @@ class Zero3Plugin(RuntimePlugin):
     def _prepare_buckets(self, model: nn.Module) -> None:
         visited: set[str] = set()
         param_to_name = {id(param): name for name, param in model.named_parameters()}
+        covered_param_ids: set[int] = set()
         bucket_specs: list[tuple[nn.Module, list[nn.Parameter], list[str]]] = []
         for module_name, module in model.named_modules():
             if not isinstance(module, tuple(self.wrap_cls)):
@@ -117,6 +136,18 @@ class Zero3Plugin(RuntimePlugin):
             visited.add(module_name)
             logical_names = [param_to_name[id(param)] for param in params]
             bucket_specs.append((module, params, logical_names))
+            covered_param_ids.update(id(param) for param in params)
+
+        uncovered = [
+            name
+            for name, param in model.named_parameters()
+            if param.requires_grad and id(param) not in covered_param_ids
+        ]
+        if uncovered:
+            raise ValueError(
+                "Zero3Plugin wrap_cls does not cover all trainable parameters. "
+                f"Uncovered params: {uncovered}"
+            )
 
         if not bucket_specs:
             return
@@ -131,12 +162,6 @@ class Zero3Plugin(RuntimePlugin):
         for index, (module, params, logical_names) in enumerate(bucket_specs):
             bucket = self._make_bucket(index, module, params, logical_names)
             self.buckets.append(bucket)
-
-        for index, bucket in enumerate(self.buckets):
-            if index > 0:
-                bucket.prev_bucket = self.buckets[index - 1]
-            if index + 1 < len(self.buckets):
-                bucket.next_bucket = self.buckets[index + 1]
 
         self._reset_buckets(grad_accum_start=True, grad_accum_end=True)
         self._add_hooks()
@@ -186,8 +211,9 @@ class Zero3Plugin(RuntimePlugin):
 
     def _make_materialize_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs) -> None:
+            self._record_forward_bucket(bucket)
             self._materialize_full_params(bucket, direction="forward")
-            if self.enable_prefetch and bucket.next_bucket is not None:
+            if self.enable_prefetch and self.bucket_order_checked and bucket.next_bucket is not None:
                 self._prefetch_bucket(bucket.next_bucket, direction="forward")
 
         return hook
@@ -202,7 +228,7 @@ class Zero3Plugin(RuntimePlugin):
     def _make_materialize_backward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _grad_outputs) -> None:
             self._materialize_full_params(bucket, direction="backward")
-            if self.enable_prefetch and bucket.prev_bucket is not None:
+            if self.enable_prefetch and not self.pipeline_parallel_enabled and bucket.prev_bucket is not None:
                 self._prefetch_bucket(bucket.prev_bucket, direction="backward")
 
         return hook
@@ -258,6 +284,22 @@ class Zero3Plugin(RuntimePlugin):
             )
             return
         raise ValueError(f"unknown ZeRO3 prefetch direction={direction}")
+
+    def _record_forward_bucket(self, bucket: _Bucket) -> None:
+        if self.bucket_order_checked or bucket.index in self._observed_forward_set:
+            return
+        self._observed_forward_set.add(bucket.index)
+        self._observed_forward_order.append(bucket)
+
+    def _finalize_bucket_order(self) -> None:
+        if self.bucket_order_checked or len(self._observed_forward_order) != len(self.buckets):
+            return
+        self._first_bucket = self._observed_forward_order[0]
+        self._last_bucket = self._observed_forward_order[-1]
+        for prev_bucket, next_bucket in zip(self._observed_forward_order, self._observed_forward_order[1:]):
+            prev_bucket.next_bucket = next_bucket
+            next_bucket.prev_bucket = prev_bucket
+        self.bucket_order_checked = True
 
     def _materialize_full_params(self, bucket: _Bucket, direction: str) -> None:
         if direction == "forward":
