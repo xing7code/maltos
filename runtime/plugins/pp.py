@@ -44,7 +44,6 @@ class PipelineParallelPlugin(RuntimePlugin):
         self.next_global_rank: int | None = None
         self.last_global_rank = 0
         self.hidden_size = 0
-        self.pipeline_microbatches = 1
         self.pp_group: dist.ProcessGroup | None = None
         self.sequence_parallel_enabled = False
         self.sequence_parallel_world_size = 1
@@ -66,7 +65,6 @@ class PipelineParallelPlugin(RuntimePlugin):
         _, pp_idx, _, _ = self.runtime.mesh.rank_coordinates(global_rank)
         self.stage_index = pp_idx
         self.stage_count = self.runtime.mesh.pp
-        self.pipeline_microbatches = self.runtime.plan.pp_schedule.microbatches
         self.prev_global_rank = self._stage_global_rank(pp_idx - 1) if pp_idx > 0 else None
         self.next_global_rank = self._stage_global_rank(pp_idx + 1) if pp_idx + 1 < self.stage_count else None
         self.last_global_rank = self._stage_global_rank(self.stage_count - 1)
@@ -87,8 +85,12 @@ class PipelineParallelPlugin(RuntimePlugin):
     def _run_pipeline_step(self, batch) -> torch.Tensor:
         assert self.runtime is not None
         context = self.runtime.state.step_context
-        micro_batches = _split_batch(batch, self.pipeline_microbatches)
-        context.reset_pp_microbatches(len(micro_batches))
+        micro_batches = _split_batch(batch, context.pp_num_microbatches)
+        if len(micro_batches) != context.pp_num_microbatches:
+            raise ValueError(
+                "PipelineParallelPlugin microbatch split count does not match StepContext.pp_num_microbatches: "
+                f"{len(micro_batches)} vs {context.pp_num_microbatches}"
+            )
         states: list[_PipelineMicroState] = []
         total_loss: torch.Tensor | None = None
 
@@ -134,11 +136,10 @@ class PipelineParallelPlugin(RuntimePlugin):
             if state.activation_send_work is not None:
                 state.activation_send_work.wait()
 
-        context.pp_bwd_microbatch_idx = 0
         for backward_exec_idx, state in enumerate(reversed(states)):
             if self.next_global_rank is None:
                 assert state.raw_loss is not None
-                self.runtime.state.loss = state.raw_loss / float(self.pipeline_microbatches)
+                self.runtime.state.loss = state.raw_loss / float(context.pp_num_microbatches)
                 self.runtime._backward_step_impl()
                 if self.prev_global_rank is not None:
                     assert state.input_activation is not None and state.input_activation.grad is not None
@@ -162,7 +163,6 @@ class PipelineParallelPlugin(RuntimePlugin):
             if state.grad_send_work is not None:
                 state.grad_send_work.wait()
 
-        context.reset_pp_microbatches()
         loss_out = self._broadcast_loss(total_loss, micro_batches[0])
         self.runtime.state.loss = loss_out
         return loss_out
@@ -173,7 +173,7 @@ class PipelineParallelPlugin(RuntimePlugin):
         dtype = torch.float32 if total_loss is None else total_loss.dtype
         if self.next_global_rank is None:
             assert total_loss is not None
-            loss = total_loss / float(self.pipeline_microbatches)
+            loss = total_loss / float(self.runtime.state.step_context.pp_num_microbatches)
         else:
             loss = torch.zeros((), device=device, dtype=dtype)
         if self.pp_group is not None and self.stage_count > 1:

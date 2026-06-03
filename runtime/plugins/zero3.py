@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 
 import torch
 import torch.distributed as dist
@@ -30,7 +31,28 @@ class _AllReduceShardWork:
 
     def wait(self) -> None:
         self.work.wait()
-        self.local_grad.copy_(self.grad_buffer[self.shard_start : self.shard_end])
+        self.local_grad.add_(self.grad_buffer[self.shard_start : self.shard_end])
+
+
+class _ReduceScatterShardWork:
+    def __init__(
+        self,
+        work: dist.Work,
+        shard_buffer: torch.Tensor,
+        local_grad: torch.Tensor,
+    ):
+        self.work = work
+        self.shard_buffer = shard_buffer
+        self.local_grad = local_grad
+
+    def wait(self) -> None:
+        self.work.wait()
+        self.local_grad.add_(self.shard_buffer)
+
+
+class _ExecDirection(str, Enum):
+    FORWARD = "forward"
+    BACKWARD = "backward"
 
 
 @dataclass
@@ -41,17 +63,24 @@ class _Bucket:
     param_numels: list[int]
     buffer_size: int
     local_param: nn.Parameter
-    data_buffer: torch.Tensor
-    grad_buffer: torch.Tensor
     index: int
     logical_names: list[str]
-    pending: int
     prev_bucket: "_Bucket | None" = None
     next_bucket: "_Bucket | None" = None
+    exec_states: list["_BucketExecState"] = field(default_factory=list)
+
+
+@dataclass
+class _BucketExecState:
+    data_buffer: torch.Tensor
+    grad_buffer: torch.Tensor
+    shard_buffer: torch.Tensor
     fwd_handle: dist.Work | None = None
     bwd_handle: dist.Work | None = None
+    grad_handle: dist.Work | _AllReduceShardWork | _ReduceScatterShardWork | None = None
+    pending: int = 0
     attached: bool = False
-    grad_handle: dist.Work | _AllReduceShardWork | None = None
+    backward_materialized: bool = False
 
 
 class Zero3Plugin(RuntimePlugin):
@@ -65,12 +94,10 @@ class Zero3Plugin(RuntimePlugin):
         super().__init__(id=PluginId.ZERO3, name="zero3", owns_optimizer=True)
         self.wrap_cls = set(wrap_cls or {nn.Linear})
         self.enable_prefetch = enable_prefetch
-        self.pipeline_parallel_enabled = False
         self.dp_group: dist.ProcessGroup | None = None
         self.world_size = 1
         self.rank = 0
         self.buckets: list[_Bucket] = []
-        self.data_buffers: list[torch.Tensor] = []
         self._materialized_buffers: list[torch.Tensor] = []
         self.bucket_order_checked = False
         self._observed_forward_order: list[_Bucket] = []
@@ -83,7 +110,6 @@ class Zero3Plugin(RuntimePlugin):
     def bind(self, runtime) -> None:
         super().bind(runtime)
         active_plugins = {plugin.id for plugin in runtime.plugins if plugin is not self}
-        self.pipeline_parallel_enabled = runtime.mesh.pp > 1
         if PluginId.TP in active_plugins and nn.Linear in self.wrap_cls:
             self.wrap_cls.update({ColumnParallelLinear, RowParallelLinear})
 
@@ -103,7 +129,7 @@ class Zero3Plugin(RuntimePlugin):
         if phase == RuntimePhase.PRE_FORWARD:
             assert self.runtime is not None
             if self.enable_prefetch and self.bucket_order_checked and self._first_bucket is not None:
-                self._prefetch_bucket(self._first_bucket, direction="forward")
+                self._prefetch_bucket(self._first_bucket, direction=_ExecDirection.FORWARD)
         elif phase == RuntimePhase.POST_FORWARD:
             self._finalize_bucket_order()
         elif phase == RuntimePhase.PRE_BACKWARD:
@@ -113,8 +139,8 @@ class Zero3Plugin(RuntimePlugin):
                 grad_accum_start=context.accum_start,
                 grad_accum_end=context.is_step_boundary,
             )
-            if self.enable_prefetch and not self.pipeline_parallel_enabled and self.bucket_order_checked and self._last_bucket is not None:
-                self._prefetch_bucket(self._last_bucket, direction="backward")
+            if self.enable_prefetch and self.bucket_order_checked and self._last_bucket is not None:
+                self._prefetch_bucket(self._last_bucket, direction=_ExecDirection.BACKWARD)
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
             if self.runtime.state.step_context.is_step_boundary:
@@ -152,13 +178,6 @@ class Zero3Plugin(RuntimePlugin):
         if not bucket_specs:
             return
 
-        dtype, device = bucket_specs[0][1][0].dtype, bucket_specs[0][1][0].device
-        max_buffer_size = max(self._padded_len(sum(param.numel() for param in params)) for _, params, _ in bucket_specs)
-        self.data_buffers = [
-            torch.empty(max_buffer_size, dtype=dtype, device=device),
-            torch.empty(max_buffer_size, dtype=dtype, device=device),
-        ]
-
         for index, (module, params, logical_names) in enumerate(bucket_specs):
             bucket = self._make_bucket(index, module, params, logical_names)
             self.buckets.append(bucket)
@@ -183,8 +202,16 @@ class Zero3Plugin(RuntimePlugin):
         shard_start = self.rank * shard_len
         shard_end = (self.rank + 1) * shard_len
         local_param = nn.Parameter(full_param[shard_start:shard_end].clone())
-        data_buffer = self.data_buffers[index % len(self.data_buffers)][:buffer_size]
-        grad_buffer = torch.empty(buffer_size, dtype=dtype, device=device)
+        shard_buffer = torch.empty(shard_len, dtype=dtype, device=device)
+        exec_state_count = self.runtime.state.step_context.pp_num_microbatches
+        exec_states = [
+            _BucketExecState(
+                data_buffer=torch.empty(buffer_size, dtype=dtype, device=device),
+                grad_buffer=torch.empty(buffer_size, dtype=dtype, device=device),
+                shard_buffer=shard_buffer.clone(),
+            )
+            for _ in range(exec_state_count)
+        ]
         return _Bucket(
             module=module,
             params=params,
@@ -192,19 +219,15 @@ class Zero3Plugin(RuntimePlugin):
             param_numels=param_numels,
             buffer_size=buffer_size,
             local_param=local_param,
-            data_buffer=data_buffer,
-            grad_buffer=grad_buffer,
             index=index,
             logical_names=logical_names,
-            pending=len(params),
+            exec_states=exec_states,
         )
 
     def _add_hooks(self) -> None:
         for bucket in self.buckets:
             bucket.module.register_forward_pre_hook(self._make_materialize_forward_hook(bucket))
             bucket.module.register_forward_hook(self._make_free_forward_hook(bucket))
-            bucket.module.register_full_backward_pre_hook(self._make_materialize_backward_hook(bucket))
-            bucket.module.register_full_backward_hook(self._make_free_backward_hook(bucket))
             for param in bucket.params:
                 param.register_hook(self._make_attach_grad_hook(bucket))
                 param.register_post_accumulate_grad_hook(self._make_reduce_grad_hook(bucket))
@@ -212,72 +235,62 @@ class Zero3Plugin(RuntimePlugin):
     def _make_materialize_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs) -> None:
             self._record_forward_bucket(bucket)
-            self._materialize_full_params(bucket, direction="forward")
+            self._materialize_full_params(bucket, direction=_ExecDirection.FORWARD)
             if self.enable_prefetch and self.bucket_order_checked and bucket.next_bucket is not None:
-                self._prefetch_bucket(bucket.next_bucket, direction="forward")
+                self._prefetch_bucket(bucket.next_bucket, direction=_ExecDirection.FORWARD)
 
         return hook
 
     def _make_free_forward_hook(self, bucket: _Bucket):
-        def hook(_module: nn.Module, _inputs, _outputs) -> None:
+        def hook(_module: nn.Module, _inputs, outputs) -> None:
+            self._register_backward_output_hooks(bucket, outputs)
             self._free_full_params(bucket)
-            bucket.fwd_handle = None
-
-        return hook
-
-    def _make_materialize_backward_hook(self, bucket: _Bucket):
-        def hook(_module: nn.Module, _grad_outputs) -> None:
-            self._materialize_full_params(bucket, direction="backward")
-            if self.enable_prefetch and not self.pipeline_parallel_enabled and bucket.prev_bucket is not None:
-                self._prefetch_bucket(bucket.prev_bucket, direction="backward")
-
-        return hook
-
-    def _make_free_backward_hook(self, bucket: _Bucket):
-        def hook(_module: nn.Module, _grad_inputs, _grad_outputs) -> None:
-            pass
+            self._exec_state(bucket, _ExecDirection.FORWARD).fwd_handle = None
 
         return hook
 
     def _make_attach_grad_hook(self, bucket: _Bucket):
         def hook(grad: torch.Tensor) -> torch.Tensor:
-            if not bucket.attached:
+            state = self._exec_state(bucket, _ExecDirection.BACKWARD)
+            if not state.attached:
                 offset = 0
                 for param, numel, shape in zip(bucket.params, bucket.param_numels, bucket.param_shapes):
-                    param.grad = bucket.grad_buffer[offset : offset + numel].view(shape)
+                    param.grad = state.grad_buffer[offset : offset + numel].view(shape)
                     offset += numel
-                bucket.attached = True
+                state.attached = True
             return grad
 
         return hook
 
     def _make_reduce_grad_hook(self, bucket: _Bucket):
         def hook(_param: nn.Parameter) -> None:
-            bucket.pending -= 1
-            if bucket.pending == 0:
+            state = self._exec_state(bucket, _ExecDirection.BACKWARD)
+            state.pending -= 1
+            if state.pending == 0:
                 if bucket.local_param.grad is None:
                     bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
-                bucket.grad_handle = self._reduce_scatter_avg(bucket)
+                state.grad_handle = self._reduce_scatter_avg(bucket, state)
 
         return hook
 
-    def _prefetch_bucket(self, bucket: _Bucket, direction: str) -> None:
+    def _prefetch_bucket(self, bucket: _Bucket, direction: _ExecDirection) -> None:
         assert self.dp_group is not None
-        if direction == "forward":
-            if bucket.fwd_handle is not None:
+        state = self._exec_state(bucket, direction)
+        if direction == _ExecDirection.FORWARD:
+            if state.fwd_handle is not None:
                 return
-            bucket.fwd_handle = dist.all_gather_into_tensor(
-                bucket.data_buffer,
+            state.fwd_handle = dist.all_gather_into_tensor(
+                state.data_buffer,
                 bucket.local_param.detach().contiguous(),
                 group=self.dp_group,
                 async_op=True,
             )
             return
-        if direction == "backward":
-            if bucket.bwd_handle is not None:
+        if direction == _ExecDirection.BACKWARD:
+            if state.bwd_handle is not None:
                 return
-            bucket.bwd_handle = dist.all_gather_into_tensor(
-                bucket.data_buffer,
+            state.bwd_handle = dist.all_gather_into_tensor(
+                state.data_buffer,
                 bucket.local_param.detach().contiguous(),
                 group=self.dp_group,
                 async_op=True,
@@ -291,6 +304,24 @@ class Zero3Plugin(RuntimePlugin):
         self._observed_forward_set.add(bucket.index)
         self._observed_forward_order.append(bucket)
 
+    def _register_backward_output_hooks(self, bucket: _Bucket, outputs) -> None:
+        tensors = list(_iter_tensors(outputs))
+        if not tensors:
+            return
+
+        def hook(grad: torch.Tensor) -> torch.Tensor:
+            state = self._exec_state(bucket, _ExecDirection.BACKWARD)
+            if not state.backward_materialized:
+                self._materialize_full_params(bucket, direction=_ExecDirection.BACKWARD)
+                if self.enable_prefetch and bucket.prev_bucket is not None:
+                    self._prefetch_bucket(bucket.prev_bucket, direction=_ExecDirection.BACKWARD)
+                state.backward_materialized = True
+            return grad
+
+        for tensor in tensors:
+            if tensor.requires_grad:
+                tensor.register_hook(hook)
+
     def _finalize_bucket_order(self) -> None:
         if self.bucket_order_checked or len(self._observed_forward_order) != len(self.buckets):
             return
@@ -301,20 +332,23 @@ class Zero3Plugin(RuntimePlugin):
             next_bucket.prev_bucket = prev_bucket
         self.bucket_order_checked = True
 
-    def _materialize_full_params(self, bucket: _Bucket, direction: str) -> None:
-        if direction == "forward":
-            if bucket.fwd_handle is None:
-                self._prefetch_bucket(bucket, direction="forward")
-            assert bucket.fwd_handle is not None
-            bucket.fwd_handle.wait()
-        elif direction == "backward":
-            if bucket.bwd_handle is None:
-                self._prefetch_bucket(bucket, direction="backward")
-            assert bucket.bwd_handle is not None
-            bucket.bwd_handle.wait()
+    def _materialize_full_params(self, bucket: _Bucket, direction: _ExecDirection) -> None:
+        state = self._exec_state(bucket, direction)
+        if direction == _ExecDirection.FORWARD:
+            if state.fwd_handle is None:
+                self._prefetch_bucket(bucket, direction=_ExecDirection.FORWARD)
+            assert state.fwd_handle is not None
+            state.fwd_handle.wait()
+            state.fwd_handle = None
+        elif direction == _ExecDirection.BACKWARD:
+            if state.bwd_handle is None:
+                self._prefetch_bucket(bucket, direction=_ExecDirection.BACKWARD)
+            assert state.bwd_handle is not None
+            state.bwd_handle.wait()
+            state.bwd_handle = None
         else:
             raise ValueError(f"unknown ZeRO3 materialize direction={direction}")
-        self._bind_full_params(bucket, bucket.data_buffer)
+        self._bind_full_params(bucket, state.data_buffer)
 
     def _materialize_full_params_sync(self, bucket: _Bucket) -> None:
         assert self.dp_group is not None
@@ -337,21 +371,26 @@ class Zero3Plugin(RuntimePlugin):
         for param in bucket.params:
             param.data = bucket.local_param.data
 
-    def _reduce_scatter_avg(self, bucket: _Bucket) -> dist.Work | _AllReduceShardWork:
+    def _reduce_scatter_avg(
+        self,
+        bucket: _Bucket,
+        state: _BucketExecState,
+    ) -> dist.Work | _AllReduceShardWork | _ReduceScatterShardWork:
         assert self.dp_group is not None
         if dist.get_backend(self.dp_group) == "gloo":
-            work = dist.all_reduce(bucket.grad_buffer, op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
+            work = dist.all_reduce(state.grad_buffer, op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
             shard_len = bucket.local_param.numel()
             shard_start = self.rank * shard_len
             shard_end = (self.rank + 1) * shard_len
-            return _AllReduceShardWork(work, bucket.grad_buffer, bucket.local_param.grad, shard_start, shard_end)
-        return dist.reduce_scatter_tensor(
-            bucket.local_param.grad,
-            bucket.grad_buffer,
+            return _AllReduceShardWork(work, state.grad_buffer, bucket.local_param.grad, shard_start, shard_end)
+        work = dist.reduce_scatter_tensor(
+            state.shard_buffer,
+            state.grad_buffer,
             op=dist.ReduceOp.AVG,
             group=self.dp_group,
             async_op=True,
         )
+        return _ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad)
 
     def materialize_model(self) -> None:
         self._materialized_buffers.clear()
@@ -408,21 +447,66 @@ class Zero3Plugin(RuntimePlugin):
 
     def _wait_all_grad_sync(self) -> None:
         for bucket in self.buckets:
-            if bucket.grad_handle is None:
+            waited = False
+            for state in bucket.exec_states:
+                if state.grad_handle is None:
+                    continue
+                state.grad_handle.wait()
+                state.grad_handle = None
+                waited = True
+            if not waited:
                 raise RuntimeError("ZeRO3 bucket grad handle is None after backward")
-            bucket.grad_handle.wait()
             self._free_full_params(bucket)
 
     def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
         self._materialized_buffers.clear()
         for bucket in self.buckets:
             if grad_accum_start:
-                bucket.grad_buffer.zero_()
-            bucket.pending = len(bucket.params) if grad_accum_end else 0
-            bucket.attached = False
-            bucket.grad_handle = None
-            bucket.fwd_handle = None
-            bucket.bwd_handle = None
+                if bucket.local_param.grad is None:
+                    bucket.local_param.grad = torch.zeros_like(bucket.local_param.data)
+                else:
+                    bucket.local_param.grad.zero_()
+            for state in bucket.exec_states:
+                if grad_accum_start:
+                    state.grad_handle = None
+            backward_state = self._exec_state(bucket, _ExecDirection.BACKWARD)
+            if backward_state.grad_handle is not None:
+                backward_state.grad_handle.wait()
+                backward_state.grad_handle = None
+            backward_state.grad_buffer.zero_()
+            backward_state.shard_buffer.zero_()
+            backward_state.pending = len(bucket.params)
+            backward_state.attached = False
+            backward_state.backward_materialized = False
 
     def _padded_len(self, numel: int) -> int:
         return (numel + self.world_size - 1) // self.world_size * self.world_size
+
+    def _exec_state(self, bucket: _Bucket, direction: _ExecDirection) -> _BucketExecState:
+        if len(bucket.exec_states) == 1:
+            return bucket.exec_states[0]
+        assert self.runtime is not None
+        context = self.runtime.state.step_context
+        if direction == _ExecDirection.FORWARD:
+            slot = context.pp_fwd_microbatch_idx
+        elif direction == _ExecDirection.BACKWARD:
+            slot = context.pp_bwd_microbatch_idx
+        else:
+            raise ValueError(f"unknown ZeRO3 execution direction={direction}")
+        return bucket.exec_states[slot]
+
+    def _uses_pp_execute_states(self) -> bool:
+        return bool(self.buckets) and len(self.buckets[0].exec_states) > 1
+
+
+def _iter_tensors(obj):
+    if torch.is_tensor(obj):
+        yield obj
+        return
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            yield from _iter_tensors(item)
+        return
+    if isinstance(obj, dict):
+        for item in obj.values():
+            yield from _iter_tensors(item)

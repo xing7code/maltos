@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--zero3-disable-prefetch", action="store_true")
     return parser.parse_args()
 
 
@@ -98,7 +99,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     local_batch_size = args.batch_size // args.dp_size
     local_tokens = tokens.narrow(0, dp_idx * local_batch_size, local_batch_size).contiguous()
 
-    plugins, zero3 = _make_plugins(args.case)
+    plugins, zero3 = _make_plugins(args)
     core = RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=1, ep=1),
         plan=ParallelPlan(pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches)),
@@ -154,7 +155,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if zero3 is not None:
         zero3.reshard_model()
     dist.destroy_process_group()
-def _make_plugins(case: str):
+def _make_plugins(args: argparse.Namespace):
+    case = args.case
     zero3: Zero3Plugin | None = None
     if case == "pp":
         return [PipelineParallelPlugin()], zero3
@@ -165,7 +167,10 @@ def _make_plugins(case: str):
     if case == "pp_zero2":
         return [PipelineParallelPlugin(), Zero2Plugin(bucket_mb_size=0)], zero3
     if case == "pp_zero3":
-        zero3 = Zero3Plugin(wrap_cls={torch.nn.Linear, torch.nn.Embedding, RmsNorm})
+        zero3 = Zero3Plugin(
+            wrap_cls={torch.nn.Linear, torch.nn.Embedding, RmsNorm},
+            enable_prefetch=not args.zero3_disable_prefetch,
+        )
         return [PipelineParallelPlugin(), zero3], zero3
     if case == "pp_tp":
         return [TensorParallelPlugin(), PipelineParallelPlugin()], zero3

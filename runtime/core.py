@@ -48,39 +48,46 @@ class StepContext:
             raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
         if self.pp_num_microbatches < 1:
             raise ValueError(f"pp_num_microbatches must be >= 1, got {self.pp_num_microbatches}")
+        if not 0 <= self.pp_fwd_microbatch_idx < self.pp_num_microbatches:
+            raise ValueError(
+                "pp_fwd_microbatch_idx must be within [0, pp_num_microbatches), "
+                f"got idx={self.pp_fwd_microbatch_idx}, count={self.pp_num_microbatches}"
+            )
+        if not 0 <= self.pp_bwd_microbatch_idx < self.pp_num_microbatches:
+            raise ValueError(
+                "pp_bwd_microbatch_idx must be within [0, pp_num_microbatches), "
+                f"got idx={self.pp_bwd_microbatch_idx}, count={self.pp_num_microbatches}"
+            )
 
     @property
     def accum_start(self) -> bool:
-        return self.microbatch_idx == 0 and self.pp_bwd_microbatch_idx == 0
+        return self.microbatch_idx == 0 and self.pp_bwd_microbatch_idx == (self.pp_num_microbatches - 1)
 
     @property
     def is_step_boundary(self) -> bool:
         return (
             ((self.microbatch_idx + 1) % self.grad_accum_steps) == 0
-            and self.pp_bwd_microbatch_idx == (self.pp_num_microbatches - 1)
+            and self.pp_bwd_microbatch_idx == 0
         )
 
     @property
     def loss_divisor(self) -> float:
         return float(self.grad_accum_steps)
 
-    def reset_pp_microbatches(self, count: int = 1) -> None:
-        if count < 1:
-            raise ValueError(f"pp_num_microbatches must be >= 1, got {count}")
-        self.pp_fwd_microbatch_idx = 0
-        self.pp_bwd_microbatch_idx = 0
-        self.pp_num_microbatches = count
-
     def advance_pp_forward(self) -> None:
         if self.pp_fwd_microbatch_idx + 1 < self.pp_num_microbatches:
             self.pp_fwd_microbatch_idx += 1
 
     def advance_pp_backward(self) -> None:
-        if self.pp_bwd_microbatch_idx + 1 < self.pp_num_microbatches:
-            self.pp_bwd_microbatch_idx += 1
+        if self.pp_bwd_microbatch_idx > 0:
+            self.pp_bwd_microbatch_idx -= 1
 
-    def advance_micro_step(self) -> None:
+    def advance_micro_step(self) -> bool:
+        should_step = self.is_step_boundary
         self.microbatch_idx = (self.microbatch_idx + 1) % self.grad_accum_steps
+        self.pp_fwd_microbatch_idx = 0
+        self.pp_bwd_microbatch_idx = self.pp_num_microbatches - 1
+        return should_step
 
     def advance_step(self) -> None:
         self.step += 1
@@ -131,7 +138,12 @@ class RuntimeCore:
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
             raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
-        self.state.step_context = StepContext(grad_accum_steps=self.grad_accum_steps)
+        pp_num_microbatches = self.plan.pp_schedule.microbatches
+        self.state.step_context = StepContext(
+            grad_accum_steps=self.grad_accum_steps,
+            pp_num_microbatches=pp_num_microbatches,
+            pp_bwd_microbatch_idx=pp_num_microbatches - 1,
+        )
         self._validate_mesh_and_plan()
         if self.group_manager is None:
             self.group_manager = ProcessGroupManager.from_mesh(self.mesh)
@@ -164,10 +176,9 @@ class RuntimeCore:
         if tokens is not None:
             self.state.metadata["tokens"] = tokens
         context = self.state.step_context
-        should_step = context.is_step_boundary
         self._run_phase(RuntimePhase.PRE_MICROBATCH)
         loss = self.get_step_runner()(batch)
-        context.advance_micro_step()
+        should_step = context.advance_micro_step()
         return loss, should_step
 
     def _run_step_impl(self, batch: Any) -> torch.Tensor:
