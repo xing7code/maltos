@@ -55,6 +55,9 @@ for c in tp_sp tp_sp_ddp_sync tp_sp_ddp_async tp_sp_ddp_bucket tp_sp_zero1 tp_sp
   "${PYTHON_BIN}" tests/tiny_transformer_runtime_core_integration.py --case "${c}"
 done
 
+echo "=== tiny transformer full-stack equivalence ==="
+"${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py
+
 echo "=== tp+sp+zero3+bf16+clip checkpoint resume ==="
 "${PYTHON_BIN}" tests/tiny_transformer_tp_sp_zero3_bf16_clip_checkpoint_resume.py
 

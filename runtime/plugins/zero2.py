@@ -74,7 +74,12 @@ class Zero2Plugin(RuntimePlugin):
         self,
         bucket_mb_size: int = 25,
     ):
-        super().__init__(id=PluginId.ZERO2, name="zero2", owns_optimizer=True)
+        super().__init__(
+            id=PluginId.ZERO2,
+            name="zero2",
+            owns_optimizer=True,
+            runs_after={PluginId.PP, PluginId.TP, PluginId.SP},
+        )
         self.bucket_byte_size = bucket_mb_size * 1024 * 1024
         self.dp_group: dist.ProcessGroup | None = None
         self.world_size = 1

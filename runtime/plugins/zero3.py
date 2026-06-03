@@ -91,7 +91,12 @@ class Zero3Plugin(RuntimePlugin):
         wrap_cls: set[type[nn.Module]] | None = None,
         enable_prefetch: bool = True,
     ):
-        super().__init__(id=PluginId.ZERO3, name="zero3", owns_optimizer=True)
+        super().__init__(
+            id=PluginId.ZERO3,
+            name="zero3",
+            owns_optimizer=True,
+            runs_after={PluginId.PP, PluginId.TP, PluginId.SP},
+        )
         self.wrap_cls = set(wrap_cls or {nn.Linear})
         self.enable_prefetch = enable_prefetch
         self.dp_group: dist.ProcessGroup | None = None
