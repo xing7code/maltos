@@ -167,7 +167,7 @@ class RuntimeCore:
             self.state.metadata["tokens"] = tokens
         context = self.state.step_context
         self._run_phase(RuntimePhase.PRE_MICROBATCH)
-        loss = self.get_step_runner()(batch)
+        loss = self.get_step_runner()(self.state.batch)
         should_step = context.advance_micro_step()
         return loss, should_step
 

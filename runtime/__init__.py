@@ -6,12 +6,20 @@ from .core import (
     StepRunnerFn,
 )
 from .mesh import MeshAxis, MeshConfig, ProcessGroupManager
-from .plugin import MetricValue, PipelineParallelizableModule, PluginId, RuntimePlugin, TpSpParallelizableModule
+from .plugin import (
+    ContextParallelizableModule,
+    MetricValue,
+    PipelineParallelizableModule,
+    PluginId,
+    RuntimePlugin,
+    TpSpParallelizableModule,
+)
 
 __all__ = [
     "MetricValue",
     "MeshAxis",
     "MeshConfig",
+    "ContextParallelizableModule",
     "PipelineParallelizableModule",
     "PluginId",
     "ProcessGroupManager",

@@ -23,6 +23,7 @@ from parallel import ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
 from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
+from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ddp import DataParallelPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
@@ -48,16 +49,23 @@ _STEP_ATOL = 1e-5
 _LR = 1e-2
 
 
+def _step_atol(args: argparse.Namespace) -> float:
+    if args.cp_size > 1:
+        return 1e-4
+    return _STEP_ATOL
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--case",
-        choices=("pp", "pp_ddp_sync", "pp_zero1", "pp_zero2", "pp_zero3", "pp_tp", "pp_tp_sp"),
+        choices=("pp", "pp_ddp_sync", "pp_zero1", "pp_zero2", "pp_zero3", "pp_tp", "pp_tp_sp", "cp_pp"),
         default="pp",
     )
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--pp-size", type=int, default=2)
+    parser.add_argument("--cp-size", type=int, default=1)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--pp-microbatches", type=int, default=2)
     parser.add_argument("--pp-schedule", choices=("afab", "1f1b"), default="afab")
@@ -85,8 +93,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         rank=rank,
         world_size=args.world_size,
     )
-    if args.world_size != args.dp_size * args.pp_size * args.tp_size:
-        raise ValueError("PP equivalence test expects world_size == dp_size * pp_size * tp_size")
+    if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
+        raise ValueError("PP equivalence test expects world_size == dp_size * pp_size * cp_size * tp_size")
 
     baseline_loss, baseline_params = _run_baseline(rank, args)
 
@@ -96,13 +104,13 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     if args.batch_size % args.dp_size != 0:
         raise ValueError("batch_size must be divisible by dp_size")
-    dp_idx = rank // (args.pp_size * args.tp_size)
+    dp_idx = rank // (args.pp_size * args.cp_size * args.tp_size)
     local_batch_size = args.batch_size // args.dp_size
     local_tokens = tokens.narrow(0, dp_idx * local_batch_size, local_batch_size).contiguous()
 
     plugins, zero3 = _make_plugins(args)
     core = RuntimeCore(
-        mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=1, ep=1),
+        mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=1),
         plan=ParallelPlan(pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches)),
         model=pp_model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
@@ -130,7 +138,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
             local_param_name = name
 
     dp_group = core.get_group(MeshAxis.DP)
+    cp_group = core.get_group(MeshAxis.CP)
     avg_loss = runtime_loss.detach().clone()
+    if cp_group is not None:
+        dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM, group=cp_group)
     if dp_group is not None:
         dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG, group=dp_group)
 
@@ -145,10 +156,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         print(f"Baseline loss    : {baseline_loss:.6f}")
         print(f"RuntimeCore PP   : {avg_loss.item():.6f}")
         print(f"Loss diff        : {loss_diff_tensor.item():.2e}  (atol={_LOSS_ATOL:.2e})")
-        print(f"Local param diff : {param_diff_tensor.item():.2e}  ({local_param_name}, atol={_STEP_ATOL:.2e})")
+        print(f"Local param diff : {param_diff_tensor.item():.2e}  ({local_param_name}, atol={_step_atol(args):.2e})")
         if loss_diff_tensor.item() > _LOSS_ATOL:
             raise AssertionError(f"PP loss equivalence failed: diff={loss_diff_tensor.item():.2e}")
-        if param_diff_tensor.item() > _STEP_ATOL:
+        if param_diff_tensor.item() > _step_atol(args):
             raise AssertionError(
                 f"PP one-step equivalence failed: param={local_param_name}, diff={param_diff_tensor.item():.2e}"
             )
@@ -162,6 +173,8 @@ def _make_plugins(args: argparse.Namespace):
     zero3: Zero3Plugin | None = None
     if case == "pp":
         return [PipelineParallelPlugin(schedule=args.pp_schedule)], zero3
+    if case == "cp_pp":
+        return [ContextParallelPlugin(), PipelineParallelPlugin(schedule=args.pp_schedule)], zero3
     if case == "pp_ddp_sync":
         return [PipelineParallelPlugin(schedule=args.pp_schedule), DataParallelPlugin(async_op=False)], zero3
     if case == "pp_zero1":

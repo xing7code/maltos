@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from parallel.context import ContextParallelSpec
 from parallel.pipeline import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from utils.logging import debug_log
@@ -20,8 +21,9 @@ class CausalSelfAttention(nn.Module):
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.kv_proj = nn.Linear(dim, 2*self.head_dim*self.n_kv_heads, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.attn_core = _LocalCausalAttentionCore()
 
-    def forward(self, x, cos=None, sin=None):
+    def forward(self, x, cos=None, sin=None, position_offset: int = 0):
         debug_log(3, f"layer: {self._get_name()} input shape={x.size()}")
         b, s, d = x.size()
         # use -1 for n_heads, n_kv_heads, this dim can be sharded for TP.
@@ -32,15 +34,23 @@ class CausalSelfAttention(nn.Module):
         if self.n_heads != self.n_kv_heads:
             k = k.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1)
             v = v.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1)
-        logits = (q @ k.transpose(-1,-2)) / self.head_dim ** 0.5
-        mask = torch.ones(s, s, device=x.device).triu(1).bool()
-        logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0), torch.finfo(logits.dtype).min)
-        scores = F.softmax(logits, dim=-1)
+        vo = self.attn_core(q, k, v, position_offset)
         # use -1 for last dim, it can be different than d for TP.
-        out = (scores @ v).transpose(1, 2).contiguous().view(b, s, -1)
+        out = vo.transpose(1, 2).contiguous().view(b, s, -1)
         output = self.o_proj(out)
         debug_log(3, f"layer: {self._get_name()}, output shape={output.size()}")
         return output
+
+
+class _LocalCausalAttentionCore(nn.Module):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, position_offset: int) -> torch.Tensor:
+        del position_offset
+        logits = (q @ k.transpose(-1, -2)) / q.size(-1) ** 0.5
+        seq_len = q.size(-2)
+        mask = torch.ones(seq_len, seq_len, device=q.device).triu(1).bool()
+        logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0), torch.finfo(logits.dtype).min)
+        scores = F.softmax(logits, dim=-1)
+        return scores @ v
 
 
 class MLP(nn.Module):
@@ -78,8 +88,8 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(dim, hidden_size)
         self.norm2 = RmsNorm(dim, eps)
     
-    def forward(self, x, cos=None, sin=None):
-        x = self.attn(self.norm1(x), cos, sin) + x
+    def forward(self, x, cos=None, sin=None, position_offset: int = 0):
+        x = self.attn(self.norm1(x), cos, sin, position_offset=position_offset) + x
         x = self.mlp(self.norm2(x)) + x
         return x
 
@@ -113,12 +123,18 @@ class TinyTransformer(nn.Module):
             input_ids = batch.get("input_ids")
             hidden_states = batch.get("hidden_states")
             labels = batch.get("labels")
+            position_offset = int(batch.get("position_offset", 0))
+            loss_weight = batch.get("loss_weight")
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
             hidden_states = None
+            position_offset = 0
+            loss_weight = None
         else:
             input_ids, labels = batch, None
             hidden_states = None
+            position_offset = 0
+            loss_weight = None
 
         if hidden_states is not None:
             x = hidden_states
@@ -129,9 +145,9 @@ class TinyTransformer(nn.Module):
                 raise ValueError("TinyTransformer PP non-first stage requires hidden_states input")
             x = self.embed(input_ids)
         b, s, d = x.size()
-        cos, sin = self.rope(0, s)
+        cos, sin = self.rope(position_offset, position_offset + s)
         for layer in self.layers:
-            x = layer(x, cos, sin)
+            x = layer(x, cos, sin, position_offset=position_offset)
         if self.norm is None or self.lm_head is None:
             return x
         x = self.norm(x)
@@ -147,6 +163,8 @@ class TinyTransformer(nn.Module):
             labels.contiguous().view(-1),
             ignore_index=-100,
         )
+        if loss_weight is not None:
+            loss = loss * float(loss_weight)
         return loss
 
     def pipeline_parallel_spec(self) -> PipelineParallelSpec:
@@ -154,6 +172,11 @@ class TinyTransformer(nn.Module):
             head_layers=["embed"],
             pipe_layers=["layers"],
             tail_layers=["norm", "lm_head"],
+        )
+
+    def context_parallel_spec(self) -> ContextParallelSpec:
+        return ContextParallelSpec(
+            attention_paths=[f"layers.{i}.attn" for i in range(len(self.layers))],
         )
 
 class TinyTransformerTp(TinyTransformer):

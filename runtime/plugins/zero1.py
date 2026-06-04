@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 
 import torch
 import torch.distributed as dist
@@ -41,6 +42,7 @@ class _Bucket:
     local_param: nn.Parameter
     pending: int
     handle: dist.Work | _AllReduceShardWork | None = None
+    cp_handle: dist.Work | None = None
 
 
 class Zero1Plugin(RuntimePlugin):
@@ -54,10 +56,11 @@ class Zero1Plugin(RuntimePlugin):
             id=PluginId.ZERO1,
             name="zero1",
             owns_optimizer=True,
-            runs_after={PluginId.PP, PluginId.TP, PluginId.SP},
+            runs_after={PluginId.PP, PluginId.CP, PluginId.TP, PluginId.SP},
         )
         self.bucket_byte_size = bucket_mb_size * 1024 * 1024
         self.dp_group: dist.ProcessGroup | None = None
+        self.cp_group: dist.ProcessGroup | None = None
         self.world_size = 1
         self.rank = 0
         self.data_buffer: torch.Tensor | None = None
@@ -65,10 +68,13 @@ class Zero1Plugin(RuntimePlugin):
         self.buckets: list[_Bucket] = []
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+        self._cp_sync_thread: threading.Thread | None = None
+        self._cp_sync_cond = threading.Condition()
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
         self.dp_group = self.runtime.get_group(MeshAxis.DP)
+        self.cp_group = self.runtime.get_group(MeshAxis.CP)
         if self.dp_group is None:
             raise ValueError("Zero1Plugin requires mesh.dp > 1")
         self.world_size = dist.get_world_size(self.dp_group)
@@ -86,10 +92,19 @@ class Zero1Plugin(RuntimePlugin):
                 grad_accum_start=context.accum_start,
                 grad_accum_end=context.is_step_boundary,
             )
+            if context.is_step_boundary and self._use_cp_sync_worker():
+                self._maybe_start_cp_sync_worker()
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
-            if self.runtime.state.step_context.is_step_boundary:
-                self._wait_grad_sync()
+            if (
+                self.runtime.state.step_context.is_step_boundary
+                and self.cp_group is not None
+                and dist.get_world_size(self.cp_group) > 1
+                and not self._use_cp_sync_worker()
+            ):
+                self._launch_cp_grad_sync()
+        elif phase == RuntimePhase.PRE_STEP:
+            self._wait_grad_sync()
         elif phase == RuntimePhase.POST_STEP:
             self._gather_updated_params()
         elif phase == RuntimePhase.POST_LOAD:
@@ -160,6 +175,9 @@ class Zero1Plugin(RuntimePlugin):
                 if bucket.local_param.grad is None:
                     bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
                 bucket.handle = self._reduce_scatter_avg(bucket)
+                if self._use_cp_sync_worker():
+                    with self._cp_sync_cond:
+                        self._cp_sync_cond.notify_all()
 
         return hook
 
@@ -201,11 +219,64 @@ class Zero1Plugin(RuntimePlugin):
             for handle in handles:
                 handle.wait()
 
-    def _wait_grad_sync(self) -> None:
+    def _maybe_start_cp_sync_worker(self) -> None:
+        if self.cp_group is None or dist.get_world_size(self.cp_group) <= 1:
+            self._cp_sync_thread = None
+            return
+        self._cp_sync_thread = threading.Thread(target=self._cp_sync_worker, daemon=True)
+        self._cp_sync_thread.start()
+
+    def _cp_sync_worker(self) -> None:
+        assert self.cp_group is not None
+        for bucket in self.buckets:
+            with self._cp_sync_cond:
+                self._cp_sync_cond.wait_for(lambda: bucket.handle is not None)
+            if bucket.handle is None:
+                raise RuntimeError("ZeRO1 bucket handle is None after backward")
+            bucket.handle.wait()
+            bucket.handle = None
+            if bucket.local_param.grad is None:
+                continue
+            bucket.cp_handle = dist.all_reduce(
+                bucket.local_param.grad,
+                op=dist.ReduceOp.SUM,
+                group=self.cp_group,
+                async_op=True,
+            )
+
+    def _launch_cp_grad_sync(self) -> None:
         for bucket in self.buckets:
             if bucket.handle is None:
                 raise RuntimeError("ZeRO1 bucket handle is None after backward")
             bucket.handle.wait()
+            bucket.handle = None
+            if self.cp_group is None or dist.get_world_size(self.cp_group) <= 1:
+                continue
+            if bucket.local_param.grad is None:
+                continue
+            bucket.cp_handle = dist.all_reduce(
+                bucket.local_param.grad,
+                op=dist.ReduceOp.SUM,
+                group=self.cp_group,
+                async_op=True,
+            )
+
+    def _wait_grad_sync(self) -> None:
+        if self._cp_sync_thread is not None:
+            self._cp_sync_thread.join()
+            self._cp_sync_thread = None
+        for bucket in self.buckets:
+            if bucket.cp_handle is None:
+                if bucket.handle is None:
+                    raise RuntimeError("ZeRO1 bucket handle is None after backward")
+                bucket.handle.wait()
+                bucket.handle = None
+                continue
+            bucket.cp_handle.wait()
+            bucket.cp_handle = None
+
+    def _use_cp_sync_worker(self) -> bool:
+        return self.dp_group is not None and dist.get_backend(self.dp_group) != "gloo"
 
     def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
         assert self.grad_buffer is not None
@@ -214,6 +285,7 @@ class Zero1Plugin(RuntimePlugin):
         for bucket in self.buckets:
             bucket.pending = len(bucket.params) if grad_accum_end else 0
             bucket.handle = None
+            bucket.cp_handle = None
 
     def _sync_local_params_from_data_buffer(self) -> None:
         assert self.data_buffer is not None

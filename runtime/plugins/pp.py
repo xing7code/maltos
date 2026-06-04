@@ -212,8 +212,12 @@ class PipelineParallelPlugin(RuntimePlugin):
             recv_work.wait()
             input_activation.requires_grad_(True)
             model_input = {"hidden_states": input_activation}
+            if isinstance(micro_batch, dict) and "position_offset" in micro_batch:
+                model_input["position_offset"] = micro_batch["position_offset"]
             if self.next_global_rank is None:
                 model_input["labels"] = _extract_labels(micro_batch)
+                if isinstance(micro_batch, dict) and "loss_weight" in micro_batch:
+                    model_input["loss_weight"] = micro_batch["loss_weight"]
 
         self.runtime._forward_step_impl(model_input)
         state.input_activation = input_activation
@@ -331,9 +335,9 @@ class PipelineParallelPlugin(RuntimePlugin):
         mesh = self.runtime.mesh
         if mesh.pp <= 1:
             raise ValueError("PipelineParallelPlugin requires mesh.pp > 1")
-        if mesh.cp != 1 or mesh.ep != 1:
+        if mesh.ep != 1:
             raise ValueError(
-                "PipelineParallelPlugin currently requires cp=ep=1, "
+                "PipelineParallelPlugin currently requires ep=1, "
                 f"got dp={mesh.dp} tp={mesh.tp} cp={mesh.cp} ep={mesh.ep}"
             )
         unsupported = set()

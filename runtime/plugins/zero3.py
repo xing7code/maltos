@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import threading
 
 import torch
 import torch.distributed as dist
@@ -67,6 +68,8 @@ class _Bucket:
     logical_names: list[str]
     prev_bucket: "_Bucket | None" = None
     next_bucket: "_Bucket | None" = None
+    cp_handle: dist.Work | None = None
+    cp_pending_states: int = 0
     exec_states: list["_BucketExecState"] = field(default_factory=list)
 
 
@@ -95,11 +98,12 @@ class Zero3Plugin(RuntimePlugin):
             id=PluginId.ZERO3,
             name="zero3",
             owns_optimizer=True,
-            runs_after={PluginId.PP, PluginId.TP, PluginId.SP},
+            runs_after={PluginId.PP, PluginId.CP, PluginId.TP, PluginId.SP},
         )
         self.wrap_cls = set(wrap_cls or {nn.Linear})
         self.enable_prefetch = enable_prefetch
         self.dp_group: dist.ProcessGroup | None = None
+        self.cp_group: dist.ProcessGroup | None = None
         self.world_size = 1
         self.rank = 0
         self.buckets: list[_Bucket] = []
@@ -111,6 +115,8 @@ class Zero3Plugin(RuntimePlugin):
         self._last_bucket: _Bucket | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+        self._cp_sync_thread: threading.Thread | None = None
+        self._cp_sync_cond = threading.Condition()
 
     def bind(self, runtime) -> None:
         super().bind(runtime)
@@ -121,6 +127,7 @@ class Zero3Plugin(RuntimePlugin):
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
         self.dp_group = self.runtime.get_group(MeshAxis.DP)
+        self.cp_group = self.runtime.get_group(MeshAxis.CP)
         if self.dp_group is None:
             raise ValueError("Zero3Plugin requires mesh.dp > 1")
         self.world_size = dist.get_world_size(self.dp_group)
@@ -144,12 +151,21 @@ class Zero3Plugin(RuntimePlugin):
                 grad_accum_start=context.accum_start,
                 grad_accum_end=context.is_step_boundary,
             )
+            if context.is_step_boundary and self._use_cp_sync_worker():
+                self._maybe_start_cp_sync_worker()
             if self.enable_prefetch and self.bucket_order_checked and self._last_bucket is not None:
                 self._prefetch_bucket(self._last_bucket, direction=_ExecDirection.BACKWARD)
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
-            if self.runtime.state.step_context.is_step_boundary:
-                self._wait_all_grad_sync()
+            if (
+                self.runtime.state.step_context.is_step_boundary
+                and self.cp_group is not None
+                and dist.get_world_size(self.cp_group) > 1
+                and not self._use_cp_sync_worker()
+            ):
+                self._launch_cp_grad_sync()
+        elif phase == RuntimePhase.PRE_STEP:
+            self._wait_grad_sync()
 
     def _prepare_buckets(self, model: nn.Module) -> None:
         visited: set[str] = set()
@@ -275,6 +291,10 @@ class Zero3Plugin(RuntimePlugin):
                 if bucket.local_param.grad is None:
                     bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
                 state.grad_handle = self._reduce_scatter_avg(bucket, state)
+                if self._use_cp_sync_worker():
+                    with self._cp_sync_cond:
+                        bucket.cp_pending_states -= 1
+                        self._cp_sync_cond.notify_all()
 
         return hook
 
@@ -450,7 +470,34 @@ class Zero3Plugin(RuntimePlugin):
             self._free_full_params(bucket)
         return True
 
-    def _wait_all_grad_sync(self) -> None:
+    def _maybe_start_cp_sync_worker(self) -> None:
+        if self.cp_group is None or dist.get_world_size(self.cp_group) <= 1:
+            self._cp_sync_thread = None
+            return
+        self._cp_sync_thread = threading.Thread(target=self._cp_sync_worker, daemon=True)
+        self._cp_sync_thread.start()
+
+    def _cp_sync_worker(self) -> None:
+        assert self.cp_group is not None
+        for bucket in self.buckets:
+            with self._cp_sync_cond:
+                self._cp_sync_cond.wait_for(lambda: bucket.cp_pending_states == 0)
+            for state in bucket.exec_states:
+                if state.grad_handle is None:
+                    raise RuntimeError("ZeRO3 bucket grad handle is None after backward")
+                state.grad_handle.wait()
+                state.grad_handle = None
+            self._free_full_params(bucket)
+            if bucket.local_param.grad is None:
+                continue
+            bucket.cp_handle = dist.all_reduce(
+                bucket.local_param.grad,
+                op=dist.ReduceOp.SUM,
+                group=self.cp_group,
+                async_op=True,
+            )
+
+    def _launch_cp_grad_sync(self) -> None:
         for bucket in self.buckets:
             waited = False
             for state in bucket.exec_states:
@@ -460,8 +507,44 @@ class Zero3Plugin(RuntimePlugin):
                 state.grad_handle = None
                 waited = True
             if not waited:
-                raise RuntimeError("ZeRO3 bucket grad handle is None after backward")
+                self._free_full_params(bucket)
+                continue
             self._free_full_params(bucket)
+            if self.cp_group is None or dist.get_world_size(self.cp_group) <= 1:
+                continue
+            if bucket.local_param.grad is None:
+                continue
+            bucket.cp_handle = dist.all_reduce(
+                bucket.local_param.grad,
+                op=dist.ReduceOp.SUM,
+                group=self.cp_group,
+                async_op=True,
+            )
+
+    def _wait_grad_sync(self) -> None:
+        if self._cp_sync_thread is not None:
+            self._cp_sync_thread.join()
+            self._cp_sync_thread = None
+        for bucket in self.buckets:
+            if bucket.cp_handle is None:
+                waited = False
+                for state in bucket.exec_states:
+                    if state.grad_handle is None:
+                        continue
+                    state.grad_handle.wait()
+                    state.grad_handle = None
+                    waited = True
+                if not waited:
+                    self._free_full_params(bucket)
+                    continue
+                self._free_full_params(bucket)
+                continue
+            bucket.cp_handle.wait()
+            bucket.cp_handle = None
+            self._free_full_params(bucket)
+
+    def _use_cp_sync_worker(self) -> bool:
+        return self.dp_group is not None and dist.get_backend(self.dp_group) != "gloo"
 
     def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
         self._materialized_buffers.clear()
@@ -471,6 +554,8 @@ class Zero3Plugin(RuntimePlugin):
                     bucket.local_param.grad = torch.zeros_like(bucket.local_param.data)
                 else:
                     bucket.local_param.grad.zero_()
+                bucket.cp_handle = None
+            bucket.cp_pending_states = len(bucket.exec_states) if grad_accum_end else 0
             for state in bucket.exec_states:
                 if grad_accum_start:
                     state.grad_handle = None

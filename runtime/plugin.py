@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import torch
 import torch.nn as nn
 
+from parallel.context import ContextParallelSpec
 from parallel.pipeline import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec
 from runtime.mesh import MeshAxis
@@ -26,6 +27,11 @@ class TpSpParallelizableModule(Protocol):
 @runtime_checkable
 class PipelineParallelizableModule(Protocol):
     def pipeline_parallel_spec(self) -> PipelineParallelSpec: ...
+
+
+@runtime_checkable
+class ContextParallelizableModule(Protocol):
+    def context_parallel_spec(self) -> ContextParallelSpec: ...
 
 
 @runtime_checkable

@@ -27,9 +27,11 @@ from models import (
 from models.llama import LlamaRMSNorm
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
+from parallel.context import ContextParallelAttentionCoreType
 from parallel.schedule import PipelineScheduleConfig
 from runtime import MeshConfig, RuntimeCore
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
+from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.perf_metrics import PerfMetricsPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
@@ -96,6 +98,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--pp-size", type=int, default=1)
     parser.add_argument("--pp-microbatches", type=int, default=1)
+    parser.add_argument("--cp-size", type=int, default=1)
+    parser.add_argument(
+        "--cp-attn-core",
+        type=str,
+        default="all_gather_kv",
+        choices=tuple(core.value for core in ContextParallelAttentionCoreType),
+    )
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--zero-stage", type=int, default=0, choices=(0, 1, 2, 3))
     parser.add_argument("--use-sp", action=argparse.BooleanOptionalAction, default=False)
@@ -150,13 +159,15 @@ def main() -> None:
     device = _select_device()
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    expected_world_size = args.dp_size * args.pp_size * args.tp_size
+    expected_world_size = args.dp_size * args.pp_size * args.cp_size * args.tp_size
     if world_size != expected_world_size:
         raise ValueError(
-            f"world_size={world_size} must equal dp_size * pp_size * tp_size={expected_world_size}"
+            f"world_size={world_size} must equal dp_size * pp_size * cp_size * tp_size={expected_world_size}"
         )
     if args.use_sp and args.tp_size <= 1:
         raise ValueError("--use-sp requires --tp-size > 1")
+    if args.cp_size > 1 and args.seq_len % args.cp_size != 0:
+        raise ValueError("--cp-size requires --seq-len divisible by cp_size for CP v0")
     if args.zero_stage > 0 and args.dp_size <= 1:
         raise ValueError("--zero-stage > 0 requires --dp-size > 1")
     if args.zero_stage > 0 and args.ddp_mode is not None:
@@ -174,7 +185,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
-    dp_rank = rank // (args.pp_size * args.tp_size)
+    dp_rank = rank // (args.pp_size * args.cp_size * args.tp_size)
     data_paths = _expand_data_paths(args.data)
     model = _build_model(args)
     initial_trainable_params = _count_trainable_params(model)
@@ -279,6 +290,8 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         plugins.append(TensorParallelPlugin())
     if args.use_sp:
         plugins.append(SequenceParallelPlugin())
+    if args.cp_size > 1:
+        plugins.append(ContextParallelPlugin())
     if args.pp_size > 1:
         plugins.append(PipelineParallelPlugin())
     if args.zero_stage == 0:
@@ -318,9 +331,10 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         )
 
     return RuntimeCore(
-        mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=1, ep=1),
+        mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=1),
         plan=ParallelPlan(
             zero_stage=args.zero_stage,
+            cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
         ),
         device=device,
@@ -467,6 +481,8 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("parallel", "dp_size"): "dp_size",
         ("parallel", "pp_size"): "pp_size",
         ("parallel", "pp_microbatches"): "pp_microbatches",
+        ("parallel", "cp_size"): "cp_size",
+        ("parallel", "cp_attn_core"): "cp_attn_core",
         ("parallel", "tp_size"): "tp_size",
         ("parallel", "use_sp"): "use_sp",
         ("parallel", "zero_stage"): "zero_stage",

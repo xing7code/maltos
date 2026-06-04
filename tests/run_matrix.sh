@@ -38,10 +38,12 @@ echo "=== tp checkpoint manifest ==="
 "${PYTHON_BIN}" tests/tiny_transformer_tp_checkpoint_manifest.py
 
 echo "=== tiny transformer pp equivalence ==="
-for c in pp pp_ddp_sync pp_zero1 pp_zero2 pp_zero3 pp_tp pp_tp_sp; do
+for c in pp pp_ddp_sync pp_zero1 pp_zero2 pp_zero3 pp_tp pp_tp_sp cp_pp; do
   echo "--- pp case: ${c} ---"
   if [ "${c}" = "pp" ]; then
     "${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case "${c}" --world-size 2 --dp-size 1 --pp-size 2
+  elif [ "${c}" = "cp_pp" ]; then
+    "${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case "${c}" --world-size 4 --dp-size 1 --pp-size 2 --cp-size 2
   elif [ "${c}" = "pp_tp" ] || [ "${c}" = "pp_tp_sp" ]; then
     "${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case "${c}" --world-size 4 --dp-size 1 --pp-size 2 --tp-size 2
   else
@@ -55,8 +57,24 @@ for c in tp_sp tp_sp_ddp_sync tp_sp_ddp_async tp_sp_ddp_bucket tp_sp_zero1 tp_sp
   "${PYTHON_BIN}" tests/tiny_transformer_runtime_core_integration.py --case "${c}"
 done
 
+echo "=== tiny transformer cp equivalence ==="
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp --world-size 2 --dp-size 1 --cp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_ddp_sync --world-size 4 --dp-size 2 --cp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_ddp_async --world-size 4 --dp-size 2 --cp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_ddp_bucket --world-size 4 --dp-size 2 --cp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_zero1 --world-size 4 --dp-size 2 --cp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_zero2 --world-size 4 --dp-size 2 --cp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_zero3 --world-size 4 --dp-size 2 --cp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp --world-size 4 --dp-size 1 --cp-size 2 --tp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp --world-size 4 --dp-size 1 --cp-size 2 --tp-size 2 --use-sp
+
 echo "=== tiny transformer full-stack equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py
+
+echo "=== tiny transformer latest full-stack combos (afab) ==="
+"${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py --world-size 16 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 2 --zero-stage 1
+"${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py --world-size 16 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 2 --zero-stage 2
+"${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py --world-size 16 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 2 --zero-stage 3
 
 echo "=== tiny transformer pp 1f1b equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_pp_runtime_core_equivalence.py --case pp --pp-schedule 1f1b --world-size 2 --dp-size 1 --pp-size 2
@@ -65,6 +83,7 @@ echo "=== tiny transformer pp 1f1b equivalence ==="
 
 echo "=== tiny transformer full-stack 1f1b equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py --pp-schedule 1f1b
+"${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py --pp-schedule 1f1b --world-size 16 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 2 --zero-stage 3
 
 echo "=== tp+sp+zero3+bf16+clip checkpoint resume ==="
 "${PYTHON_BIN}" tests/tiny_transformer_tp_sp_zero3_bf16_clip_checkpoint_resume.py

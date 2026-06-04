@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .context import ContextParallelAttentionCoreType
 from .schedule import PipelineScheduleConfig
 
 
 @dataclass(frozen=True)
 class ParallelPlan:
     zero_stage: int = 0  # 0, 1, 2, 3
+    cp_attn_core: ContextParallelAttentionCoreType = ContextParallelAttentionCoreType.ALL_GATHER_KV
     pp_schedule: PipelineScheduleConfig = field(default_factory=PipelineScheduleConfig)
 
     def __post_init__(self):

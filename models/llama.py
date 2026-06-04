@@ -9,6 +9,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from models.activation_checkpointing import ActivationCheckpointConfig
+from parallel.context import ContextParallelSpec
 from parallel.pipeline import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 
@@ -54,9 +55,9 @@ class LlamaRotaryEmbedding(nn.Module):
         self.register_buffer("cos", freqs.cos(), persistent=False)
         self.register_buffer("sin", freqs.sin(), persistent=False)
 
-    def forward(self, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        cos = self.cos[:seq_len].unsqueeze(0).unsqueeze(0)
-        sin = self.sin[:seq_len].unsqueeze(0).unsqueeze(0)
+    def forward(self, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
+        cos = self.cos[start:end].unsqueeze(0).unsqueeze(0)
+        sin = self.sin[start:end].unsqueeze(0).unsqueeze(0)
         return cos, sin
 
 
@@ -105,10 +106,11 @@ class LlamaAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.attn_core = _LlamaAttentionCore(config.attention_backend)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, position_offset: int = 0) -> torch.Tensor:
         batch, seq_len, _ = x.shape
-        cos, sin = self.rotary_emb(seq_len)
+        cos, sin = self.rotary_emb(position_offset, position_offset + seq_len)
         cos = cos.to(device=x.device, dtype=x.dtype)
         sin = sin.to(device=x.device, dtype=x.dtype)
         q = self.q_proj(x).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
@@ -119,15 +121,24 @@ class LlamaAttention(nn.Module):
         repeats = q.size(1) // k.size(1)
         k = _repeat_kv(k, repeats)
         v = _repeat_kv(v, repeats)
-        if self.config.attention_backend == "sdpa_auto":
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        elif self.config.attention_backend == "sdpa_flash":
-            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            out = _eager_causal_attention(q, k, v)
-        out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        vo = self.attn_core(q, k, v, position_offset)
+        out = vo.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(out)
+
+
+class _LlamaAttentionCore(nn.Module):
+    def __init__(self, attention_backend: str) -> None:
+        super().__init__()
+        self.attention_backend = attention_backend
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, position_offset: int) -> torch.Tensor:
+        del position_offset
+        if self.attention_backend == "sdpa_auto":
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if self.attention_backend == "sdpa_flash":
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return _eager_causal_attention(q, k, v)
 
 
 class LlamaMLP(nn.Module):
@@ -149,8 +160,8 @@ class LlamaDecoderLayer(nn.Module):
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x))
+    def forward(self, x: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
+        x = x + self.self_attn(self.input_layernorm(x), position_offset=position_offset)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -171,12 +182,18 @@ class LlamaForCausalLM(nn.Module):
             input_ids = batch.get("input_ids")
             hidden_states = batch.get("hidden_states")
             labels = batch.get("labels")
+            position_offset = int(batch.get("position_offset", 0))
+            loss_weight = batch.get("loss_weight")
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
             hidden_states = None
+            position_offset = 0
+            loss_weight = None
         else:
             input_ids, labels = batch, None
             hidden_states = None
+            position_offset = 0
+            loss_weight = None
 
         if hidden_states is not None:
             x = hidden_states
@@ -188,9 +205,9 @@ class LlamaForCausalLM(nn.Module):
             x = self.embed_tokens(input_ids)
         for layer_idx, layer in enumerate(self.layers):
             if self.training and self.config.activation_checkpointing.should_checkpoint_layer(layer_idx):
-                x = checkpoint(layer, x, use_reentrant=False)
+                x = checkpoint(lambda y: layer(y, position_offset=position_offset), x, use_reentrant=False)
             else:
-                x = layer(x)
+                x = layer(x, position_offset=position_offset)
         if self.norm is None or self.lm_head is None:
             return x
         logits = self.lm_head(self.norm(x))
@@ -198,17 +215,25 @@ class LlamaForCausalLM(nn.Module):
             return logits
         if input_ids is not None and labels.shape != input_ids.shape:
             raise ValueError(f"labels shape must match input_ids shape, got {labels.shape} vs {input_ids.shape}")
-        return F.cross_entropy(
+        loss = F.cross_entropy(
             logits.contiguous().view(-1, logits.size(-1)),
             labels.contiguous().view(-1),
             ignore_index=-100,
         )
+        if loss_weight is not None:
+            loss = loss * float(loss_weight)
+        return loss
 
     def pipeline_parallel_spec(self) -> PipelineParallelSpec:
         return PipelineParallelSpec(
             head_layers=["embed_tokens"],
             pipe_layers=["layers"],
             tail_layers=["norm", "lm_head"],
+        )
+
+    def context_parallel_spec(self) -> ContextParallelSpec:
+        return ContextParallelSpec(
+            attention_paths=[f"layers.{i}.self_attn" for i in range(len(self.layers))],
         )
 
     def flops_per_token(self) -> float:
