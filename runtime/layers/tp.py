@@ -61,7 +61,12 @@ class ColumnParallelLinear(nn.Module):
     def forward(self, input):
         output = F.linear(input, self.weight, self.bias)
         if self.gather_output and self.world_size > 1:
-            output = all_gather(output, self.tp_group, -1)
+            output = all_gather(
+                output,
+                self.tp_group,
+                -1,
+                alloc_key=f"tp.column_parallel_linear.{id(self)}.all_gather",
+            )
         return output
 
 
@@ -120,7 +125,12 @@ class RowParallelLinear(nn.Module):
         if self.comm == "all_reduce":
             output = all_reduce(output, self.tp_group, dist.ReduceOp.SUM)
         elif self.comm == "reduce_scatter":
-            output = reduce_scatter(output, self.tp_group, 1)
+            output = reduce_scatter(
+                output,
+                self.tp_group,
+                1,
+                alloc_key=f"tp.row_parallel_linear.{id(self)}.reduce_scatter",
+            )
         if self.bias is not None:
             output = output + self.bias
         return output

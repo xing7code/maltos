@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from runtime.buffer_allocator import allocate_buffer
 from runtime.core import RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
@@ -377,7 +378,12 @@ class Zero3Plugin(RuntimePlugin):
 
     def _materialize_full_params_sync(self, bucket: _Bucket) -> None:
         assert self.dp_group is not None
-        buffer = torch.empty(bucket.buffer_size, dtype=bucket.local_param.dtype, device=bucket.local_param.device)
+        buffer = allocate_buffer(
+            key=f"zero3.materialize_sync.bucket{bucket.index}",
+            shape=(bucket.buffer_size,),
+            dtype=bucket.local_param.dtype,
+            device=bucket.local_param.device,
+        )
         dist.all_gather_into_tensor(
             buffer,
             bucket.local_param.detach().contiguous(),

@@ -1,3 +1,4 @@
+from .buffer_allocator import allocate_buffer
 from .core import (
     RuntimeCore,
     RuntimePhase,
@@ -16,6 +17,7 @@ from .plugin import (
 )
 
 __all__ = [
+    "allocate_buffer",
     "MetricValue",
     "MeshAxis",
     "MeshConfig",

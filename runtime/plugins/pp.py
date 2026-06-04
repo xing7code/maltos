@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from runtime.buffer_allocator import allocate_buffer
 from runtime.core import PpStatus
 from parallel.specs import TpSpParallelSpec
 from runtime.mesh import MeshAxis
@@ -296,14 +297,20 @@ class PipelineParallelPlugin(RuntimePlugin):
 
     def _recv_activation_async(self, batch) -> tuple[torch.Tensor, dist.Work]:
         assert self.prev_global_rank is not None
-        buffer = torch.empty(
-            _activation_shape(
-                batch,
-                self.hidden_size,
-                sequence_parallel_world_size=self.sequence_parallel_world_size,
-            ),
-            device=_model_device(self.runtime.model),
-            dtype=_activation_dtype(self.runtime),
+        assert self.runtime is not None
+        microbatch_idx = self.runtime.state.step_context.pp_cur_microbatch_idx
+        device = _model_device(self.runtime.model)
+        dtype = _activation_dtype(self.runtime)
+        shape = _activation_shape(
+            batch,
+            self.hidden_size,
+            sequence_parallel_world_size=self.sequence_parallel_world_size,
+        )
+        buffer = allocate_buffer(
+            key=f"pp.recv_activation.mb{microbatch_idx}",
+            shape=shape,
+            dtype=dtype,
+            device=device,
         )
         work = dist.irecv(buffer, src=self.prev_global_rank)
         return buffer, work
@@ -316,7 +323,14 @@ class PipelineParallelPlugin(RuntimePlugin):
 
     def _recv_grad_async(self, output_activation: torch.Tensor) -> tuple[torch.Tensor, dist.Work]:
         assert self.next_global_rank is not None
-        grad = torch.empty_like(output_activation)
+        assert self.runtime is not None
+        microbatch_idx = self.runtime.state.step_context.pp_cur_microbatch_idx
+        grad = allocate_buffer(
+            key=f"pp.recv_grad.mb{microbatch_idx}",
+            shape=tuple(output_activation.shape),
+            dtype=output_activation.dtype,
+            device=output_activation.device,
+        )
         work = dist.irecv(grad, src=self.next_global_rank)
         return grad, work
 

@@ -7,6 +7,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from runtime.layers.functional import all_gather
+
 
 @dataclass
 class _ContextParallelMeta:
@@ -19,8 +21,20 @@ class AllGatherKvAttentionCore(nn.Module):
         self.meta = _ContextParallelMeta(group)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, position_offset: int) -> torch.Tensor:
-        gathered_k = _cp_all_gather(k, self.meta.group, comm_dim=2)
-        gathered_v = _cp_all_gather(v, self.meta.group, comm_dim=2)
+        gathered_k = all_gather(
+            k,
+            self.meta.group,
+            comm_dim=2,
+            alloc_key=f"cp.all_gather_kv.{id(self)}.k",
+            backward_reduce_op=dist.ReduceOp.SUM,
+        )
+        gathered_v = all_gather(
+            v,
+            self.meta.group,
+            comm_dim=2,
+            alloc_key=f"cp.all_gather_kv.{id(self)}.v",
+            backward_reduce_op=dist.ReduceOp.SUM,
+        )
         return _eager_cp_causal_attention(q, gathered_k, gathered_v, position_offset=position_offset)
 
 
@@ -41,26 +55,3 @@ def _eager_cp_causal_attention(
     scores = scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(scores.dtype).min)
     probs = F.softmax(scores, dim=-1)
     return torch.matmul(probs, v)
-
-
-class _ContextParallelAllGather(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, group: dist.ProcessGroup, comm_dim: int) -> torch.Tensor:
-        ctx.group = group
-        ctx.comm_dim = comm_dim
-        ctx.rank = dist.get_rank(group)
-        ctx.world_size = dist.get_world_size(group)
-        out = [torch.empty_like(x) for _ in range(ctx.world_size)]
-        dist.all_gather(out, x.contiguous(), group=group)
-        return torch.cat(out, dim=comm_dim)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        per_rank_dim = grad_output.shape[ctx.comm_dim] // ctx.world_size
-        grad = grad_output.narrow(ctx.comm_dim, ctx.rank * per_rank_dim, per_rank_dim).contiguous()
-        dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=ctx.group)
-        return grad, None, None
-
-
-def _cp_all_gather(x: torch.Tensor, group: dist.ProcessGroup, comm_dim: int) -> torch.Tensor:
-    return _ContextParallelAllGather.apply(x, group, comm_dim)

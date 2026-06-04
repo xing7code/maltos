@@ -60,7 +60,7 @@ class SequenceParallelPlugin(RuntimePlugin):
 
     def _register_sequence_hook(self, module: nn.Module, rule: TpSpShardRule) -> None:
         if rule.pre_comm == TpSpComm.ALL_GATHER:
-            module.register_forward_pre_hook(self._make_all_gather_hook(rule.comm_dim))
+            module.register_forward_pre_hook(self._make_all_gather_hook(rule.comm_dim, rule.module_path))
         elif rule.post_comm == TpSpComm.SCATTER:
             module.register_forward_hook(self._make_scatter_hook(rule.comm_dim))
         else:
@@ -70,10 +70,15 @@ class SequenceParallelPlugin(RuntimePlugin):
                 f"pre_comm={rule.pre_comm!r}, post_comm={rule.post_comm!r}"
             )
 
-    def _make_all_gather_hook(self, comm_dim: int):
+    def _make_all_gather_hook(self, comm_dim: int, module_path: str):
         def hook(module, input):
             x, *args = input
-            x = all_gather(x, self.sp_group, comm_dim)
+            x = all_gather(
+                x,
+                self.sp_group,
+                comm_dim,
+                alloc_key=f"sp.{module_path}.all_gather",
+            )
             return (x, *args)
 
         return hook
