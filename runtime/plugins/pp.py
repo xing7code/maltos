@@ -231,8 +231,10 @@ class PipelineParallelPlugin(RuntimePlugin):
         if not torch.is_tensor(self.runtime.state.outputs):
             raise TypeError("non-last PP stage must return Tensor activations")
         assert torch.is_tensor(self.runtime.state.outputs)
-        state.output_activation = self.runtime.state.outputs
-        send_buffer, send_work = self._send_activation_async(self.runtime.state.outputs.detach())
+        boundary_activation = _cast_boundary_activation(self.runtime.state.outputs, self.runtime)
+        self.runtime.state.outputs = boundary_activation
+        state.output_activation = boundary_activation
+        send_buffer, send_work = self._send_activation_async(boundary_activation.detach())
         state.activation_send_buffer = send_buffer
         state.activation_send_work = send_work
         return total_loss
@@ -534,3 +536,10 @@ def _activation_dtype(runtime) -> torch.dtype:
     if first_param is None:
         raise ValueError("PP model must have parameters")
     return first_param.dtype
+
+
+def _cast_boundary_activation(tensor: torch.Tensor, runtime) -> torch.Tensor:
+    target_dtype = _activation_dtype(runtime)
+    if tensor.dtype == target_dtype:
+        return tensor
+    return tensor.to(dtype=target_dtype)
