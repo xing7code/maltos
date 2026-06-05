@@ -53,9 +53,9 @@ workflows.
 | Stateful token-shard dataloader | Supported |
 | Sharded checkpoint save/load | Supported |
 | W&B metric logging and checkpoint artifacts | Supported |
-| Pipeline parallelism | PP v0 supported (pp-only) |
-| Context parallelism | Planned |
-| Expert parallelism | Planned |
+| Pipeline parallelism | Supported |
+| Context parallelism | Supported |
+| Expert parallelism | Supported |
 | LLaMA activation checkpointing | Supported |
 | LLaMA SDPA attention backends | Supported |
 | FlashAttention-specific kernels | Planned |
@@ -143,10 +143,12 @@ optimizer-step boundaries. This keeps gradient accumulation observability
 honest without making checkpoints land mid-step unless explicitly requested by
 tests.
 
-Current PP support is intentionally narrow: decoder-only TinyTransformer/LLaMA
-layer partitioning, runtime-owned optimizer per stage, and pipeline
-microbatching inside `run_step()`. PP v0 does not yet compose with TP/SP, DDP,
-or ZeRO.
+Current PP support is still intentionally narrow in model scope and scheduling
+algorithm: decoder-only TinyTransformer/LLaMA layer partitioning, runtime-owned
+optimizer per stage, and pipeline microbatching inside `run_step()`. The
+runtime and plugin boundaries now support PP composed with TP/SP, CP, EP, DDP,
+and ZeRO in the exercised test matrix, even though more advanced PP/CP
+algorithms are still future work.
 
 ## Batch Contract
 
