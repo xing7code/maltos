@@ -68,6 +68,21 @@ echo "=== tiny transformer cp equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp --world-size 4 --dp-size 1 --cp-size 2 --tp-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp --world-size 4 --dp-size 1 --cp-size 2 --tp-size 2 --use-sp
 
+echo "=== tiny transformer ep equivalence ==="
+"${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep --world-size 2 --dp-size 2 --ep-size 2 --tp-size 1
+"${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_ddp_sync --world-size 2 --dp-size 2 --ep-size 2 --tp-size 1
+"${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_ddp_async --world-size 2 --dp-size 2 --ep-size 2 --tp-size 1
+"${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_ddp_bucket --world-size 2 --dp-size 2 --ep-size 2 --tp-size 1
+"${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_zero1 --world-size 2 --dp-size 2 --ep-size 2 --tp-size 1
+"${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_zero2 --world-size 2 --dp-size 2 --ep-size 2 --tp-size 1
+"${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_zero3 --world-size 2 --dp-size 2 --ep-size 2 --tp-size 1
+"${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_tp --world-size 4 --dp-size 2 --ep-size 2 --tp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_tp_sp --world-size 4 --dp-size 2 --ep-size 2 --tp-size 2
+
+echo "=== tiny transformer ep zero3 checkpoint/resume ==="
+"${PYTHON_BIN}" tests/tiny_transformer_ep_zero3_checkpoint_resume.py --world-size 2 --dp-size 2 --ep-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_ep_zero3_accum2_midstep_resume.py --world-size 2 --dp-size 2 --ep-size 2
+
 echo "=== tiny transformer full-stack equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py
 

@@ -3,6 +3,7 @@ from .context import (
     ContextParallelAttentionCoreType,
     ContextParallelSpec,
 )
+from .expert import ExpertParallelMoEModule, ExpertParallelSpec
 from .plan import ParallelPlan
 from .pipeline import PipelineParallelSpec
 from .schedule import PipelineScheduleConfig
@@ -12,6 +13,8 @@ __all__ = [
     "ContextParallelSpec",
     "ContextParallelAttentionCore",
     "ContextParallelAttentionCoreType",
+    "ExpertParallelMoEModule",
+    "ExpertParallelSpec",
     "ParallelPlan",
     "PipelineParallelSpec",
     "PipelineScheduleConfig",

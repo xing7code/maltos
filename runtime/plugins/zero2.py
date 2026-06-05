@@ -10,6 +10,7 @@ import torch.nn as nn
 from runtime.core import RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
+from runtime.plugins.ep import is_ep_expert_param
 
 
 class _AllReduceShardWork:
@@ -90,6 +91,7 @@ class Zero2Plugin(RuntimePlugin):
         self.rank = 0
         self.data_buffer: torch.Tensor | None = None
         self.buckets: list[_Bucket] = []
+        self.expert_params: list[nn.Parameter] = []
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self._cp_sync_thread: threading.Thread | None = None
@@ -103,8 +105,10 @@ class Zero2Plugin(RuntimePlugin):
             raise ValueError("Zero2Plugin requires mesh.dp > 1")
         self.world_size = dist.get_world_size(self.dp_group)
         self.rank = dist.get_rank(self.dp_group)
+        self.expert_params = [param for param in model.parameters() if param.requires_grad and is_ep_expert_param(self.runtime, param)]
         self._prepare_buffers_and_buckets(model)
-        self.optimizer = self.runtime.create_optimizer([bucket.local_param for bucket in self.buckets])
+        optimizer_params = [bucket.local_param for bucket in self.buckets] + self.expert_params
+        self.optimizer = self.runtime.create_optimizer(optimizer_params)
         self.scheduler = self.runtime.create_scheduler(self.optimizer)
         return model
 
@@ -135,7 +139,7 @@ class Zero2Plugin(RuntimePlugin):
             self._sync_local_params_from_data_buffer()
 
     def _prepare_buffers_and_buckets(self, model: nn.Module) -> None:
-        params = [param for param in model.parameters() if param.requires_grad][::-1]
+        params = [param for param in model.parameters() if param.requires_grad and not is_ep_expert_param(self.runtime, param)][::-1]
         if not params:
             return
 

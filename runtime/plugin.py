@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from parallel.context import ContextParallelSpec
+from parallel.expert import ExpertParallelSpec
 from parallel.pipeline import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec
 from runtime.mesh import MeshAxis
@@ -32,6 +33,11 @@ class PipelineParallelizableModule(Protocol):
 @runtime_checkable
 class ContextParallelizableModule(Protocol):
     def context_parallel_spec(self) -> ContextParallelSpec: ...
+
+
+@runtime_checkable
+class ExpertParallelizableModule(Protocol):
+    def expert_parallel_spec(self) -> ExpertParallelSpec: ...
 
 
 @runtime_checkable

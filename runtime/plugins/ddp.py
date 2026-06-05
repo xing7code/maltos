@@ -9,6 +9,7 @@ import torch.distributed as dist
 from runtime.core import RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
+from runtime.plugins.ep import is_ep_expert_param
 
 
 class DataParallelPlugin(RuntimePlugin):
@@ -31,6 +32,8 @@ class DataParallelPlugin(RuntimePlugin):
         handles = []
         for name, param in self.runtime.model.named_parameters():
             if not param.requires_grad:
+                continue
+            if is_ep_expert_param(self.runtime, param):
                 continue
             if param.grad is None:
                 raise RuntimeError(f"param={name} requires grad but has no gradient")
@@ -135,7 +138,9 @@ class BucketDataParallelPlugin(RuntimePlugin):
     def _build_buckets(self, model: nn.Module, dp_group: dist.ProcessGroup) -> None:
         self.buckets = []
         current_bucket: _Bucket | None = None
-        for param in reversed([p for p in model.parameters() if p.requires_grad]):
+        for param in reversed(
+            [p for p in model.parameters() if p.requires_grad and not is_ep_expert_param(self.runtime, p)]
+        ):
             if current_bucket is None or current_bucket.total_bytes >= self.bucket_byte_size:
                 if current_bucket is not None:
                     current_bucket.finalize()

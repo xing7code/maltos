@@ -110,6 +110,22 @@ class ProcessGroupManager:
                     group = dist.new_group(group_ranks)
                     if d == dp_idx and p == pp_idx and c == cp_idx and self.mesh.tp > 1:
                         self.groups[MeshAxis.TP] = group
+        if self.mesh.ep > 1:
+            edp = self.mesh.dp // self.mesh.ep
+            for e in range(edp):
+                dp_slice = slice(e * self.mesh.ep, (e + 1) * self.mesh.ep)
+                for p in range(self.mesh.pp):
+                    for c in range(self.mesh.cp):
+                        for t in range(self.mesh.tp):
+                            group_ranks = ranks[dp_slice, p, c, t].tolist()
+                            group = dist.new_group(group_ranks)
+                            if (
+                                e == (dp_idx // self.mesh.ep)
+                                and p == pp_idx
+                                and c == cp_idx
+                                and t == tp_idx
+                            ):
+                                self.groups[MeshAxis.EP] = group
         for d in range(self.mesh.dp):
             for p in range(self.mesh.pp):
                 for t in range(self.mesh.tp):

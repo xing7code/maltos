@@ -9,6 +9,7 @@ from .core import (
 from .mesh import MeshAxis, MeshConfig, ProcessGroupManager
 from .plugin import (
     ContextParallelizableModule,
+    ExpertParallelizableModule,
     MetricValue,
     PipelineParallelizableModule,
     PluginId,
@@ -22,6 +23,7 @@ __all__ = [
     "MeshAxis",
     "MeshConfig",
     "ContextParallelizableModule",
+    "ExpertParallelizableModule",
     "PipelineParallelizableModule",
     "PluginId",
     "ProcessGroupManager",

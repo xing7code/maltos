@@ -13,6 +13,7 @@ from runtime.core import RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
 from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
+from runtime.plugins.ep import is_ep_expert_param
 from state.state import ParamState
 
 
@@ -114,6 +115,7 @@ class Zero3Plugin(RuntimePlugin):
         self._observed_forward_set: set[int] = set()
         self._first_bucket: _Bucket | None = None
         self._last_bucket: _Bucket | None = None
+        self.expert_params: list[nn.Parameter] = []
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self._cp_sync_thread: threading.Thread | None = None
@@ -133,8 +135,10 @@ class Zero3Plugin(RuntimePlugin):
             raise ValueError("Zero3Plugin requires mesh.dp > 1")
         self.world_size = dist.get_world_size(self.dp_group)
         self.rank = dist.get_rank(self.dp_group)
+        self.expert_params = [param for param in model.parameters() if param.requires_grad and is_ep_expert_param(self.runtime, param)]
         self._prepare_buckets(model)
-        self.optimizer = self.runtime.create_optimizer([bucket.local_param for bucket in self.buckets])
+        optimizer_params = [bucket.local_param for bucket in self.buckets] + self.expert_params
+        self.optimizer = self.runtime.create_optimizer(optimizer_params)
         self.scheduler = self.runtime.create_scheduler(self.optimizer)
         return model
 
@@ -181,6 +185,8 @@ class Zero3Plugin(RuntimePlugin):
             params = [param for param in module.parameters(recurse=True) if param.requires_grad]
             if not params:
                 continue
+            if all(is_ep_expert_param(self.runtime, param) for param in params):
+                continue
             visited.add(module_name)
             logical_names = [param_to_name[id(param)] for param in params]
             bucket_specs.append((module, params, logical_names))
@@ -189,7 +195,7 @@ class Zero3Plugin(RuntimePlugin):
         uncovered = [
             name
             for name, param in model.named_parameters()
-            if param.requires_grad and id(param) not in covered_param_ids
+            if param.requires_grad and id(param) not in covered_param_ids and not is_ep_expert_param(self.runtime, param)
         ]
         if uncovered:
             raise ValueError(

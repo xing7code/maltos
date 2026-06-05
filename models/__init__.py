@@ -13,6 +13,12 @@ from .tiny_transformer import (
     TinyTransformerTp,
     TinyTransformerTpSp,
 )
+from .tiny_moe_transformer import (
+    Top1MoE,
+    TinyMoETransformer,
+    TinyMoETransformerTp,
+    TinyMoETransformerTpSp,
+)
 
 __all__ = [
     "TinyModel",
@@ -24,6 +30,10 @@ __all__ = [
     "TinyTransformer",
     "TinyTransformerTp",
     "TinyTransformerTpSp",
+    "Top1MoE",
+    "TinyMoETransformer",
+    "TinyMoETransformerTp",
+    "TinyMoETransformerTpSp",
     "CausalSelfAttention",
     "MLP",
 ]
