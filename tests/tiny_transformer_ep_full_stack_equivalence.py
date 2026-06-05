@@ -136,6 +136,7 @@ def _logical_named_tensors(
     ep_group: dist.ProcessGroup | None,
     *,
     grads: bool,
+    pp_partitioned: bool,
 ) -> dict[str, torch.Tensor]:
     device = next(model.parameters()).device
     shared_tensors: dict[str, torch.Tensor] = {}
@@ -146,10 +147,13 @@ def _logical_named_tensors(
         if source is None:
             source = torch.zeros_like(param)
         shared_tensors[name] = _logical_tensor(name, source.detach(), shard_rules, tp_group).cpu()
-    tensors = {name: tensor.to(device) for name, tensor in _gather_object_dict(shared_tensors, pp_group).items()}
+    if pp_partitioned:
+        shared_tensors = _gather_object_dict(shared_tensors, pp_group)
+    tensors = {name: tensor.to(device) for name, tensor in shared_tensors.items()}
 
     expert_tensors = _gather_object_dict(_runtime_local_expert_tensors(model, grads=grads), ep_group)
-    expert_tensors = _gather_object_dict(expert_tensors, pp_group)
+    if pp_partitioned:
+        expert_tensors = _gather_object_dict(expert_tensors, pp_group)
     for name, tensor in expert_tensors.items():
         tensors[name] = tensor.to(device)
     return tensors
@@ -280,12 +284,26 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     runtime_pp_group = runtime_core.get_group(MeshAxis.PP)
     baseline_ep_group = baseline_core.get_group(MeshAxis.EP)
     runtime_ep_group = runtime_core.get_group(MeshAxis.EP)
+    baseline_pp_partitioned = any(isinstance(plugin, PipelineParallelPlugin) for plugin in baseline_core.plugins)
+    runtime_pp_partitioned = any(isinstance(plugin, PipelineParallelPlugin) for plugin in runtime_core.plugins)
 
     baseline_grads = _logical_named_tensors(
-        baseline_core.model, shard_rules, baseline_tp_group, baseline_pp_group, baseline_ep_group, grads=True
+        baseline_core.model,
+        shard_rules,
+        baseline_tp_group,
+        baseline_pp_group,
+        baseline_ep_group,
+        grads=True,
+        pp_partitioned=baseline_pp_partitioned,
     )
     runtime_grads = _logical_named_tensors(
-        runtime_core.model, shard_rules, runtime_tp_group, runtime_pp_group, runtime_ep_group, grads=True
+        runtime_core.model,
+        shard_rules,
+        runtime_tp_group,
+        runtime_pp_group,
+        runtime_ep_group,
+        grads=True,
+        pp_partitioned=runtime_pp_partitioned,
     )
     grad_name, grad_diff = _max_diff(baseline_grads, runtime_grads)
 
@@ -295,10 +313,22 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_zero3.materialize_model()
     runtime_zero3.materialize_model()
     baseline_params = _logical_named_tensors(
-        baseline_core.model, shard_rules, baseline_tp_group, baseline_pp_group, baseline_ep_group, grads=False
+        baseline_core.model,
+        shard_rules,
+        baseline_tp_group,
+        baseline_pp_group,
+        baseline_ep_group,
+        grads=False,
+        pp_partitioned=baseline_pp_partitioned,
     )
     runtime_params = _logical_named_tensors(
-        runtime_core.model, shard_rules, runtime_tp_group, runtime_pp_group, runtime_ep_group, grads=False
+        runtime_core.model,
+        shard_rules,
+        runtime_tp_group,
+        runtime_pp_group,
+        runtime_ep_group,
+        grads=False,
+        pp_partitioned=runtime_pp_partitioned,
     )
     step_name, step_diff = _max_diff(baseline_params, runtime_params)
     baseline_zero3.reshard_model()

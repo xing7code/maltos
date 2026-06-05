@@ -166,6 +166,7 @@ class ExpertParallelPlugin(RuntimePlugin):
         self._expert_edp_grad_sync_handles: list[dist.Work] = []
         self._expert_cp_grad_sync_handles: list[dist.Work] = []
         self._delegate_shared_dp_sync = False
+        self._delegate_expert_sync = False
 
     @property
     def ep_group(self) -> dist.ProcessGroup:
@@ -193,7 +194,8 @@ class ExpertParallelPlugin(RuntimePlugin):
     def bind(self, runtime) -> None:
         super().bind(runtime)
         active = {plugin.id for plugin in runtime.plugins if plugin is not self}
-        self._delegate_shared_dp_sync = PluginId.DP in active
+        self._delegate_shared_dp_sync = bool({PluginId.DP, PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
+        self._delegate_expert_sync = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
         self._validate_runtime_support()
 
     def transform_model(self, model: nn.Module) -> nn.Module:
@@ -236,24 +238,25 @@ class ExpertParallelPlugin(RuntimePlugin):
                 return
             self._expert_cp_grad_sync_handles.clear()
             self._expert_edp_grad_sync_handles.clear()
-            expert_params = [
-                param
-                for param in self.runtime.model.parameters()
-                if param.requires_grad and param.grad is not None and id(param) in self._expert_param_ids
-            ]
-            expert_param_ids = {id(param) for param in expert_params}
-            if self.cp_group is not None and dist.get_world_size(self.cp_group) > 1:
-                for param in expert_params:
-                    self._expert_cp_grad_sync_handles.append(
-                        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=self.cp_group, async_op=True)
-                    )
-            if self.edp_group is not None and dist.get_world_size(self.edp_group) > 1:
-                for param in self.runtime.model.parameters():
-                    if id(param) not in expert_param_ids:
-                        continue
-                    self._expert_edp_grad_sync_handles.append(
-                        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.edp_group, async_op=True)
-                    )
+            if not self._delegate_expert_sync:
+                expert_params = [
+                    param
+                    for param in self.runtime.model.parameters()
+                    if param.requires_grad and param.grad is not None and id(param) in self._expert_param_ids
+                ]
+                expert_param_ids = {id(param) for param in expert_params}
+                if self.cp_group is not None and dist.get_world_size(self.cp_group) > 1:
+                    for param in expert_params:
+                        self._expert_cp_grad_sync_handles.append(
+                            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=self.cp_group, async_op=True)
+                        )
+                if self.edp_group is not None and dist.get_world_size(self.edp_group) > 1:
+                    for param in self.runtime.model.parameters():
+                        if id(param) not in expert_param_ids:
+                            continue
+                        self._expert_edp_grad_sync_handles.append(
+                            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.edp_group, async_op=True)
+                        )
             if self._delegate_shared_dp_sync:
                 return
             if self.dp_group is None or dist.get_world_size(self.dp_group) <= 1:

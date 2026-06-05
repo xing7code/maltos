@@ -48,9 +48,26 @@ class _ReduceScatterShardWork:
         self.local_grad.add_(self.shard_buffer)
 
 
+class _LocalAddWork:
+    def __init__(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        self.src = src
+        self.dst = dst
+
+    def wait(self) -> None:
+        self.dst.add_(self.src)
+
+
+@dataclass(frozen=True)
+class _GroupContext:
+    group: dist.ProcessGroup | None
+    world_size: int
+    rank: int
+
+
 @dataclass
 class _Bucket:
     params: list[nn.Parameter]
+    group_context: _GroupContext
     start: int
     end: int
     shard_start: int
@@ -66,7 +83,7 @@ class _BucketExecState:
     grad_buffer: torch.Tensor
     shard_buffer: torch.Tensor
     pending: int = 0
-    handle: dist.Work | _AllReduceShardWork | _ReduceScatterShardWork | None = None
+    handle: dist.Work | _AllReduceShardWork | _ReduceScatterShardWork | _LocalAddWork | None = None
     attached: bool = False
 
 
@@ -90,7 +107,6 @@ class Zero2Plugin(RuntimePlugin):
         self.rank = 0
         self.data_buffer: torch.Tensor | None = None
         self.buckets: list[_Bucket] = []
-        self.expert_params: list[nn.Parameter] = []
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self._cp_sync_thread: threading.Thread | None = None
@@ -104,11 +120,8 @@ class Zero2Plugin(RuntimePlugin):
             raise ValueError("Zero2Plugin requires mesh.dp > 1")
         self.world_size = dist.get_world_size(self.dp_group)
         self.rank = dist.get_rank(self.dp_group)
-        self.expert_params = [
-            param for param in model.parameters() if param.requires_grad and self.runtime.get_param_role(param) == ParamRole.EXPERT
-        ]
         self._prepare_buffers_and_buckets(model)
-        optimizer_params = [bucket.local_param for bucket in self.buckets] + self.expert_params
+        optimizer_params = [bucket.local_param for bucket in self.buckets]
         self.optimizer = self.runtime.create_optimizer(optimizer_params)
         self.scheduler = self.runtime.create_scheduler(self.optimizer)
         return model
@@ -140,19 +153,27 @@ class Zero2Plugin(RuntimePlugin):
             self._sync_local_params_from_data_buffer()
 
     def _prepare_buffers_and_buckets(self, model: nn.Module) -> None:
-        params = [
-            param for param in model.parameters() if param.requires_grad and self.runtime.get_param_role(param) != ParamRole.EXPERT
-        ][::-1]
-        if not params:
+        shared_params = self._role_params(model, ParamRole.SHARED)
+        expert_params = self._role_params(model, ParamRole.EXPERT)
+        bucket_specs: list[tuple[_GroupContext, list[list[nn.Parameter]]]] = []
+        if shared_params:
+            bucket_specs.append((_GroupContext(self.dp_group, self.world_size, self.rank), self._build_param_buckets(shared_params)))
+        if expert_params:
+            bucket_specs.append((self._group_context_for_role(ParamRole.EXPERT), self._build_param_buckets(expert_params)))
+        if not bucket_specs:
             return
 
-        dtype, device = params[0].dtype, params[0].device
-        param_buckets = self._build_param_buckets(params)
-        padded_sizes = [self._padded_len(sum(param.numel() for param in bucket)) for bucket in param_buckets]
-        self.data_buffer = torch.zeros(sum(padded_sizes), dtype=dtype, device=device)
+        dtype = (shared_params or expert_params)[0].dtype
+        device = (shared_params or expert_params)[0].device
+        flat_specs: list[tuple[_GroupContext, list[nn.Parameter], int]] = []
+        for group_context, param_buckets in bucket_specs:
+            for bucket_params in param_buckets:
+                padded_size = self._padded_len(sum(param.numel() for param in bucket_params), group_context.world_size)
+                flat_specs.append((group_context, bucket_params, padded_size))
+        self.data_buffer = torch.zeros(sum(padded_size for _, _, padded_size in flat_specs), dtype=dtype, device=device)
 
         offset = 0
-        for bucket_params, padded_size in zip(param_buckets, padded_sizes):
+        for group_context, bucket_params, padded_size in flat_specs:
             param_offset = offset
             for param in bucket_params:
                 with torch.no_grad():
@@ -160,12 +181,13 @@ class Zero2Plugin(RuntimePlugin):
                     param.data = self.data_buffer[param_offset : param_offset + param.numel()].view_as(param)
                 param_offset += param.numel()
 
-            per_rank_size = padded_size // self.world_size
-            shard_start = offset + self.rank * per_rank_size
-            shard_end = offset + (self.rank + 1) * per_rank_size
+            per_rank_size = padded_size // group_context.world_size
+            shard_start = offset + group_context.rank * per_rank_size
+            shard_end = offset + (group_context.rank + 1) * per_rank_size
             self.buckets.append(
                 _Bucket(
                     params=bucket_params,
+                    group_context=group_context,
                     start=offset,
                     end=offset + padded_size,
                     shard_start=shard_start,
@@ -200,6 +222,13 @@ class Zero2Plugin(RuntimePlugin):
         if curr_bucket:
             buckets.append(curr_bucket)
         return buckets
+
+    def _role_params(self, model: nn.Module, role: ParamRole) -> list[nn.Parameter]:
+        return [
+            param
+            for param in model.parameters()
+            if param.requires_grad and self.runtime.get_param_role(param) == role
+        ][::-1]
 
     def _add_param_hooks(self) -> None:
         for bucket in self.buckets:
@@ -243,36 +272,39 @@ class Zero2Plugin(RuntimePlugin):
         bucket: _Bucket,
         state: _BucketExecState,
     ) -> dist.Work | _AllReduceShardWork | _ReduceScatterShardWork:
-        assert self.dp_group is not None
         assert bucket.local_param.grad is not None
         bucket_numel = bucket.end - bucket.start
         full_grad = state.grad_buffer[:bucket_numel]
-        if dist.get_backend(self.dp_group) == "gloo":
-            work = dist.all_reduce(full_grad, op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
+        if bucket.group_context.group is None or bucket.group_context.world_size == 1:
+            return _LocalAddWork(full_grad[: bucket.local_param.numel()], bucket.local_param.grad)
+        if dist.get_backend(bucket.group_context.group) == "gloo":
+            work = dist.all_reduce(full_grad, op=dist.ReduceOp.AVG, group=bucket.group_context.group, async_op=True)
             shard_len = bucket.local_param.numel()
-            shard_start = self.rank * shard_len
-            shard_end = (self.rank + 1) * shard_len
+            shard_start = bucket.group_context.rank * shard_len
+            shard_end = (bucket.group_context.rank + 1) * shard_len
             return _AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end)
         work = dist.reduce_scatter_tensor(
             state.shard_buffer,
             full_grad,
             op=dist.ReduceOp.AVG,
-            group=self.dp_group,
+            group=bucket.group_context.group,
             async_op=True,
         )
         return _ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad)
 
     def _gather_updated_params(self) -> None:
-        assert self.dp_group is not None
         assert self.data_buffer is not None
         handles = []
         with torch.no_grad():
             for bucket in self.buckets:
+                if bucket.group_context.group is None or bucket.group_context.world_size == 1:
+                    self.data_buffer[bucket.start : bucket.end].copy_(bucket.local_param.detach())
+                    continue
                 handles.append(
                     dist.all_gather_into_tensor(
                         self.data_buffer[bucket.start : bucket.end],
                         bucket.local_param.detach().contiguous(),
-                        group=self.dp_group,
+                        group=bucket.group_context.group,
                         async_op=True,
                     )
                 )
@@ -309,6 +341,7 @@ class Zero2Plugin(RuntimePlugin):
         for bucket in self.buckets:
             waited = False
             for state in bucket.exec_states:
+                self._ensure_state_handle(bucket, state)
                 if state.handle is None:
                     continue
                 state.handle.wait()
@@ -335,6 +368,7 @@ class Zero2Plugin(RuntimePlugin):
             if bucket.cp_handle is None:
                 waited = False
                 for state in bucket.exec_states:
+                    self._ensure_state_handle(bucket, state)
                     if state.handle is None:
                         continue
                     state.handle.wait()
@@ -357,7 +391,7 @@ class Zero2Plugin(RuntimePlugin):
                 else:
                     bucket.local_param.grad.zero_()
                 bucket.cp_handle = None
-            bucket.cp_pending_states = len(bucket.exec_states) if grad_accum_end else 0
+                bucket.cp_pending_states = len(bucket.exec_states) if grad_accum_end else 0
         for bucket in self.buckets:
             state = self._exec_state(bucket)
             if state.handle is not None:
@@ -374,8 +408,27 @@ class Zero2Plugin(RuntimePlugin):
             for bucket in self.buckets:
                 bucket.local_param.data.copy_(self.data_buffer[bucket.shard_start : bucket.shard_end])
 
-    def _padded_len(self, numel: int) -> int:
-        return (numel + self.world_size - 1) // self.world_size * self.world_size
+    def _padded_len(self, numel: int, world_size: int) -> int:
+        return (numel + world_size - 1) // world_size * world_size
+
+    def _group_context_for_role(self, role: ParamRole) -> _GroupContext:
+        assert self.runtime is not None
+        if role == ParamRole.EXPERT:
+            group = self.runtime.get_group(MeshAxis.EDP)
+            if group is None:
+                return _GroupContext(None, 1, 0)
+            return _GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
+        assert self.dp_group is not None
+        return _GroupContext(self.dp_group, self.world_size, self.rank)
+
+    def _ensure_state_handle(self, bucket: _Bucket, state: _BucketExecState) -> None:
+        if state.handle is not None:
+            return
+        if bucket.local_param.grad is None:
+            bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
+        state.grad_buffer.zero_()
+        state.shard_buffer.zero_()
+        state.handle = self._reduce_scatter_avg(bucket, state)
 
     def _exec_state(self, bucket: _Bucket) -> _BucketExecState:
         assert self.runtime is not None

@@ -52,6 +52,18 @@ class _ReduceScatterShardWork:
         self.local_grad.add_(self.shard_buffer)
 
 
+class _ImmediateWork:
+    def wait(self) -> None:
+        return
+
+
+@dataclass(frozen=True)
+class _GroupContext:
+    group: dist.ProcessGroup | None
+    world_size: int
+    rank: int
+
+
 class _ExecDirection(str, Enum):
     FORWARD = "forward"
     BACKWARD = "backward"
@@ -61,6 +73,8 @@ class _ExecDirection(str, Enum):
 class _Bucket:
     module: nn.Module
     params: list[nn.Parameter]
+    role: ParamRole
+    group_context: _GroupContext
     param_shapes: list[torch.Size]
     param_numels: list[int]
     buffer_size: int
@@ -79,9 +93,9 @@ class _BucketExecState:
     data_buffer: torch.Tensor
     grad_buffer: torch.Tensor
     shard_buffer: torch.Tensor
-    fwd_handle: dist.Work | None = None
-    bwd_handle: dist.Work | None = None
-    grad_handle: dist.Work | _AllReduceShardWork | _ReduceScatterShardWork | None = None
+    fwd_handle: dist.Work | _ImmediateWork | None = None
+    bwd_handle: dist.Work | _ImmediateWork | None = None
+    grad_handle: dist.Work | _AllReduceShardWork | _ReduceScatterShardWork | _ImmediateWork | None = None
     pending: int = 0
     attached: bool = False
     backward_materialized: bool = False
@@ -105,6 +119,7 @@ class Zero3Plugin(RuntimePlugin):
         self.enable_prefetch = enable_prefetch
         self.dp_group: dist.ProcessGroup | None = None
         self.cp_group: dist.ProcessGroup | None = None
+        self.tp_group: dist.ProcessGroup | None = None
         self.world_size = 1
         self.rank = 0
         self.buckets: list[_Bucket] = []
@@ -119,26 +134,26 @@ class Zero3Plugin(RuntimePlugin):
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self._cp_sync_thread: threading.Thread | None = None
         self._cp_sync_cond = threading.Condition()
+        self._expert_tp_sync = False
 
     def bind(self, runtime) -> None:
         super().bind(runtime)
         active_plugins = {plugin.id for plugin in runtime.plugins if plugin is not self}
         if PluginId.TP in active_plugins and nn.Linear in self.wrap_cls:
             self.wrap_cls.update({ColumnParallelLinear, RowParallelLinear})
+        self._expert_tp_sync = PluginId.SP in active_plugins
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
         self.dp_group = self.runtime.get_group(MeshAxis.DP)
         self.cp_group = self.runtime.get_group(MeshAxis.CP)
+        self.tp_group = self.runtime.get_group(MeshAxis.TP)
         if self.dp_group is None:
             raise ValueError("Zero3Plugin requires mesh.dp > 1")
         self.world_size = dist.get_world_size(self.dp_group)
         self.rank = dist.get_rank(self.dp_group)
-        self.expert_params = [
-            param for param in model.parameters() if param.requires_grad and self.runtime.get_param_role(param) == ParamRole.EXPERT
-        ]
         self._prepare_buckets(model)
-        optimizer_params = [bucket.local_param for bucket in self.buckets] + self.expert_params
+        optimizer_params = [bucket.local_param for bucket in self.buckets]
         self.optimizer = self.runtime.create_optimizer(optimizer_params)
         self.scheduler = self.runtime.create_scheduler(self.optimizer)
         return model
@@ -146,7 +161,7 @@ class Zero3Plugin(RuntimePlugin):
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
             assert self.runtime is not None
-            if self.enable_prefetch and self.bucket_order_checked and self._first_bucket is not None:
+            if self._prefetch_is_enabled() and self.bucket_order_checked and self._first_bucket is not None:
                 self._prefetch_bucket(self._first_bucket, direction=_ExecDirection.FORWARD)
         elif phase == RuntimePhase.POST_FORWARD:
             self._finalize_bucket_order()
@@ -186,8 +201,6 @@ class Zero3Plugin(RuntimePlugin):
             params = [param for param in module.parameters(recurse=True) if param.requires_grad]
             if not params:
                 continue
-            if all(self.runtime.get_param_role(param) == ParamRole.EXPERT for param in params):
-                continue
             visited.add(module_name)
             logical_names = [param_to_name[id(param)] for param in params]
             bucket_specs.append((module, params, logical_names))
@@ -196,7 +209,7 @@ class Zero3Plugin(RuntimePlugin):
         uncovered = [
             name
             for name, param in model.named_parameters()
-            if param.requires_grad and id(param) not in covered_param_ids and self.runtime.get_param_role(param) != ParamRole.EXPERT
+            if param.requires_grad and id(param) not in covered_param_ids
         ]
         if uncovered:
             raise ValueError(
@@ -217,19 +230,23 @@ class Zero3Plugin(RuntimePlugin):
             self._free_full_params(bucket)
 
     def _make_bucket(self, index: int, module: nn.Module, params: list[nn.Parameter], logical_names: list[str]) -> _Bucket:
+        role = self.runtime.get_param_role(params[0])
+        if any(self.runtime.get_param_role(param) != role for param in params):
+            raise ValueError(f"Zero3 bucket {index} mixes param roles, which is unsupported")
+        group_context = self._group_context_for_role(role)
         dtype, device = params[0].dtype, params[0].device
         param_shapes = [param.shape for param in params]
         param_numels = [param.numel() for param in params]
-        buffer_size = self._padded_len(sum(param_numels))
+        buffer_size = self._padded_len(sum(param_numels), group_context.world_size)
         full_param = torch.zeros(buffer_size, dtype=dtype, device=device)
         offset = 0
         for param in params:
             full_param[offset : offset + param.numel()].copy_(param.detach().view(-1))
             offset += param.numel()
 
-        shard_len = buffer_size // self.world_size
-        shard_start = self.rank * shard_len
-        shard_end = (self.rank + 1) * shard_len
+        shard_len = buffer_size // group_context.world_size
+        shard_start = group_context.rank * shard_len
+        shard_end = (group_context.rank + 1) * shard_len
         local_param = nn.Parameter(full_param[shard_start:shard_end].clone())
         shard_buffer = torch.empty(shard_len, dtype=dtype, device=device)
         exec_state_count = self.runtime.plan.pp_schedule.microbatches
@@ -244,6 +261,8 @@ class Zero3Plugin(RuntimePlugin):
         return _Bucket(
             module=module,
             params=params,
+            role=role,
+            group_context=group_context,
             param_shapes=param_shapes,
             param_numels=param_numels,
             buffer_size=buffer_size,
@@ -265,7 +284,7 @@ class Zero3Plugin(RuntimePlugin):
         def hook(_module: nn.Module, _inputs) -> None:
             self._record_forward_bucket(bucket)
             self._materialize_full_params(bucket, direction=_ExecDirection.FORWARD)
-            if self.enable_prefetch and self.bucket_order_checked and bucket.next_bucket is not None:
+            if self._prefetch_is_enabled() and self.bucket_order_checked and bucket.next_bucket is not None:
                 self._prefetch_bucket(bucket.next_bucket, direction=_ExecDirection.FORWARD)
 
         return hook
@@ -307,15 +326,24 @@ class Zero3Plugin(RuntimePlugin):
         return hook
 
     def _prefetch_bucket(self, bucket: _Bucket, direction: _ExecDirection) -> None:
-        assert self.dp_group is not None
         state = self._exec_state(bucket, direction)
+        if bucket.group_context.group is None or bucket.group_context.world_size == 1:
+            state.data_buffer.copy_(bucket.local_param.detach())
+            immediate = _ImmediateWork()
+            if direction == _ExecDirection.FORWARD:
+                state.fwd_handle = immediate
+                return
+            if direction == _ExecDirection.BACKWARD:
+                state.bwd_handle = immediate
+                return
+            raise ValueError(f"unknown ZeRO3 prefetch direction={direction}")
         if direction == _ExecDirection.FORWARD:
             if state.fwd_handle is not None:
                 return
             state.fwd_handle = dist.all_gather_into_tensor(
                 state.data_buffer,
                 bucket.local_param.detach().contiguous(),
-                group=self.dp_group,
+                group=bucket.group_context.group,
                 async_op=True,
             )
             return
@@ -325,7 +353,7 @@ class Zero3Plugin(RuntimePlugin):
             state.bwd_handle = dist.all_gather_into_tensor(
                 state.data_buffer,
                 bucket.local_param.detach().contiguous(),
-                group=self.dp_group,
+                group=bucket.group_context.group,
                 async_op=True,
             )
             return
@@ -346,7 +374,7 @@ class Zero3Plugin(RuntimePlugin):
             state = self._exec_state(bucket, _ExecDirection.BACKWARD)
             if not state.backward_materialized:
                 self._materialize_full_params(bucket, direction=_ExecDirection.BACKWARD)
-                if self.enable_prefetch and bucket.prev_bucket is not None:
+                if self._prefetch_is_enabled() and bucket.prev_bucket is not None:
                     self._prefetch_bucket(bucket.prev_bucket, direction=_ExecDirection.BACKWARD)
                 state.backward_materialized = True
             return grad
@@ -384,18 +412,20 @@ class Zero3Plugin(RuntimePlugin):
         self._bind_full_params(bucket, state.data_buffer)
 
     def _materialize_full_params_sync(self, bucket: _Bucket) -> None:
-        assert self.dp_group is not None
         buffer = allocate_buffer(
             key=f"zero3.materialize_sync.bucket{bucket.index}",
             shape=(bucket.buffer_size,),
             dtype=bucket.local_param.dtype,
             device=bucket.local_param.device,
         )
-        dist.all_gather_into_tensor(
-            buffer,
-            bucket.local_param.detach().contiguous(),
-            group=self.dp_group,
-        )
+        if bucket.group_context.group is None or bucket.group_context.world_size == 1:
+            buffer.copy_(bucket.local_param.detach())
+        else:
+            dist.all_gather_into_tensor(
+                buffer,
+                bucket.local_param.detach().contiguous(),
+                group=bucket.group_context.group,
+            )
         self._materialized_buffers.append(buffer)
         self._bind_full_params(bucket, buffer)
 
@@ -406,6 +436,9 @@ class Zero3Plugin(RuntimePlugin):
             offset += numel
 
     def _free_full_params(self, bucket: _Bucket) -> None:
+        if bucket.group_context.world_size == 1:
+            self._bind_full_params(bucket, bucket.local_param.data)
+            return
         for param in bucket.params:
             param.data = bucket.local_param.data
 
@@ -414,18 +447,21 @@ class Zero3Plugin(RuntimePlugin):
         bucket: _Bucket,
         state: _BucketExecState,
     ) -> dist.Work | _AllReduceShardWork | _ReduceScatterShardWork:
-        assert self.dp_group is not None
-        if dist.get_backend(self.dp_group) == "gloo":
-            work = dist.all_reduce(state.grad_buffer, op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
+        assert self.runtime is not None
+        if bucket.group_context.group is None or bucket.group_context.world_size == 1:
+            bucket.local_param.grad.add_(state.grad_buffer[: bucket.local_param.numel()])
+            return _ImmediateWork()
+        if dist.get_backend(bucket.group_context.group) == "gloo":
+            work = dist.all_reduce(state.grad_buffer, op=dist.ReduceOp.AVG, group=bucket.group_context.group, async_op=True)
             shard_len = bucket.local_param.numel()
-            shard_start = self.rank * shard_len
-            shard_end = (self.rank + 1) * shard_len
+            shard_start = bucket.group_context.rank * shard_len
+            shard_end = (bucket.group_context.rank + 1) * shard_len
             return _AllReduceShardWork(work, state.grad_buffer, bucket.local_param.grad, shard_start, shard_end)
         work = dist.reduce_scatter_tensor(
             state.shard_buffer,
             state.grad_buffer,
             op=dist.ReduceOp.AVG,
-            group=self.dp_group,
+            group=bucket.group_context.group,
             async_op=True,
         )
         return _ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad)
@@ -467,9 +503,9 @@ class Zero3Plugin(RuntimePlugin):
             self.id.value,
             {
                 "bucket_index": bucket.index,
-                "rank": self.rank,
-                "world_size": self.world_size,
-                "shard_offset": self.rank * shard_len,
+                "rank": bucket.group_context.rank,
+                "world_size": bucket.group_context.world_size,
+                "shard_offset": bucket.group_context.rank * shard_len,
                 "shard_numel": shard_len,
                 "numel": bucket.buffer_size,
             },
@@ -482,6 +518,36 @@ class Zero3Plugin(RuntimePlugin):
             bucket.local_param.data.copy_(tensor)
             self._free_full_params(bucket)
         return True
+
+    def export_plugin_state(self) -> dict[str, object]:
+        assert self.runtime is not None
+        if self.runtime.state.step_context.microbatch_idx == 0:
+            return {}
+        self._flush_partial_grad_state_for_checkpoint()
+        grads: dict[str, torch.Tensor] = {}
+        for bucket in self.buckets:
+            if bucket.local_param.grad is None:
+                continue
+            grads[str(bucket.index)] = bucket.local_param.grad.detach().cpu().clone()
+        if not grads:
+            return {}
+        return {"bucket_local_grads": grads}
+
+    def import_plugin_state(self, state: dict[str, object]) -> None:
+        grad_state = state.get("bucket_local_grads")
+        if not isinstance(grad_state, dict):
+            return
+        for bucket in self.buckets:
+            tensor = grad_state.get(str(bucket.index))
+            if not torch.is_tensor(tensor):
+                bucket.local_param.grad = None
+                continue
+            bucket.local_param.grad = tensor.to(
+                device=bucket.local_param.device,
+                dtype=bucket.local_param.dtype,
+            ).clone()
+            bucket.cp_handle = None
+            self._free_full_params(bucket)
 
     def _maybe_start_cp_sync_worker(self) -> None:
         if self.cp_group is None or dist.get_world_size(self.cp_group) <= 1:
@@ -514,6 +580,7 @@ class Zero3Plugin(RuntimePlugin):
         for bucket in self.buckets:
             waited = False
             for state in bucket.exec_states:
+                self._ensure_state_grad_handle(bucket, state)
                 if state.grad_handle is None:
                     continue
                 state.grad_handle.wait()
@@ -542,6 +609,7 @@ class Zero3Plugin(RuntimePlugin):
             if bucket.cp_handle is None:
                 waited = False
                 for state in bucket.exec_states:
+                    self._ensure_state_grad_handle(bucket, state)
                     if state.grad_handle is None:
                         continue
                     state.grad_handle.wait()
@@ -550,10 +618,27 @@ class Zero3Plugin(RuntimePlugin):
                 if not waited:
                     self._free_full_params(bucket)
                     continue
+                self._maybe_sync_expert_tp(bucket)
                 self._free_full_params(bucket)
                 continue
             bucket.cp_handle.wait()
             bucket.cp_handle = None
+            self._maybe_sync_expert_tp(bucket)
+            self._free_full_params(bucket)
+
+    def _flush_partial_grad_state_for_checkpoint(self) -> None:
+        if self._cp_sync_thread is not None:
+            self._cp_sync_thread.join()
+            self._cp_sync_thread = None
+        for bucket in self.buckets:
+            if bucket.cp_handle is not None:
+                bucket.cp_handle.wait()
+                bucket.cp_handle = None
+            for state in bucket.exec_states:
+                if state.grad_handle is None:
+                    continue
+                state.grad_handle.wait()
+                state.grad_handle = None
             self._free_full_params(bucket)
 
     def _use_cp_sync_worker(self) -> bool:
@@ -582,8 +667,42 @@ class Zero3Plugin(RuntimePlugin):
             backward_state.attached = False
             backward_state.backward_materialized = False
 
-    def _padded_len(self, numel: int) -> int:
-        return (numel + self.world_size - 1) // self.world_size * self.world_size
+    def _padded_len(self, numel: int, world_size: int) -> int:
+        return (numel + world_size - 1) // world_size * world_size
+
+    def _group_context_for_role(self, role: ParamRole) -> _GroupContext:
+        assert self.runtime is not None
+        if role == ParamRole.EXPERT:
+            group = self.runtime.get_group(MeshAxis.EDP)
+            if group is None:
+                return _GroupContext(None, 1, 0)
+            return _GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
+        assert self.dp_group is not None
+        return _GroupContext(self.dp_group, self.world_size, self.rank)
+
+    def _ensure_state_grad_handle(self, bucket: _Bucket, state: _BucketExecState) -> None:
+        if state.grad_handle is not None:
+            return
+        if bucket.local_param.grad is None:
+            bucket.local_param.grad = torch.zeros_like(bucket.local_param.data)
+        state.grad_buffer.zero_()
+        state.shard_buffer.zero_()
+        state.grad_handle = self._reduce_scatter_avg(bucket, state)
+
+    def _maybe_sync_expert_tp(self, bucket: _Bucket) -> None:
+        if bucket.role != ParamRole.EXPERT or not self._expert_tp_sync:
+            return
+        if self.tp_group is None or dist.get_world_size(self.tp_group) <= 1:
+            return
+        if bucket.local_param.grad is None:
+            return
+        dist.all_reduce(bucket.local_param.grad, op=dist.ReduceOp.SUM, group=self.tp_group)
+
+    def _prefetch_is_enabled(self) -> bool:
+        if not self.enable_prefetch:
+            return False
+        assert self.runtime is not None
+        return self.runtime.state.step_context.grad_accum_steps == 1
 
     def _exec_state(self, bucket: _Bucket, direction: _ExecDirection) -> _BucketExecState:
         if len(bucket.exec_states) == 1:
