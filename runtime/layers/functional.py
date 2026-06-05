@@ -21,17 +21,16 @@ class AllGather(torch.autograd.Function):
         ctx.world_size = dist.get_world_size(group)
         ctx.backward_reduce_op = backward_reduce_op
 
-        out = [
-            allocate_buffer(
-                key=f"{alloc_key}.slot{i}",
-                shape=tuple(x.shape),
-                dtype=x.dtype,
-                device=x.device,
-            )
-            for i in range(ctx.world_size)
-        ]
-        dist.all_gather(out, x.contiguous(), group=group)
-        return torch.cat(out, dim=comm_dim)
+        x_t = x.transpose(0, comm_dim).contiguous()
+        out_shape = (ctx.world_size * x_t.shape[0], *x_t.shape[1:])
+        out_t = allocate_buffer(
+            key=f"{alloc_key}.forward",
+            shape=out_shape,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        dist.all_gather_into_tensor(out_t, x_t, group=group)
+        return out_t.transpose(0, comm_dim).contiguous()
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -67,17 +66,16 @@ class ReduceScatter(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        out = [
-            allocate_buffer(
-                key=f"{ctx.alloc_key}.backward.slot{i}",
-                shape=tuple(grad_output.shape),
-                dtype=grad_output.dtype,
-                device=grad_output.device,
-            )
-            for i in range(ctx.world_size)
-        ]
-        dist.all_gather(out, grad_output.contiguous(), group=ctx.group)
-        return torch.cat(out, dim=ctx.comm_dim), None, None, None, None
+        grad_output_t = grad_output.transpose(0, ctx.comm_dim).contiguous()
+        out_shape = (ctx.world_size * grad_output_t.shape[0], *grad_output_t.shape[1:])
+        out_t = allocate_buffer(
+            key=f"{ctx.alloc_key}.backward",
+            shape=out_shape,
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        dist.all_gather_into_tensor(out_t, grad_output_t, group=ctx.group)
+        return out_t.transpose(0, ctx.comm_dim).contiguous(), None, None, None, None
 
 
 class AllReduce(torch.autograd.Function):
