@@ -10,7 +10,7 @@ from parallel.context import (
     ContextParallelAttentionCore,
     ContextParallelAttentionCoreType,
 )
-from runtime.core import RuntimePhase
+from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import ContextParallelizableModule, PluginId, RuntimePlugin
 from runtime.plugins.cp_all_gather import AllGatherKvAttentionCore
@@ -70,10 +70,12 @@ class ContextParallelPlugin(RuntimePlugin):
             return model
         spec = model.context_parallel_spec()
         for path in spec.attention_paths:
+            if self.runtime.is_module_path_omitted(path):
+                continue
             try:
                 module = model.get_submodule(path)
             except AttributeError:
-                continue
+                raise
             _validate_supported_attention_module(module)
             module.attn_core = _build_cp_attention_core(
                 self.cp_group,
@@ -103,6 +105,8 @@ class ContextParallelPlugin(RuntimePlugin):
             assert self.runtime is not None
             if not self.runtime.state.step_context.is_step_boundary:
                 return
+            if self.runtime.get_param_role(param) == ParamRole.EXPERT:
+                return
             if param.grad is None:
                 raise RuntimeError("ContextParallelPlugin expected param.grad before CP sync hook")
             self._grad_sync_handles.append(
@@ -122,6 +126,8 @@ class ContextParallelPlugin(RuntimePlugin):
             return
         self._grad_sync_handles.clear()
         for param in self.runtime.model.parameters():
+            if self.runtime.get_param_role(param) == ParamRole.EXPERT:
+                continue
             if param.grad is None:
                 continue
             self._grad_sync_handles.append(
@@ -138,16 +144,6 @@ class ContextParallelPlugin(RuntimePlugin):
         mesh = self.runtime.mesh
         if mesh.cp <= 1:
             raise ValueError("ContextParallelPlugin requires mesh.cp > 1")
-        if mesh.ep != 1:
-            raise ValueError(
-                "ContextParallelPlugin v0 currently requires ep=1, "
-                f"got dp={mesh.dp} pp={mesh.pp} cp={mesh.cp} tp={mesh.tp} ep={mesh.ep}"
-            )
-        active = {plugin.id for plugin in self.runtime.plugins if plugin is not self}
-        unsupported = {PluginId.EP}
-        overlap = sorted(plugin_id.value for plugin_id in active & unsupported)
-        if overlap:
-            raise ValueError(f"ContextParallelPlugin v0 does not yet support plugin combinations: {overlap}")
 
 def _build_cp_attention_core(
     group: dist.ProcessGroup,

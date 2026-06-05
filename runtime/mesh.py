@@ -15,6 +15,7 @@ class MeshAxis(str, Enum):
     PP = "pp"
     CP = "cp"
     EP = "ep"
+    EDP = "edp"
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class MeshConfig:
             MeshAxis.PP: self.pp,
             MeshAxis.CP: self.cp,
             MeshAxis.EP: self.ep,
+            MeshAxis.EDP: self.dp // self.ep,
         }.items():
             if size < 1:
                 raise ValueError(f"{axis.value} must be >= 1, got {size}")
@@ -92,6 +94,7 @@ class ProcessGroupManager:
             MeshAxis.PP: None,
             MeshAxis.CP: None,
             MeshAxis.EP: None,
+            MeshAxis.EDP: None,
         }
         if not dist.is_initialized():
             return
@@ -126,6 +129,21 @@ class ProcessGroupManager:
                                 and t == tp_idx
                             ):
                                 self.groups[MeshAxis.EP] = group
+            for ep_local_idx in range(self.mesh.ep):
+                dp_indices = list(range(ep_local_idx, self.mesh.dp, self.mesh.ep))
+                for p in range(self.mesh.pp):
+                    for c in range(self.mesh.cp):
+                        for t in range(self.mesh.tp):
+                            group_ranks = [int(ranks[d, p, c, t]) for d in dp_indices]
+                            group = dist.new_group(group_ranks)
+                            if (
+                                dp_idx % self.mesh.ep == ep_local_idx
+                                and p == pp_idx
+                                and c == cp_idx
+                                and t == tp_idx
+                                and len(group_ranks) > 1
+                            ):
+                                self.groups[MeshAxis.EDP] = group
         for d in range(self.mesh.dp):
             for p in range(self.mesh.pp):
                 for t in range(self.mesh.tp):

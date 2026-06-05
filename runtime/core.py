@@ -34,6 +34,11 @@ class RuntimePhase(str, Enum):
     POST_LOAD = "post_load"
 
 
+class ParamRole(str, Enum):
+    SHARED = "shared"
+    EXPERT = "expert"
+
+
 class PpStatus(str, Enum):
     IDLE = "idle"
     FORWARD = "forward"
@@ -103,6 +108,8 @@ class RuntimeState:
     metadata: dict[str, Any] = field(default_factory=dict)
     static_metrics: dict[str, MetricValue] = field(default_factory=dict)
     scaler: torch.amp.GradScaler | None = None
+    omitted_module_paths: set[str] = field(default_factory=set)
+    param_roles: dict[int, ParamRole] = field(default_factory=dict)
 
     @property
     def step(self) -> int:
@@ -208,6 +215,21 @@ class RuntimeCore:
     def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:
         assert self.group_manager is not None
         return self.group_manager.get_group(axis)
+
+    def mark_module_path_omitted(self, path: str) -> None:
+        self.state.omitted_module_paths.add(path)
+
+    def is_module_path_omitted(self, path: str) -> bool:
+        for omitted in self.state.omitted_module_paths:
+            if path == omitted or path.startswith(omitted + "."):
+                return True
+        return False
+
+    def set_param_role(self, param: nn.Parameter, role: ParamRole) -> None:
+        self.state.param_roles[id(param)] = role
+
+    def get_param_role(self, param: nn.Parameter) -> ParamRole:
+        return self.state.param_roles.get(id(param), ParamRole.SHARED)
 
     def get_optimizer_and_scheduler(
         self,

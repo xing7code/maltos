@@ -99,9 +99,9 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         world_size=args.world_size,
     )
     if args.world_size != args.dp_size:
-        raise ValueError("EP v0 resume test expects world_size == dp_size")
-    if args.dp_size != args.ep_size:
-        raise ValueError("EP v0 resume test expects dp_size == ep_size")
+        raise ValueError("EP resume test expects world_size == dp_size")
+    if args.dp_size < args.ep_size:
+        raise ValueError("EP resume test expects dp_size >= ep_size")
     if args.global_batch_size % args.dp_size != 0:
         raise ValueError("global batch size must be divisible by dp size")
 

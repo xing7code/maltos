@@ -351,11 +351,6 @@ class PipelineParallelPlugin(RuntimePlugin):
         mesh = self.runtime.mesh
         if mesh.pp <= 1:
             raise ValueError("PipelineParallelPlugin requires mesh.pp > 1")
-        if mesh.ep != 1:
-            raise ValueError(
-                "PipelineParallelPlugin currently requires ep=1, "
-                f"got dp={mesh.dp} tp={mesh.tp} cp={mesh.cp} ep={mesh.ep}"
-            )
         unsupported = set()
         active = {plugin.id for plugin in self.runtime.plugins if plugin is not self}
         overlap = sorted(plugin_id.value for plugin_id in active & unsupported)
@@ -363,11 +358,14 @@ class PipelineParallelPlugin(RuntimePlugin):
             raise ValueError(f"PipelineParallelPlugin does not yet support plugin combinations: {overlap}")
 
     def _partition_model(self, model: nn.Module, spec, stage_index: int, stage_count: int) -> None:
+        assert self.runtime is not None
         for path in spec.head_layers:
             if stage_index != 0:
+                self.runtime.mark_module_path_omitted(path)
                 _replace_module_path(model, path, None)
         for path in spec.tail_layers:
             if stage_index != stage_count - 1:
+                self.runtime.mark_module_path_omitted(path)
                 _replace_module_path(model, path, None)
 
         for path in spec.pipe_layers:
@@ -378,6 +376,9 @@ class PipelineParallelPlugin(RuntimePlugin):
                     f"got {type(module).__name__}"
                 )
             start, end = _layer_range(len(module), stage_index, stage_count)
+            for layer_idx in range(len(module)):
+                if not start <= layer_idx < end:
+                    self.runtime.mark_module_path_omitted(f"{path}.{layer_idx}")
             partitioned = nn.ModuleList(
                 [layer if start <= layer_idx < end else _IdentityPipeLayer() for layer_idx, layer in enumerate(module)]
             )

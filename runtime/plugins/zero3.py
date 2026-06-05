@@ -9,11 +9,10 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from runtime.buffer_allocator import allocate_buffer
-from runtime.core import RuntimePhase
+from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
 from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
-from runtime.plugins.ep import is_ep_expert_param
 from state.state import ParamState
 
 
@@ -135,7 +134,9 @@ class Zero3Plugin(RuntimePlugin):
             raise ValueError("Zero3Plugin requires mesh.dp > 1")
         self.world_size = dist.get_world_size(self.dp_group)
         self.rank = dist.get_rank(self.dp_group)
-        self.expert_params = [param for param in model.parameters() if param.requires_grad and is_ep_expert_param(self.runtime, param)]
+        self.expert_params = [
+            param for param in model.parameters() if param.requires_grad and self.runtime.get_param_role(param) == ParamRole.EXPERT
+        ]
         self._prepare_buckets(model)
         optimizer_params = [bucket.local_param for bucket in self.buckets] + self.expert_params
         self.optimizer = self.runtime.create_optimizer(optimizer_params)
@@ -185,7 +186,7 @@ class Zero3Plugin(RuntimePlugin):
             params = [param for param in module.parameters(recurse=True) if param.requires_grad]
             if not params:
                 continue
-            if all(is_ep_expert_param(self.runtime, param) for param in params):
+            if all(self.runtime.get_param_role(param) == ParamRole.EXPERT for param in params):
                 continue
             visited.add(module_name)
             logical_names = [param_to_name[id(param)] for param in params]
@@ -195,7 +196,7 @@ class Zero3Plugin(RuntimePlugin):
         uncovered = [
             name
             for name, param in model.named_parameters()
-            if param.requires_grad and id(param) not in covered_param_ids and not is_ep_expert_param(self.runtime, param)
+            if param.requires_grad and id(param) not in covered_param_ids and self.runtime.get_param_role(param) != ParamRole.EXPERT
         ]
         if uncovered:
             raise ValueError(

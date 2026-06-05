@@ -4,7 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from parallel.context import ContextParallelSpec
 from parallel.expert import ExpertParallelMoEModule, ExpertParallelSpec
+from parallel.pipeline import PipelineParallelSpec
 from parallel.specs import TpSpComm, TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from models.tiny_transformer import CausalSelfAttention, RmsNorm, RoPE, MLP
 
@@ -88,28 +90,65 @@ class TinyMoETransformer(nn.Module):
     def forward(self, batch):
         if isinstance(batch, dict):
             input_ids = batch.get("input_ids")
+            hidden_states = batch.get("hidden_states")
             labels = batch.get("labels")
+            position_offset = int(batch.get("position_offset", 0))
+            loss_weight = batch.get("loss_weight")
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
+            hidden_states = None
+            position_offset = 0
+            loss_weight = None
         else:
             input_ids, labels = batch, None
-        x = self.embed(input_ids)
+            hidden_states = None
+            position_offset = 0
+            loss_weight = None
+
+        if hidden_states is not None:
+            x = hidden_states
+        else:
+            if input_ids is None:
+                raise ValueError("TinyMoETransformer requires input_ids or hidden_states")
+            if self.embed is None:
+                raise ValueError("TinyMoETransformer PP non-first stage requires hidden_states input")
+            x = self.embed(input_ids)
+
         _, seq_len, _ = x.shape
-        cos, sin = self.rope(0, seq_len)
+        cos, sin = self.rope(position_offset, position_offset + seq_len)
         for layer in self.layers:
-            x = layer(x, cos, sin, position_offset=0)
+            x = layer(x, cos, sin, position_offset=position_offset)
+        if self.norm is None or self.lm_head is None:
+            return x
         logits = self.lm_head(self.norm(x))
         if labels is None:
             return logits
-        return F.cross_entropy(
+        if input_ids is not None and labels.shape != input_ids.shape:
+            raise ValueError(f"labels shape must match input_ids shape, got {labels.shape} vs {input_ids.shape}")
+        loss = F.cross_entropy(
             logits.contiguous().view(-1, logits.size(-1)),
             labels.contiguous().view(-1),
             ignore_index=-100,
         )
+        if loss_weight is not None:
+            loss = loss * float(loss_weight)
+        return loss
 
     def expert_parallel_spec(self) -> ExpertParallelSpec:
         return ExpertParallelSpec(
             moe_paths=[f"layers.{i}.moe" for i in range(len(self.layers))],
+        )
+
+    def pipeline_parallel_spec(self) -> PipelineParallelSpec:
+        return PipelineParallelSpec(
+            head_layers=["embed"],
+            pipe_layers=["layers"],
+            tail_layers=["norm", "lm_head"],
+        )
+
+    def context_parallel_spec(self) -> ContextParallelSpec:
+        return ContextParallelSpec(
+            attention_paths=[f"layers.{i}.attn" for i in range(len(self.layers))],
         )
 
 

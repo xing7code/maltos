@@ -15,6 +15,7 @@ from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
 from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
+from runtime.core import RuntimePhase
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin, _ExpertParallelMoE
 from runtime.plugins.sp import SequenceParallelPlugin
@@ -50,7 +51,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--case",
-        choices=("ep", "ep_tp", "ep_tp_sp", "ep_ddp_sync", "ep_ddp_async", "ep_ddp_bucket", "ep_zero1", "ep_zero2", "ep_zero3"),
+        choices=(
+            "ep",
+            "ep_tp",
+            "ep_tp_sp",
+            "ep_ddp_sync",
+            "ep_ddp_async",
+            "ep_ddp_bucket",
+            "ep_zero1",
+            "ep_zero2",
+            "ep_zero3",
+            "ep_tp_sp_zero1",
+            "ep_tp_sp_zero2",
+            "ep_tp_sp_zero3",
+        ),
         default="ep",
     )
     parser.add_argument("--world-size", type=int, default=2)
@@ -195,7 +209,18 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_loss = baseline_model(causal_lm_batch(global_tokens))
     baseline_loss.backward()
 
-    if args.case in {"ep", "ep_ddp_sync", "ep_ddp_async", "ep_ddp_bucket", "ep_zero1", "ep_zero2", "ep_zero3"}:
+    if args.case in {
+        "ep",
+        "ep_ddp_sync",
+        "ep_ddp_async",
+        "ep_ddp_bucket",
+        "ep_zero1",
+        "ep_zero2",
+        "ep_zero3",
+        "ep_tp_sp_zero1",
+        "ep_tp_sp_zero2",
+        "ep_tp_sp_zero3",
+    }:
         sharded_cls = TinyMoETransformer
     elif args.case == "ep_tp":
         sharded_cls = TinyMoETransformerTp
@@ -220,9 +245,18 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     elif args.case == "ep_zero3":
         zero_plugin = Zero3Plugin(wrap_cls={torch.nn.Linear, torch.nn.Embedding, RmsNorm})
         plugins.append(zero_plugin)
-    if args.case in {"ep_tp", "ep_tp_sp"}:
+    elif args.case == "ep_tp_sp_zero1":
+        zero_plugin = Zero1Plugin(bucket_mb_size=0)
+        plugins.append(zero_plugin)
+    elif args.case == "ep_tp_sp_zero2":
+        zero_plugin = Zero2Plugin(bucket_mb_size=0)
+        plugins.append(zero_plugin)
+    elif args.case == "ep_tp_sp_zero3":
+        zero_plugin = Zero3Plugin(wrap_cls={torch.nn.Linear, torch.nn.Embedding, RmsNorm})
+        plugins.append(zero_plugin)
+    if args.case in {"ep_tp", "ep_tp_sp", "ep_tp_sp_zero1", "ep_tp_sp_zero2", "ep_tp_sp_zero3"}:
         plugins.insert(0, TensorParallelPlugin())
-    if args.case == "ep_tp_sp":
+    if args.case in {"ep_tp_sp", "ep_tp_sp_zero1", "ep_tp_sp_zero2", "ep_tp_sp_zero3"}:
         plugins.insert(1, SequenceParallelPlugin())
     core = RuntimeCore(
         mesh=mesh,
@@ -241,6 +275,11 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     dp_group = core.get_group(MeshAxis.DP)
     if dp_group is not None:
         dist.all_reduce(runtime_loss, op=dist.ReduceOp.AVG, group=dp_group)
+
+    # Some plugin paths intentionally launch async grad sync in POST_BACKWARD and
+    # only guarantee completion by PRE_STEP. Flush that boundary before comparing
+    # gradients for equivalence.
+    core._run_phase(RuntimePhase.PRE_STEP)
 
     shard_rules = _rule_by_param_name(sharded_model)
     tp_group = core.get_group(MeshAxis.TP)
@@ -279,6 +318,12 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
             runtime_label = "RuntimeCore EP+ZeRO2"
         elif args.case == "ep_zero3":
             runtime_label = "RuntimeCore EP+ZeRO3"
+        elif args.case == "ep_tp_sp_zero1":
+            runtime_label = "RuntimeCore EP+TP+SP+ZeRO1"
+        elif args.case == "ep_tp_sp_zero2":
+            runtime_label = "RuntimeCore EP+TP+SP+ZeRO2"
+        elif args.case == "ep_tp_sp_zero3":
+            runtime_label = "RuntimeCore EP+TP+SP+ZeRO3"
         else:
             runtime_label = "RuntimeCore EP"
         print(f"Baseline loss : {baseline_loss.item():.6f}")
@@ -308,11 +353,9 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    assert args.dp_size == args.ep_size
     assert args.world_size == args.dp_size * args.tp_size
     if args.case in {"ep", "ep_ddp_sync", "ep_ddp_async", "ep_ddp_bucket", "ep_zero1", "ep_zero2", "ep_zero3"}:
         assert args.tp_size == 1
-
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     mp.spawn(_run_worker, args=(args,), nprocs=args.world_size, join=True)
 

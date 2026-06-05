@@ -8,7 +8,7 @@ import torch.distributed.nn.functional as dist_nn
 import torch.nn as nn
 
 from parallel.expert import ExpertParallelMoEModule
-from runtime.core import RuntimePhase
+from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import ExpertParallelizableModule, PluginId, RuntimePlugin
 
@@ -124,7 +124,8 @@ class _ExpertParallelMoE(nn.Module):
             mask = recv_local_expert_idx == local_idx
             if not torch.any(mask):
                 continue
-            recv_outputs[mask] = expert(recv_tokens[mask]) * recv_weights[mask].unsqueeze(1)
+            expert_out = expert(recv_tokens[mask]) * recv_weights[mask].unsqueeze(1)
+            recv_outputs[mask] = expert_out.to(recv_outputs.dtype)
 
         returned_outputs = torch.empty_like(send_tokens)
         returned_outputs = dist_nn.all_to_all_single(
@@ -152,17 +153,6 @@ def _exchange_counts(send_counts: torch.Tensor, group: dist.ProcessGroup) -> tor
     )
     return recv_counts
 
-
-def is_ep_expert_param(runtime, param: nn.Parameter) -> bool:
-    for plugin in runtime.plugins:
-        if plugin.id != PluginId.EP:
-            continue
-        checker = getattr(plugin, "is_expert_param", None)
-        if callable(checker):
-            return bool(checker(param))
-    return False
-
-
 class ExpertParallelPlugin(RuntimePlugin):
     def __init__(self) -> None:
         super().__init__(
@@ -173,6 +163,8 @@ class ExpertParallelPlugin(RuntimePlugin):
         )
         self._expert_param_ids: set[int] = set()
         self._shared_grad_sync_handles: list[dist.Work] = []
+        self._expert_edp_grad_sync_handles: list[dist.Work] = []
+        self._expert_cp_grad_sync_handles: list[dist.Work] = []
         self._delegate_shared_dp_sync = False
 
     @property
@@ -188,6 +180,16 @@ class ExpertParallelPlugin(RuntimePlugin):
         assert self.runtime is not None
         return self.runtime.get_group(MeshAxis.DP)
 
+    @property
+    def edp_group(self) -> dist.ProcessGroup | None:
+        assert self.runtime is not None
+        return self.runtime.get_group(MeshAxis.EDP)
+
+    @property
+    def cp_group(self) -> dist.ProcessGroup | None:
+        assert self.runtime is not None
+        return self.runtime.get_group(MeshAxis.CP)
+
     def bind(self, runtime) -> None:
         super().bind(runtime)
         active = {plugin.id for plugin in runtime.plugins if plugin is not self}
@@ -202,7 +204,12 @@ class ExpertParallelPlugin(RuntimePlugin):
             )
         spec = model.expert_parallel_spec()
         for path in spec.moe_paths:
-            module = model.get_submodule(path)
+            if self.runtime.is_module_path_omitted(path):
+                continue
+            try:
+                module = model.get_submodule(path)
+            except AttributeError:
+                raise
             _validate_supported_moe_module(module)
             model.set_submodule(path, _ExpertParallelMoE.from_moe(module, self.ep_group))
         self._expert_param_ids = {
@@ -211,16 +218,42 @@ class ExpertParallelPlugin(RuntimePlugin):
             if isinstance(module, _ExpertParallelMoE)
             for param in module.local_experts.parameters()
         }
+        for param in model.parameters():
+            if not param.requires_grad:
+                continue
+            role = ParamRole.EXPERT if id(param) in self._expert_param_ids else ParamRole.SHARED
+            self.runtime.set_param_role(param, role)
         return model
 
     def is_expert_param(self, param: nn.Parameter) -> bool:
-        return id(param) in self._expert_param_ids
+        assert self.runtime is not None
+        return self.runtime.get_param_role(param) == ParamRole.EXPERT
 
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
             if not self.runtime.state.step_context.is_step_boundary:
                 return
+            self._expert_cp_grad_sync_handles.clear()
+            self._expert_edp_grad_sync_handles.clear()
+            expert_params = [
+                param
+                for param in self.runtime.model.parameters()
+                if param.requires_grad and param.grad is not None and id(param) in self._expert_param_ids
+            ]
+            expert_param_ids = {id(param) for param in expert_params}
+            if self.cp_group is not None and dist.get_world_size(self.cp_group) > 1:
+                for param in expert_params:
+                    self._expert_cp_grad_sync_handles.append(
+                        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=self.cp_group, async_op=True)
+                    )
+            if self.edp_group is not None and dist.get_world_size(self.edp_group) > 1:
+                for param in self.runtime.model.parameters():
+                    if id(param) not in expert_param_ids:
+                        continue
+                    self._expert_edp_grad_sync_handles.append(
+                        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.edp_group, async_op=True)
+                    )
             if self._delegate_shared_dp_sync:
                 return
             if self.dp_group is None or dist.get_world_size(self.dp_group) <= 1:
@@ -237,6 +270,12 @@ class ExpertParallelPlugin(RuntimePlugin):
             return
         if phase != RuntimePhase.PRE_STEP:
             return
+        for handle in self._expert_cp_grad_sync_handles:
+            handle.wait()
+        self._expert_cp_grad_sync_handles.clear()
+        for handle in self._expert_edp_grad_sync_handles:
+            handle.wait()
+        self._expert_edp_grad_sync_handles.clear()
         for handle in self._shared_grad_sync_handles:
             handle.wait()
         self._shared_grad_sync_handles.clear()
@@ -246,24 +285,17 @@ class ExpertParallelPlugin(RuntimePlugin):
         mesh = self.runtime.mesh
         if mesh.ep <= 1:
             raise ValueError("ExpertParallelPlugin requires mesh.ep > 1")
-        if mesh.dp != mesh.ep:
+        if mesh.dp < mesh.ep:
             raise ValueError(
-                "ExpertParallelPlugin v0 currently requires dp == ep "
-                f"(no expert-data-parallel replicas yet), got dp={mesh.dp}, ep={mesh.ep}"
+                "ExpertParallelPlugin requires dp >= ep, "
+                f"got dp={mesh.dp}, ep={mesh.ep}"
             )
-        if mesh.pp != 1 or mesh.cp != 1:
+        if mesh.pp < 1 or mesh.cp < 1:
             raise ValueError(
-                "ExpertParallelPlugin v0 currently requires pp=cp=1, "
+                "ExpertParallelPlugin requires pp>=1 and cp>=1, "
                 f"got dp={mesh.dp} tp={mesh.tp} pp={mesh.pp} cp={mesh.cp} ep={mesh.ep}"
             )
         active = {plugin.id for plugin in self.runtime.plugins if plugin is not self}
-        unsupported = {
-            PluginId.CP,
-            PluginId.PP,
-        }
-        overlap = sorted(plugin_id.value for plugin_id in active & unsupported)
-        if overlap:
-            raise ValueError(f"ExpertParallelPlugin v0 does not yet support plugin combinations: {overlap}")
 
 
 def _validate_supported_moe_module(module: nn.Module) -> None:
