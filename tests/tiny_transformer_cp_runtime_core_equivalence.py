@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 
 from helpers import causal_lm_batch
 from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
+from parallel.context import ContextParallelAttentionCoreType
 from parallel.specs import TpSpShardAxis
 from parallel import ParallelPlan
 from runtime import MeshAxis, MeshConfig, RuntimeCore
@@ -53,6 +54,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cp-size", type=int, default=2)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--use-sp", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--cp-attn-core",
+        type=str,
+        default="all_gather_kv",
+        choices=tuple(core.value for core in ContextParallelAttentionCoreType),
+    )
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29581)
     parser.add_argument("--backend", type=str, default="gloo")
@@ -237,7 +244,8 @@ def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespac
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, pp=1, cp=args.cp_size, tp=args.tp_size, ep=1),
         plan=ParallelPlan(
-            zero_stage=1 if args.case == "cp_zero1" else 2 if args.case == "cp_zero2" else 3 if args.case == "cp_zero3" else 0
+            zero_stage=1 if args.case == "cp_zero1" else 2 if args.case == "cp_zero2" else 3 if args.case == "cp_zero3" else 0,
+            cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
         ),
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
@@ -331,6 +339,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     if rank == 0:
         print(f"Case          : {args.case}")
+        print(f"CP attn core  : {args.cp_attn_core}")
         print(f"Baseline loss : {baseline_loss_value:.6f}")
         print(f"Runtime CP    : {runtime_loss_value:.6f}")
         print(f"Loss diff     : {loss_diff_tensor.item():.2e}  (atol={_LOSS_ATOL:.2e})")

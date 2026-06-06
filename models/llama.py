@@ -55,7 +55,21 @@ class LlamaRotaryEmbedding(nn.Module):
         self.register_buffer("cos", freqs.cos(), persistent=False)
         self.register_buffer("sin", freqs.sin(), persistent=False)
 
-    def forward(self, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        start: int | None = None,
+        end: int | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if position_ids is not None:
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+            flat = position_ids.to(device=self.cos.device, dtype=torch.long).reshape(-1)
+            cos = self.cos.index_select(0, flat).view(*position_ids.shape, -1).unsqueeze(1)
+            sin = self.sin.index_select(0, flat).view(*position_ids.shape, -1).unsqueeze(1)
+            return cos, sin
+        if start is None or end is None:
+            raise ValueError("LlamaRotaryEmbedding requires either position_ids or start/end")
         cos = self.cos[start:end].unsqueeze(0).unsqueeze(0)
         sin = self.sin[start:end].unsqueeze(0).unsqueeze(0)
         return cos, sin
@@ -73,6 +87,28 @@ def _repeat_kv(x: torch.Tensor, repeats: int) -> torch.Tensor:
     if repeats == 1:
         return x
     return x.repeat_interleave(repeats, dim=1)
+
+
+def _normalize_position_ids(
+    position_ids: torch.Tensor | None,
+    *,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if position_ids is None:
+        return None
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    if position_ids.dim() != 2:
+        raise ValueError(f"position_ids must have rank 1 or 2, got shape={tuple(position_ids.shape)}")
+    if position_ids.size(1) != seq_len:
+        raise ValueError(f"position_ids length must match sequence length, got {position_ids.size(1)} vs {seq_len}")
+    if position_ids.size(0) == 1 and batch_size > 1:
+        position_ids = position_ids.expand(batch_size, -1)
+    elif position_ids.size(0) != batch_size:
+        raise ValueError(f"position_ids batch size must be 1 or {batch_size}, got {position_ids.size(0)}")
+    return position_ids.to(device=device, dtype=torch.long)
 
 
 def _eager_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -108,9 +144,18 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.attn_core = _LlamaAttentionCore(config.attention_backend)
 
-    def forward(self, x: torch.Tensor, *, position_offset: int = 0) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        position_offset: int = 0,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
-        cos, sin = self.rotary_emb(position_offset, position_offset + seq_len)
+        if position_ids is None:
+            cos, sin = self.rotary_emb(position_offset, position_offset + seq_len)
+        else:
+            cos, sin = self.rotary_emb(position_ids=position_ids)
         cos = cos.to(device=x.device, dtype=x.dtype)
         sin = sin.to(device=x.device, dtype=x.dtype)
         q = self.q_proj(x).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
@@ -121,7 +166,7 @@ class LlamaAttention(nn.Module):
         repeats = q.size(1) // k.size(1)
         k = _repeat_kv(k, repeats)
         v = _repeat_kv(v, repeats)
-        vo = self.attn_core(q, k, v, position_offset)
+        vo = self.attn_core(q, k, v, position_offset, position_ids)
         out = vo.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(out)
 
@@ -131,8 +176,15 @@ class _LlamaAttentionCore(nn.Module):
         super().__init__()
         self.attention_backend = attention_backend
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, position_offset: int) -> torch.Tensor:
-        del position_offset
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        position_offset: int,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del position_offset, position_ids
         if self.attention_backend == "sdpa_auto":
             return F.scaled_dot_product_attention(q, k, v, is_causal=True)
         if self.attention_backend == "sdpa_flash":
@@ -160,8 +212,13 @@ class LlamaDecoderLayer(nn.Module):
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), position_offset=position_offset)
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_offset: int = 0,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = x + self.self_attn(self.input_layernorm(x), position_offset=position_offset, position_ids=position_ids)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -183,16 +240,19 @@ class LlamaForCausalLM(nn.Module):
             hidden_states = batch.get("hidden_states")
             labels = batch.get("labels")
             position_offset = int(batch.get("position_offset", 0))
+            position_ids = batch.get("position_ids")
             loss_weight = batch.get("loss_weight")
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
             hidden_states = None
             position_offset = 0
+            position_ids = None
             loss_weight = None
         else:
             input_ids, labels = batch, None
             hidden_states = None
             position_offset = 0
+            position_ids = None
             loss_weight = None
 
         if hidden_states is not None:
@@ -203,11 +263,16 @@ class LlamaForCausalLM(nn.Module):
             if self.embed_tokens is None:
                 raise ValueError("LlamaForCausalLM PP non-first stage requires hidden_states input")
             x = self.embed_tokens(input_ids)
+        position_ids = _normalize_position_ids(position_ids, batch_size=x.size(0), seq_len=x.size(1), device=x.device)
         for layer_idx, layer in enumerate(self.layers):
             if self.training and self.config.activation_checkpointing.should_checkpoint_layer(layer_idx):
-                x = checkpoint(lambda y: layer(y, position_offset=position_offset), x, use_reentrant=False)
+                x = checkpoint(
+                    lambda y: layer(y, position_offset=position_offset, position_ids=position_ids),
+                    x,
+                    use_reentrant=False,
+                )
             else:
-                x = layer(x, position_offset=position_offset)
+                x = layer(x, position_offset=position_offset, position_ids=position_ids)
         if self.norm is None or self.lm_head is None:
             return x
         logits = self.lm_head(self.norm(x))

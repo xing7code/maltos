@@ -23,7 +23,7 @@ class CausalSelfAttention(nn.Module):
         self.o_proj = nn.Linear(dim, dim, bias=False)
         self.attn_core = _LocalCausalAttentionCore()
 
-    def forward(self, x, cos=None, sin=None, position_offset: int = 0):
+    def forward(self, x, cos=None, sin=None, position_offset: int = 0, position_ids: torch.Tensor | None = None):
         debug_log(3, f"layer: {self._get_name()} input shape={x.size()}")
         b, s, d = x.size()
         # use -1 for n_heads, n_kv_heads, this dim can be sharded for TP.
@@ -34,7 +34,7 @@ class CausalSelfAttention(nn.Module):
         if self.n_heads != self.n_kv_heads:
             k = k.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1)
             v = v.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1)
-        vo = self.attn_core(q, k, v, position_offset)
+        vo = self.attn_core(q, k, v, position_offset, position_ids)
         # use -1 for last dim, it can be different than d for TP.
         out = vo.transpose(1, 2).contiguous().view(b, s, -1)
         output = self.o_proj(out)
@@ -43,8 +43,15 @@ class CausalSelfAttention(nn.Module):
 
 
 class _LocalCausalAttentionCore(nn.Module):
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, position_offset: int) -> torch.Tensor:
-        del position_offset
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        position_offset: int,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del position_offset, position_ids
         logits = (q @ k.transpose(-1, -2)) / q.size(-1) ** 0.5
         seq_len = q.size(-2)
         mask = torch.ones(seq_len, seq_len, device=q.device).triu(1).bool()
@@ -88,8 +95,8 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(dim, hidden_size)
         self.norm2 = RmsNorm(dim, eps)
     
-    def forward(self, x, cos=None, sin=None, position_offset: int = 0):
-        x = self.attn(self.norm1(x), cos, sin, position_offset=position_offset) + x
+    def forward(self, x, cos=None, sin=None, position_offset: int = 0, position_ids: torch.Tensor | None = None):
+        x = self.attn(self.norm1(x), cos, sin, position_offset=position_offset, position_ids=position_ids) + x
         x = self.mlp(self.norm2(x)) + x
         return x
 
@@ -103,8 +110,44 @@ class RoPE(nn.Module):
         self.register_buffer("cos", torch.cos(freq))
         self.register_buffer("sin", torch.sin(freq))
 
-    def forward(self, start, end):
+    def forward(
+        self,
+        start: int | None = None,
+        end: int | None = None,
+        position_ids: torch.Tensor | None = None,
+    ):
+        if position_ids is not None:
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+            flat = position_ids.to(device=self.cos.device, dtype=torch.long).reshape(-1)
+            cos = self.cos.index_select(0, flat).view(*position_ids.shape, -1).unsqueeze(1)
+            sin = self.sin.index_select(0, flat).view(*position_ids.shape, -1).unsqueeze(1)
+            return cos, sin
+        if start is None or end is None:
+            raise ValueError("RoPE requires either position_ids or start/end")
         return self.cos[start:end].unsqueeze(0).unsqueeze(0), self.sin[start:end].unsqueeze(0).unsqueeze(0)
+
+
+def _normalize_position_ids(
+    position_ids: torch.Tensor | None,
+    *,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if position_ids is None:
+        return None
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    if position_ids.dim() != 2:
+        raise ValueError(f"position_ids must have rank 1 or 2, got shape={tuple(position_ids.shape)}")
+    if position_ids.size(1) != seq_len:
+        raise ValueError(f"position_ids length must match sequence length, got {position_ids.size(1)} vs {seq_len}")
+    if position_ids.size(0) == 1 and batch_size > 1:
+        position_ids = position_ids.expand(batch_size, -1)
+    elif position_ids.size(0) != batch_size:
+        raise ValueError(f"position_ids batch size must be 1 or {batch_size}, got {position_ids.size(0)}")
+    return position_ids.to(device=device, dtype=torch.long)
 
 
 class TinyTransformer(nn.Module):
@@ -124,16 +167,19 @@ class TinyTransformer(nn.Module):
             hidden_states = batch.get("hidden_states")
             labels = batch.get("labels")
             position_offset = int(batch.get("position_offset", 0))
+            position_ids = batch.get("position_ids")
             loss_weight = batch.get("loss_weight")
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
             hidden_states = None
             position_offset = 0
+            position_ids = None
             loss_weight = None
         else:
             input_ids, labels = batch, None
             hidden_states = None
             position_offset = 0
+            position_ids = None
             loss_weight = None
 
         if hidden_states is not None:
@@ -145,9 +191,13 @@ class TinyTransformer(nn.Module):
                 raise ValueError("TinyTransformer PP non-first stage requires hidden_states input")
             x = self.embed(input_ids)
         b, s, d = x.size()
-        cos, sin = self.rope(position_offset, position_offset + s)
+        position_ids = _normalize_position_ids(position_ids, batch_size=b, seq_len=s, device=x.device)
+        if position_ids is None:
+            cos, sin = self.rope(position_offset, position_offset + s)
+        else:
+            cos, sin = self.rope(position_ids=position_ids)
         for layer in self.layers:
-            x = layer(x, cos, sin, position_offset=position_offset)
+            x = layer(x, cos, sin, position_offset=position_offset, position_ids=position_ids)
         if self.norm is None or self.lm_head is None:
             return x
         x = self.norm(x)

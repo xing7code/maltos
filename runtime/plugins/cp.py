@@ -92,6 +92,7 @@ class ContextParallelPlugin(RuntimePlugin):
                 self.runtime.state.batch,
                 rank=self.rank,
                 world_size=self.world_size,
+                attention_core_type=self.runtime.plan.cp_attn_core,
             )
             return
         if phase == RuntimePhase.POST_BACKWARD:
@@ -165,50 +166,88 @@ def _validate_supported_attention_module(module: nn.Module) -> None:
         )
 
 
-def _shard_batch_for_cp(batch: Any, *, rank: int, world_size: int) -> Any:
+def _shard_batch_for_cp(
+    batch: Any,
+    *,
+    rank: int,
+    world_size: int,
+    attention_core_type: ContextParallelAttentionCoreType,
+) -> Any:
     if world_size == 1:
         return batch
+    seq_len = _infer_seq_len(batch)
+    local_positions = _local_position_ids(
+        seq_len,
+        rank=rank,
+        world_size=world_size,
+        attention_core_type=attention_core_type,
+    )
     if isinstance(batch, dict):
-        seq_len = _infer_seq_len_from_dict(batch)
-        start, length = _local_seq_range(seq_len, rank, world_size)
         sharded = dict(batch)
         for key in ("input_ids", "labels", "hidden_states", "position_ids"):
             value = sharded.get(key)
-            if torch.is_tensor(value) and value.dim() >= 2:
-                sharded[key] = value.narrow(1, start, length).contiguous()
-        sharded["position_offset"] = start
+            sharded[key] = _shard_batch_item(value, local_positions, seq_len)
+        sharded["position_ids"] = _materialize_position_ids(
+            sharded.get("position_ids"),
+            positions=local_positions,
+            seq_len=seq_len,
+            reference=_batch_reference_tensor(sharded),
+        )
+        sharded["position_offset"] = int(local_positions[0].item())
         sharded["loss_weight"] = _loss_weight(batch.get("labels"), sharded.get("labels"))
         return sharded
     if isinstance(batch, tuple):
-        seq_len = _infer_seq_len_from_sequence(batch)
-        start, length = _local_seq_range(seq_len, rank, world_size)
-        input_ids = _shard_batch_item(batch[0], start, length) if len(batch) > 0 else None
-        labels = _shard_batch_item(batch[1], start, length) if len(batch) > 1 else None
+        input_ids = _shard_batch_item(batch[0], local_positions, seq_len) if len(batch) > 0 else None
+        labels = _shard_batch_item(batch[1], local_positions, seq_len) if len(batch) > 1 else None
         return {
             "input_ids": input_ids,
             "labels": labels,
-            "position_offset": start,
+            "position_ids": _materialize_position_ids(
+                None,
+                positions=local_positions,
+                seq_len=seq_len,
+                reference=input_ids if torch.is_tensor(input_ids) else labels,
+            ),
+            "position_offset": int(local_positions[0].item()),
             "loss_weight": _loss_weight(batch[1] if len(batch) > 1 else None, labels),
         }
     if isinstance(batch, list):
-        seq_len = _infer_seq_len_from_sequence(batch)
-        start, length = _local_seq_range(seq_len, rank, world_size)
-        input_ids = _shard_batch_item(batch[0], start, length) if len(batch) > 0 else None
-        labels = _shard_batch_item(batch[1], start, length) if len(batch) > 1 else None
+        input_ids = _shard_batch_item(batch[0], local_positions, seq_len) if len(batch) > 0 else None
+        labels = _shard_batch_item(batch[1], local_positions, seq_len) if len(batch) > 1 else None
         return {
             "input_ids": input_ids,
             "labels": labels,
-            "position_offset": start,
+            "position_ids": _materialize_position_ids(
+                None,
+                positions=local_positions,
+                seq_len=seq_len,
+                reference=input_ids if torch.is_tensor(input_ids) else labels,
+            ),
+            "position_offset": int(local_positions[0].item()),
             "loss_weight": _loss_weight(batch[1] if len(batch) > 1 else None, labels),
         }
     raise TypeError(f"ContextParallelPlugin v0 does not support batch type={type(batch).__name__}")
 
 
+def _infer_seq_len(batch: Any) -> int:
+    if isinstance(batch, dict):
+        return _infer_seq_len_from_dict(batch)
+    if isinstance(batch, (tuple, list)):
+        return _infer_seq_len_from_sequence(batch)
+    raise TypeError(f"ContextParallelPlugin v0 does not support batch type={type(batch).__name__}")
+
+
 def _infer_seq_len_from_dict(batch: dict[str, Any]) -> int:
-    for key in ("input_ids", "labels", "hidden_states", "position_ids"):
+    for key in ("input_ids", "labels", "hidden_states"):
         value = batch.get(key)
         if torch.is_tensor(value) and value.dim() >= 2:
             return int(value.size(1))
+    position_ids = batch.get("position_ids")
+    if torch.is_tensor(position_ids):
+        if position_ids.dim() >= 2:
+            return int(position_ids.size(1))
+        if position_ids.dim() == 1:
+            return int(position_ids.size(0))
     raise TypeError("ContextParallelPlugin could not infer sequence length from dict batch")
 
 
@@ -229,9 +268,61 @@ def _local_seq_range(seq_len: int, rank: int, world_size: int) -> tuple[int, int
     return rank * shard_len, shard_len
 
 
-def _shard_batch_item(value: Any, start: int, length: int) -> Any:
-    if torch.is_tensor(value) and value.dim() >= 2:
-        return value.narrow(1, start, length).contiguous()
+def _local_position_ids(
+    seq_len: int,
+    *,
+    rank: int,
+    world_size: int,
+    attention_core_type: ContextParallelAttentionCoreType,
+) -> torch.Tensor:
+    if attention_core_type != ContextParallelAttentionCoreType.RING:
+        start, length = _local_seq_range(seq_len, rank, world_size)
+        return torch.arange(start, start + length, dtype=torch.long)
+    if seq_len % (2 * world_size) != 0:
+        raise ValueError(
+            "CP ring zigzag requires sequence length divisible by 2 * cp world size, "
+            f"got seq_len={seq_len}, cp={world_size}"
+        )
+    half_len = seq_len // (2 * world_size)
+    front_start = rank * half_len
+    back_start = (2 * world_size - rank - 1) * half_len
+    front = torch.arange(front_start, front_start + half_len, dtype=torch.long)
+    back = torch.arange(back_start, back_start + half_len, dtype=torch.long)
+    return torch.cat([front, back], dim=0)
+
+
+def _batch_reference_tensor(batch: dict[str, Any]) -> torch.Tensor | None:
+    for key in ("input_ids", "labels", "hidden_states"):
+        value = batch.get(key)
+        if torch.is_tensor(value) and value.dim() >= 2:
+            return value
+    return None
+
+
+def _materialize_position_ids(
+    current: Any,
+    *,
+    positions: torch.Tensor,
+    seq_len: int,
+    reference: torch.Tensor | None,
+) -> torch.Tensor:
+    if torch.is_tensor(current):
+        sharded = _shard_batch_item(current, positions, seq_len)
+        if torch.is_tensor(sharded):
+            return sharded
+    if reference is None:
+        return positions.clone()
+    batch_size = int(reference.size(0))
+    return positions.unsqueeze(0).expand(batch_size, -1).contiguous()
+
+
+def _shard_batch_item(value: Any, positions: torch.Tensor, seq_len: int) -> Any:
+    if torch.is_tensor(value):
+        index = positions.to(device=value.device)
+        if value.dim() >= 2 and value.size(1) == seq_len:
+            return value.index_select(1, index).contiguous()
+        if value.dim() == 1 and value.size(0) == seq_len:
+            return value.index_select(0, index).contiguous()
     return value
 
 

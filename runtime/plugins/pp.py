@@ -215,6 +215,8 @@ class PipelineParallelPlugin(RuntimePlugin):
             model_input = {"hidden_states": input_activation}
             if isinstance(micro_batch, dict) and "position_offset" in micro_batch:
                 model_input["position_offset"] = micro_batch["position_offset"]
+            if isinstance(micro_batch, dict) and "position_ids" in micro_batch:
+                model_input["position_ids"] = micro_batch["position_ids"]
             if self.next_global_rank is None:
                 model_input["labels"] = _extract_labels(micro_batch)
                 if isinstance(micro_batch, dict) and "loss_weight" in micro_batch:

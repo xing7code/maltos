@@ -25,4 +25,5 @@ class ContextParallelAttentionCore(Protocol):
         k: torch.Tensor,
         v: torch.Tensor,
         position_offset: int,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor: ...

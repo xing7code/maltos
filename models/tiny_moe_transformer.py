@@ -8,7 +8,7 @@ from parallel.context import ContextParallelSpec
 from parallel.expert import ExpertParallelMoEModule, ExpertParallelSpec
 from parallel.pipeline import PipelineParallelSpec
 from parallel.specs import TpSpComm, TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
-from models.tiny_transformer import CausalSelfAttention, RmsNorm, RoPE, MLP
+from models.tiny_transformer import CausalSelfAttention, RmsNorm, RoPE, MLP, _normalize_position_ids
 
 
 class Top1MoE(nn.Module):
@@ -56,8 +56,15 @@ class MoETransformerBlock(nn.Module):
         self.moe = Top1MoE(dim, hidden_size, num_experts)
         self.norm2 = RmsNorm(dim, eps)
 
-    def forward(self, x: torch.Tensor, cos=None, sin=None, position_offset: int = 0) -> torch.Tensor:
-        x = self.attn(self.norm1(x), cos, sin, position_offset=position_offset) + x
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos=None,
+        sin=None,
+        position_offset: int = 0,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = self.attn(self.norm1(x), cos, sin, position_offset=position_offset, position_ids=position_ids) + x
         x = self.moe(self.norm2(x)) + x
         return x
 
@@ -93,16 +100,19 @@ class TinyMoETransformer(nn.Module):
             hidden_states = batch.get("hidden_states")
             labels = batch.get("labels")
             position_offset = int(batch.get("position_offset", 0))
+            position_ids = batch.get("position_ids")
             loss_weight = batch.get("loss_weight")
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
             hidden_states = None
             position_offset = 0
+            position_ids = None
             loss_weight = None
         else:
             input_ids, labels = batch, None
             hidden_states = None
             position_offset = 0
+            position_ids = None
             loss_weight = None
 
         if hidden_states is not None:
@@ -114,10 +124,14 @@ class TinyMoETransformer(nn.Module):
                 raise ValueError("TinyMoETransformer PP non-first stage requires hidden_states input")
             x = self.embed(input_ids)
 
-        _, seq_len, _ = x.shape
-        cos, sin = self.rope(position_offset, position_offset + seq_len)
+        batch_size, seq_len, _ = x.shape
+        position_ids = _normalize_position_ids(position_ids, batch_size=batch_size, seq_len=seq_len, device=x.device)
+        if position_ids is None:
+            cos, sin = self.rope(position_offset, position_offset + seq_len)
+        else:
+            cos, sin = self.rope(position_ids=position_ids)
         for layer in self.layers:
-            x = layer(x, cos, sin, position_offset=position_offset)
+            x = layer(x, cos, sin, position_offset=position_offset, position_ids=position_ids)
         if self.norm is None or self.lm_head is None:
             return x
         logits = self.lm_head(self.norm(x))

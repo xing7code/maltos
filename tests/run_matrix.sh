@@ -59,12 +59,14 @@ done
 
 echo "=== tiny transformer cp equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp --world-size 2 --dp-size 1 --cp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp --world-size 2 --dp-size 1 --cp-size 2 --cp-attn-core ring
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_ddp_sync --world-size 4 --dp-size 2 --cp-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_ddp_async --world-size 4 --dp-size 2 --cp-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_ddp_bucket --world-size 4 --dp-size 2 --cp-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_zero1 --world-size 4 --dp-size 2 --cp-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_zero2 --world-size 4 --dp-size 2 --cp-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_zero3 --world-size 4 --dp-size 2 --cp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp_zero3 --world-size 4 --dp-size 2 --cp-size 2 --cp-attn-core ring
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp --world-size 4 --dp-size 1 --cp-size 2 --tp-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_cp_runtime_core_equivalence.py --case cp --world-size 4 --dp-size 1 --cp-size 2 --tp-size 2 --use-sp
 
