@@ -16,6 +16,9 @@ metric aggregation, and a trainer loop that can run real token shards.
 Technical writeups live in the companion blog repo:
 [xing7code/maltos-blog](https://github.com/xing7code/maltos-blog).
 
+Practical integration guide:
+[docs/USER_GUIDE.md](docs/USER_GUIDE.md)
+
 Experiment tracking: [W&B report](https://api.wandb.ai/links/xing7-org/f2s88x30)
 
 ## What Works
