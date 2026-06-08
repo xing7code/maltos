@@ -128,27 +128,6 @@ class RoPE(nn.Module):
         return self.cos[start:end].unsqueeze(0).unsqueeze(0), self.sin[start:end].unsqueeze(0).unsqueeze(0)
 
 
-def _normalize_position_ids(
-    position_ids: torch.Tensor | None,
-    *,
-    batch_size: int,
-    seq_len: int,
-    device: torch.device,
-) -> torch.Tensor | None:
-    if position_ids is None:
-        return None
-    if position_ids.dim() == 1:
-        position_ids = position_ids.unsqueeze(0)
-    if position_ids.dim() != 2:
-        raise ValueError(f"position_ids must have rank 1 or 2, got shape={tuple(position_ids.shape)}")
-    if position_ids.size(1) != seq_len:
-        raise ValueError(f"position_ids length must match sequence length, got {position_ids.size(1)} vs {seq_len}")
-    if position_ids.size(0) == 1 and batch_size > 1:
-        position_ids = position_ids.expand(batch_size, -1)
-    elif position_ids.size(0) != batch_size:
-        raise ValueError(f"position_ids batch size must be 1 or {batch_size}, got {position_ids.size(0)}")
-    return position_ids.to(device=device, dtype=torch.long)
-
 
 class TinyTransformer(nn.Module):
     def __init__(self, dim, n_heads, n_kv_heads, hidden_size, eps, n_layers, vocab_size, max_seq_len):
@@ -191,7 +170,6 @@ class TinyTransformer(nn.Module):
                 raise ValueError("TinyTransformer PP non-first stage requires hidden_states input")
             x = self.embed(input_ids)
         b, s, d = x.size()
-        position_ids = _normalize_position_ids(position_ids, batch_size=b, seq_len=s, device=x.device)
         if position_ids is None:
             cos, sin = self.rope(position_offset, position_offset + s)
         else:

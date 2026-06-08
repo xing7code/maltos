@@ -306,14 +306,15 @@ def _materialize_position_ids(
     seq_len: int,
     reference: torch.Tensor | None,
 ) -> torch.Tensor:
+    device = reference.device if reference is not None else positions.device
     if torch.is_tensor(current):
         sharded = _shard_batch_item(current, positions, seq_len)
         if torch.is_tensor(sharded):
-            return sharded
+            return sharded.to(device=device, dtype=torch.long)
     if reference is None:
-        return positions.clone()
+        return positions.to(dtype=torch.long)
     batch_size = int(reference.size(0))
-    return positions.unsqueeze(0).expand(batch_size, -1).contiguous()
+    return positions.unsqueeze(0).expand(batch_size, -1).contiguous().to(device=device, dtype=torch.long)
 
 
 def _shard_batch_item(value: Any, positions: torch.Tensor, seq_len: int) -> Any:

@@ -8,7 +8,7 @@ from parallel.context import ContextParallelSpec
 from parallel.expert import ExpertParallelMoEModule, ExpertParallelSpec
 from parallel.pipeline import PipelineParallelSpec
 from parallel.specs import TpSpComm, TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
-from models.tiny_transformer import CausalSelfAttention, RmsNorm, RoPE, MLP, _normalize_position_ids
+from models.tiny_transformer import CausalSelfAttention, RmsNorm, RoPE, MLP
 
 
 class Top1MoE(nn.Module):
@@ -125,7 +125,6 @@ class TinyMoETransformer(nn.Module):
             x = self.embed(input_ids)
 
         batch_size, seq_len, _ = x.shape
-        position_ids = _normalize_position_ids(position_ids, batch_size=batch_size, seq_len=seq_len, device=x.device)
         if position_ids is None:
             cos, sin = self.rope(position_offset, position_offset + seq_len)
         else:

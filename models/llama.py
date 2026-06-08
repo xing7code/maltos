@@ -89,26 +89,6 @@ def _repeat_kv(x: torch.Tensor, repeats: int) -> torch.Tensor:
     return x.repeat_interleave(repeats, dim=1)
 
 
-def _normalize_position_ids(
-    position_ids: torch.Tensor | None,
-    *,
-    batch_size: int,
-    seq_len: int,
-    device: torch.device,
-) -> torch.Tensor | None:
-    if position_ids is None:
-        return None
-    if position_ids.dim() == 1:
-        position_ids = position_ids.unsqueeze(0)
-    if position_ids.dim() != 2:
-        raise ValueError(f"position_ids must have rank 1 or 2, got shape={tuple(position_ids.shape)}")
-    if position_ids.size(1) != seq_len:
-        raise ValueError(f"position_ids length must match sequence length, got {position_ids.size(1)} vs {seq_len}")
-    if position_ids.size(0) == 1 and batch_size > 1:
-        position_ids = position_ids.expand(batch_size, -1)
-    elif position_ids.size(0) != batch_size:
-        raise ValueError(f"position_ids batch size must be 1 or {batch_size}, got {position_ids.size(0)}")
-    return position_ids.to(device=device, dtype=torch.long)
 
 
 def _eager_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -263,7 +243,6 @@ class LlamaForCausalLM(nn.Module):
             if self.embed_tokens is None:
                 raise ValueError("LlamaForCausalLM PP non-first stage requires hidden_states input")
             x = self.embed_tokens(input_ids)
-        position_ids = _normalize_position_ids(position_ids, batch_size=x.size(0), seq_len=x.size(1), device=x.device)
         for layer_idx, layer in enumerate(self.layers):
             if self.training and self.config.activation_checkpointing.should_checkpoint_layer(layer_idx):
                 x = checkpoint(
