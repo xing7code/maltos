@@ -72,7 +72,7 @@ CLI exposes directly.
 | Sequence parallelism | Supported | Supported |
 | Pipeline parallelism | Supported | Supported |
 | Context parallelism | Supported | Supported |
-| Expert parallelism | Supported | Not exposed yet |
+| Expert parallelism | Supported | Supported |
 | ZeRO-1 / ZeRO-2 / ZeRO-3 style sharding | Supported | Supported |
 | BF16 / FP16 precision hooks | Supported | Supported |
 | Gradient accumulation / clipping | Supported | Supported |

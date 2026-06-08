@@ -20,6 +20,9 @@ from models import (
     LlamaForCausalLM,
     LlamaForCausalLMTp,
     LlamaForCausalLMTpSp,
+    TinyMoETransformer,
+    TinyMoETransformerTp,
+    TinyMoETransformerTpSp,
     TinyTransformer,
     TinyTransformerTp,
     TinyTransformerTpSp,
@@ -32,6 +35,7 @@ from parallel.schedule import PipelineScheduleConfig
 from runtime import MeshConfig, RuntimeCore
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.cp import ContextParallelPlugin
+from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.perf_metrics import PerfMetricsPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
@@ -83,12 +87,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--model", type=str, default="tiny", choices=("tiny", "llama"))
+    parser.add_argument("--model", type=str, default="tiny", choices=("tiny", "tiny_moe", "llama"))
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--n-kv-heads", type=int, default=None)
     parser.add_argument("--hidden-size", type=int, default=1024)
     parser.add_argument("--n-layers", type=int, default=4)
+    parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument("--eps", type=float, default=1e-5)
     parser.add_argument("--attention-backend", type=str, default="sdpa_auto", choices=("eager", "sdpa_auto", "sdpa_flash"))
@@ -106,6 +111,7 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(core.value for core in ContextParallelAttentionCoreType),
     )
     parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--zero-stage", type=int, default=0, choices=(0, 1, 2, 3))
     parser.add_argument("--use-sp", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ddp-mode", type=str, default=None, choices=("sync", "async", "bucket"))
@@ -168,6 +174,10 @@ def main() -> None:
         raise ValueError("--use-sp requires --tp-size > 1")
     if args.cp_size > 1 and args.seq_len % args.cp_size != 0:
         raise ValueError("--cp-size requires --seq-len divisible by cp_size for CP v0")
+    if args.ep_size > 1 and args.dp_size % args.ep_size != 0:
+        raise ValueError("--ep-size must divide --dp-size")
+    if args.ep_size > 1 and args.model != "tiny_moe":
+        raise ValueError("--ep-size > 1 requires --model tiny_moe")
     if args.zero_stage > 0 and args.dp_size <= 1:
         raise ValueError("--zero-stage > 0 requires --dp-size > 1")
     if args.zero_stage > 0 and args.ddp_mode is not None:
@@ -269,6 +279,19 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
                 ),
             )
         )
+    if args.model == "tiny_moe":
+        cls = TinyMoETransformerTpSp if args.use_sp else TinyMoETransformerTp if args.tp_size > 1 else TinyMoETransformer
+        return cls(
+            dim=args.dim,
+            n_heads=args.n_heads,
+            n_kv_heads=args.n_kv_heads or args.n_heads,
+            hidden_size=args.hidden_size,
+            eps=args.eps,
+            n_layers=args.n_layers,
+            vocab_size=args.vocab_size,
+            max_seq_len=args.seq_len,
+            num_experts=args.num_experts,
+        )
     cls = TinyTransformerTpSp if args.use_sp else TinyTransformerTp if args.tp_size > 1 else TinyTransformer
     return cls(
         dim=args.dim,
@@ -292,6 +315,8 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         plugins.append(SequenceParallelPlugin())
     if args.cp_size > 1:
         plugins.append(ContextParallelPlugin())
+    if args.ep_size > 1:
+        plugins.append(ExpertParallelPlugin())
     if args.pp_size > 1:
         plugins.append(PipelineParallelPlugin())
     if args.zero_stage == 0:
@@ -331,7 +356,7 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         )
 
     return RuntimeCore(
-        mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=1),
+        mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=args.ep_size),
         plan=ParallelPlan(
             zero_stage=args.zero_stage,
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
@@ -468,6 +493,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("model", "intermediate_size"): "hidden_size",
         ("model", "num_layers"): "n_layers",
         ("model", "n_layers"): "n_layers",
+        ("model", "num_experts"): "num_experts",
         ("model", "num_heads"): "n_heads",
         ("model", "n_heads"): "n_heads",
         ("model", "num_kv_heads"): "n_kv_heads",
@@ -484,6 +510,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("parallel", "cp_size"): "cp_size",
         ("parallel", "cp_attn_core"): "cp_attn_core",
         ("parallel", "tp_size"): "tp_size",
+        ("parallel", "ep_size"): "ep_size",
         ("parallel", "use_sp"): "use_sp",
         ("parallel", "zero_stage"): "zero_stage",
         ("parallel", "ddp_mode"): "ddp_mode",
@@ -571,7 +598,8 @@ def _print_run_summary(
     print(f"runtime_local_trainable_params={local_trainable_params:,}")
     print(
         "mesh="
-        f"dp={args.dp_size} tp={args.tp_size} pp={args.pp_size} cp=1 "
+        f"dp={args.dp_size} tp={args.tp_size} pp={args.pp_size} "
+        f"cp={args.cp_size} ep={args.ep_size} "
         f"world_size={world_size} device={device}"
     )
     print(f"plugins={plugin_names}")
@@ -675,9 +703,9 @@ def _build_run_manifest(
             "mesh": {
                 "dp": args.dp_size,
                 "tp": args.tp_size,
-                "pp": 1,
-                "cp": 1,
-                "ep": 1,
+                "pp": args.pp_size,
+                "cp": args.cp_size,
+                "ep": args.ep_size,
             },
             "plugins": [
                 {
