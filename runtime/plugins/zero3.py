@@ -282,13 +282,13 @@ class Zero3Plugin(RuntimePlugin):
         def hook(_module: nn.Module, _inputs, outputs) -> None:
             self._register_backward_output_hooks(bucket, outputs)
             self._free_full_params(bucket)
-            self._exec_state(bucket, _ExecDirection.FORWARD).fwd_handle = None
+            self._exec_state(bucket).fwd_handle = None
 
         return hook
 
     def _make_attach_grad_hook(self, bucket: _Bucket):
         def hook(grad: torch.Tensor) -> torch.Tensor:
-            state = self._exec_state(bucket, _ExecDirection.BACKWARD)
+            state = self._exec_state(bucket)
             if not state.attached:
                 offset = 0
                 for param, numel, shape in zip(bucket.params, bucket.param_numels, bucket.param_shapes):
@@ -301,7 +301,7 @@ class Zero3Plugin(RuntimePlugin):
 
     def _make_reduce_grad_hook(self, bucket: _Bucket):
         def hook(_param: nn.Parameter) -> None:
-            state = self._exec_state(bucket, _ExecDirection.BACKWARD)
+            state = self._exec_state(bucket)
             state.pending -= 1
             if state.pending == 0:
                 if bucket.local_param.grad is None:
@@ -315,7 +315,7 @@ class Zero3Plugin(RuntimePlugin):
         return hook
 
     def _prefetch_bucket(self, bucket: _Bucket, direction: _ExecDirection) -> None:
-        state = self._exec_state(bucket, direction)
+        state = self._exec_state(bucket)
         if bucket.group_context.group is None or bucket.group_context.world_size == 1:
             state.data_buffer.copy_(bucket.local_param.detach())
             immediate = _ImmediateWork()
@@ -360,7 +360,7 @@ class Zero3Plugin(RuntimePlugin):
             return
 
         def hook(grad: torch.Tensor) -> torch.Tensor:
-            state = self._exec_state(bucket, _ExecDirection.BACKWARD)
+            state = self._exec_state(bucket)
             if not state.backward_materialized:
                 self._materialize_full_params(bucket, direction=_ExecDirection.BACKWARD)
                 if bucket.prev_bucket is not None:
@@ -383,7 +383,7 @@ class Zero3Plugin(RuntimePlugin):
         self.bucket_order_checked = True
 
     def _materialize_full_params(self, bucket: _Bucket, direction: _ExecDirection) -> None:
-        state = self._exec_state(bucket, direction)
+        state = self._exec_state(bucket)
         if direction == _ExecDirection.FORWARD:
             if state.fwd_handle is None:
                 self._prefetch_bucket(bucket, direction=_ExecDirection.FORWARD)
@@ -576,17 +576,10 @@ class Zero3Plugin(RuntimePlugin):
             relevant = [(cb, rf) for cb, rf in callbacks if rf is None or rf == bucket.role]
             if not relevant:
                 continue
-            waited = False
             for state in bucket.exec_states:
                 self._ensure_state_grad_handle(bucket, state)
-                if state.grad_handle is None:
-                    continue
                 state.grad_handle.wait()
                 state.grad_handle = None
-                waited = True
-            if not waited:
-                self._free_full_params(bucket)
-                continue
             self._free_full_params(bucket)
             if bucket.local_param.grad is not None:
                 for cb, _ in relevant:
@@ -604,18 +597,11 @@ class Zero3Plugin(RuntimePlugin):
                     handle.wait()
                 bucket.post_reduction_handles.clear()
             else:
-                waited = False
                 for state in bucket.exec_states:
                     self._ensure_state_grad_handle(bucket, state)
-                    if state.grad_handle is None:
-                        continue
                     state.grad_handle.wait()
                     state.grad_handle = None
-                    waited = True
-                if not waited:
-                    self._free_full_params(bucket)
-                    continue
-                self._free_full_params(bucket)
+            self._free_full_params(bucket)
 
     def _flush_partial_grad_state_for_checkpoint(self) -> None:
         if self._post_reduction_thread is not None:
@@ -650,7 +636,7 @@ class Zero3Plugin(RuntimePlugin):
             for state in bucket.exec_states:
                 if grad_accum_start:
                     state.grad_handle = None
-            backward_state = self._exec_state(bucket, _ExecDirection.BACKWARD)
+            backward_state = self._exec_state(bucket)
             if backward_state.grad_handle is not None:
                 backward_state.grad_handle.wait()
                 backward_state.grad_handle = None
@@ -684,15 +670,12 @@ class Zero3Plugin(RuntimePlugin):
         state.grad_handle = self._reduce_scatter_avg(bucket, state)
 
 
-    def _exec_state(self, bucket: _Bucket, direction: _ExecDirection) -> _BucketExecState:
+    def _exec_state(self, bucket: _Bucket) -> _BucketExecState:
         if len(bucket.exec_states) == 1:
             return bucket.exec_states[0]
         assert self.runtime is not None
         context = self.runtime.state.step_context
         return bucket.exec_states[context.pp_cur_microbatch_idx]
-
-    def _uses_pp_execute_states(self) -> bool:
-        return bool(self.buckets) and len(self.buckets[0].exec_states) > 1
 
 
 def _iter_tensors(obj):
