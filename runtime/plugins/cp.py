@@ -53,8 +53,9 @@ class ContextParallelPlugin(RuntimePlugin):
             and PluginId.ZERO3 not in active
         )
         zero_active = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
-        if zero_active:
-            runtime.register_post_dp_reduction_callback(self._cp_grad_sync_callback)
+        ep_active = PluginId.EP in active
+        if zero_active or ep_active:
+            runtime.register_post_grad_reduction_callback(self._cp_grad_sync_callback)
         self._validate_runtime_support()
 
     def transform_model(self, model: nn.Module) -> nn.Module:

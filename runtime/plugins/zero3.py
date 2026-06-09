@@ -12,7 +12,6 @@ from runtime.buffer_allocator import allocate_buffer
 from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
-from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
 from state.state import ParamState
 
 
@@ -135,9 +134,6 @@ class Zero3Plugin(RuntimePlugin):
 
     def bind(self, runtime) -> None:
         super().bind(runtime)
-        active_plugins = {plugin.id for plugin in runtime.plugins if plugin is not self}
-        if PluginId.TP in active_plugins and nn.Linear in self.wrap_cls:
-            self.wrap_cls.update({ColumnParallelLinear, RowParallelLinear})
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
@@ -146,6 +142,8 @@ class Zero3Plugin(RuntimePlugin):
             raise ValueError("Zero3Plugin requires mesh.dp > 1")
         self.world_size = dist.get_world_size(self.dp_group)
         self.rank = dist.get_rank(self.dp_group)
+        for cls in list(self.wrap_cls):
+            self.wrap_cls.update(self.runtime.get_module_replacements(cls))
         self._prepare_buckets(model)
         optimizer_params = [bucket.local_param for bucket in self.buckets]
         self.optimizer = self.runtime.create_optimizer(optimizer_params)
@@ -175,7 +173,7 @@ class Zero3Plugin(RuntimePlugin):
             if (
                 self.runtime.state.step_context.is_step_boundary
                 and not self._use_async_worker()
-                and self.runtime._post_dp_reduction_callbacks
+                and self.runtime._post_grad_reduction_callbacks
             ):
                 self._fire_post_reductions_sync()
         elif phase == RuntimePhase.PRE_STEP:
@@ -547,7 +545,7 @@ class Zero3Plugin(RuntimePlugin):
 
     def _start_post_reduction_worker(self) -> None:
         assert self.runtime is not None
-        if not self.runtime._post_dp_reduction_callbacks:
+        if not self.runtime._post_grad_reduction_callbacks:
             self._post_reduction_thread = None
             return
         self._post_reduction_thread = threading.Thread(target=self._post_reduction_worker, daemon=True)
@@ -555,7 +553,7 @@ class Zero3Plugin(RuntimePlugin):
 
     def _post_reduction_worker(self) -> None:
         assert self.runtime is not None
-        callbacks = self.runtime._post_dp_reduction_callbacks
+        callbacks = self.runtime._post_grad_reduction_callbacks
         for bucket in self.buckets:
             with self._post_reduction_cond:
                 self._post_reduction_cond.wait_for(lambda: bucket.pending_exec_reductions == 0)
@@ -575,7 +573,7 @@ class Zero3Plugin(RuntimePlugin):
 
     def _fire_post_reductions_sync(self) -> None:
         assert self.runtime is not None
-        callbacks = self.runtime._post_dp_reduction_callbacks
+        callbacks = self.runtime._post_grad_reduction_callbacks
         for bucket in self.buckets:
             relevant = [(cb, rf) for cb, rf in callbacks if rf is None or rf == bucket.role]
             if not relevant:

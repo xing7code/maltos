@@ -135,30 +135,49 @@ class RuntimeCore:
     state: RuntimeState = field(default_factory=RuntimeState)
     optimizer: torch.optim.Optimizer | None = field(default=None, init=False)
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False)
-    _post_dp_reduction_callbacks: list[
+    _post_grad_reduction_callbacks: list[
         tuple[Callable[[torch.Tensor], "dist.Work | None"], "ParamRole | None"]
     ] = field(default_factory=list, init=False)
+    _module_replacements: "dict[type[nn.Module], set[type[nn.Module]]]" = field(
+        default_factory=dict, init=False
+    )
 
-    def register_post_dp_reduction_callback(
+    def register_post_grad_reduction_callback(
         self,
         cb: Callable[[torch.Tensor], "dist.Work | None"],
         *,
         role_filter: "ParamRole | None" = None,
     ) -> None:
-        """Register a callback invoked after each ZeRO bucket's DP reduction completes.
+        """Register a callback invoked after each DP-equivalent gradient reduction completes.
 
-        Plugins (e.g. CP) use this instead of embedding cross-plugin sync logic
-        directly into ZeRO. The callback receives the local gradient shard and
-        may return an async Work handle; ZeRO will wait on it before PRE_STEP.
+        Any plugin that performs gradient reduction (ZeRO, EP) fires these callbacks
+        after each param/bucket is reduced. Cross-cutting plugins (CP, SP) register
+        here instead of embedding sync logic inside the reducer.
 
-        The callback must be tensor-agnostic: it receives a flat 1D shard whose
-        shape and parameter identity vary per bucket. Selective per-parameter
-        logic is not supported.
+        The callback receives the local gradient shard and may return an async Work
+        handle; the reducer will wait on it before PRE_STEP.
 
-        role_filter: if set, ZeRO only invokes this callback for buckets whose
-        ParamRole matches. Use ParamRole.EXPERT for expert-only grad syncs.
+        The callback must be tensor-agnostic: shape and parameter identity vary per
+        invocation. role_filter restricts invocation to buckets/params of that role.
         """
-        self._post_dp_reduction_callbacks.append((cb, role_filter))
+        self._post_grad_reduction_callbacks.append((cb, role_filter))
+
+    def register_module_replacement(
+        self, original: "type[nn.Module]", replacement: "type[nn.Module]"
+    ) -> None:
+        """Record that a plugin replaced `original` module type with `replacement`.
+
+        Called by transform_model() implementations (e.g. TP replaces nn.Linear).
+        Other plugins (e.g. ZeRO3) query this to discover which concrete types to
+        wrap, without importing plugin-specific layer classes directly.
+        """
+        if original not in self._module_replacements:
+            self._module_replacements[original] = set()
+        self._module_replacements[original].add(replacement)
+
+    def get_module_replacements(self, original: "type[nn.Module]") -> "set[type[nn.Module]]":
+        """Return the set of replacement types registered for `original`."""
+        return self._module_replacements.get(original, set())
 
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:

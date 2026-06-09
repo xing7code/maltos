@@ -47,8 +47,9 @@ class SequenceParallelPlugin(RuntimePlugin):
         super().bind(runtime)
         active = {plugin.id for plugin in runtime.plugins if plugin is not self}
         zero_active = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
-        if zero_active:
-            runtime.register_post_dp_reduction_callback(
+        ep_active = PluginId.EP in active
+        if zero_active or ep_active:
+            runtime.register_post_grad_reduction_callback(
                 self._expert_tp_sync_callback,
                 role_filter=ParamRole.EXPERT,
             )

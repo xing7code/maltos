@@ -140,7 +140,7 @@ class Zero2Plugin(RuntimePlugin):
             if (
                 self.runtime.state.step_context.is_step_boundary
                 and not self._use_async_worker()
-                and self.runtime._post_dp_reduction_callbacks
+                and self.runtime._post_grad_reduction_callbacks
             ):
                 self._fire_post_reductions_sync()
         elif phase == RuntimePhase.PRE_STEP:
@@ -315,7 +315,7 @@ class Zero2Plugin(RuntimePlugin):
 
     def _start_post_reduction_worker(self) -> None:
         assert self.runtime is not None
-        if not self.runtime._post_dp_reduction_callbacks:
+        if not self.runtime._post_grad_reduction_callbacks:
             self._post_reduction_thread = None
             return
         self._post_reduction_thread = threading.Thread(target=self._post_reduction_worker, daemon=True)
@@ -323,7 +323,7 @@ class Zero2Plugin(RuntimePlugin):
 
     def _post_reduction_worker(self) -> None:
         assert self.runtime is not None
-        callbacks = self.runtime._post_dp_reduction_callbacks
+        callbacks = self.runtime._post_grad_reduction_callbacks
         for bucket in self.buckets:
             with self._post_reduction_cond:
                 self._post_reduction_cond.wait_for(lambda: bucket.pending_exec_reductions == 0)
@@ -342,7 +342,7 @@ class Zero2Plugin(RuntimePlugin):
 
     def _fire_post_reductions_sync(self) -> None:
         assert self.runtime is not None
-        callbacks = self.runtime._post_dp_reduction_callbacks
+        callbacks = self.runtime._post_grad_reduction_callbacks
         for bucket in self.buckets:
             relevant = [(cb, rf) for cb, rf in callbacks if rf is None or rf == bucket.role]
             if not relevant:
