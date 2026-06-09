@@ -106,7 +106,6 @@ class Zero3Plugin(RuntimePlugin):
     def __init__(
         self,
         wrap_cls: set[type[nn.Module]] | None = None,
-        enable_prefetch: bool = True,
     ):
         super().__init__(
             id=PluginId.ZERO3,
@@ -115,7 +114,6 @@ class Zero3Plugin(RuntimePlugin):
             runs_after={PluginId.PP, PluginId.CP, PluginId.TP, PluginId.SP},
         )
         self.wrap_cls = set(wrap_cls or {nn.Linear})
-        self.enable_prefetch = enable_prefetch
         self.dp_group: dist.ProcessGroup | None = None
         self.world_size = 1
         self.rank = 0
@@ -153,7 +151,7 @@ class Zero3Plugin(RuntimePlugin):
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
             assert self.runtime is not None
-            if self._prefetch_is_enabled() and self.bucket_order_checked and self._first_bucket is not None:
+            if self.bucket_order_checked and self._first_bucket is not None:
                 self._prefetch_bucket(self._first_bucket, direction=_ExecDirection.FORWARD)
         elif phase == RuntimePhase.POST_FORWARD:
             self._finalize_bucket_order()
@@ -166,7 +164,7 @@ class Zero3Plugin(RuntimePlugin):
             )
             if context.is_step_boundary and self._use_async_worker():
                 self._start_post_reduction_worker()
-            if self.enable_prefetch and self.bucket_order_checked and self._last_bucket is not None:
+            if self.bucket_order_checked and self._last_bucket is not None:
                 self._prefetch_bucket(self._last_bucket, direction=_ExecDirection.BACKWARD)
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
@@ -275,7 +273,7 @@ class Zero3Plugin(RuntimePlugin):
         def hook(_module: nn.Module, _inputs) -> None:
             self._record_forward_bucket(bucket)
             self._materialize_full_params(bucket, direction=_ExecDirection.FORWARD)
-            if self._prefetch_is_enabled() and self.bucket_order_checked and bucket.next_bucket is not None:
+            if self.bucket_order_checked and bucket.next_bucket is not None:
                 self._prefetch_bucket(bucket.next_bucket, direction=_ExecDirection.FORWARD)
 
         return hook
@@ -365,7 +363,7 @@ class Zero3Plugin(RuntimePlugin):
             state = self._exec_state(bucket, _ExecDirection.BACKWARD)
             if not state.backward_materialized:
                 self._materialize_full_params(bucket, direction=_ExecDirection.BACKWARD)
-                if self._prefetch_is_enabled() and bucket.prev_bucket is not None:
+                if bucket.prev_bucket is not None:
                     self._prefetch_bucket(bucket.prev_bucket, direction=_ExecDirection.BACKWARD)
                 state.backward_materialized = True
             return grad
@@ -628,10 +626,15 @@ class Zero3Plugin(RuntimePlugin):
                 handle.wait()
             bucket.post_reduction_handles.clear()
             for state in bucket.exec_states:
-                if state.grad_handle is None:
-                    continue
-                state.grad_handle.wait()
-                state.grad_handle = None
+                if state.grad_handle is not None:
+                    state.grad_handle.wait()
+                    state.grad_handle = None
+                if state.bwd_handle is not None:
+                    state.bwd_handle.wait()
+                    state.bwd_handle = None
+                if state.fwd_handle is not None:
+                    state.fwd_handle.wait()
+                    state.fwd_handle = None
             self._free_full_params(bucket)
 
     def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
@@ -651,6 +654,7 @@ class Zero3Plugin(RuntimePlugin):
             if backward_state.grad_handle is not None:
                 backward_state.grad_handle.wait()
                 backward_state.grad_handle = None
+            backward_state.bwd_handle = None
             backward_state.grad_buffer.zero_()
             backward_state.shard_buffer.zero_()
             backward_state.pending = len(bucket.params)
@@ -679,11 +683,6 @@ class Zero3Plugin(RuntimePlugin):
         state.shard_buffer.zero_()
         state.grad_handle = self._reduce_scatter_avg(bucket, state)
 
-    def _prefetch_is_enabled(self) -> bool:
-        if not self.enable_prefetch:
-            return False
-        assert self.runtime is not None
-        return self.runtime.state.step_context.grad_accum_steps == 1
 
     def _exec_state(self, bucket: _Bucket, direction: _ExecDirection) -> _BucketExecState:
         if len(bucket.exec_states) == 1:

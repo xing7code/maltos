@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--zero3-disable-prefetch", action="store_true")
+
     return parser.parse_args()
 
 
@@ -195,10 +195,7 @@ def _make_zero_plugin(args: argparse.Namespace) -> Zero1Plugin | Zero2Plugin | Z
         return Zero1Plugin(bucket_mb_size=0)
     if args.zero_stage == 2:
         return Zero2Plugin(bucket_mb_size=0)
-    return Zero3Plugin(
-        wrap_cls=_ZERO3_WRAP_CLS,
-        enable_prefetch=not args.zero3_disable_prefetch,
-    )
+    return Zero3Plugin(wrap_cls=_ZERO3_WRAP_CLS)
 
 
 def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespace) -> RuntimeCore:

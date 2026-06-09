@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global-batch-size", type=int, default=8)
     parser.add_argument("--hidden-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--disable-prefetch", action="store_true")
+
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     return parser.parse_args()
 
@@ -87,7 +87,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_loss = baseline_model(full_batch)
     baseline_loss.backward()
 
-    zero3 = Zero3Plugin(enable_prefetch=not args.disable_prefetch)
+    zero3 = Zero3Plugin()
     core = RuntimeCore(
         mesh=MeshConfig(dp=args.world_size, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=3),
@@ -114,8 +114,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if rank == 0:
         loss_diff = abs(baseline_loss.item() - avg_loss.item())
         print(f"Baseline loss     : {baseline_loss.item():.6f}")
-        mode = "no-prefetch" if args.disable_prefetch else "prefetch"
-        print(f"RuntimeCore ZeRO3 : {avg_loss.item():.6f}  ({mode})")
+        print(f"RuntimeCore ZeRO3 : {avg_loss.item():.6f}")
         print(f"Loss diff         : {loss_diff:.2e}  (atol={_ATOL:.2e})")
         print(f"Post-step diff    : {param_diff:.2e}  ({param_name}, atol={_ATOL:.2e})")
         if loss_diff > _ATOL:

@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--zero3-disable-prefetch", action="store_true")
+
     return parser.parse_args()
 
 
@@ -182,10 +182,7 @@ def _make_plugins(args: argparse.Namespace):
     if case == "pp_zero2":
         return [PipelineParallelPlugin(schedule=args.pp_schedule), Zero2Plugin(bucket_mb_size=0)], zero3
     if case == "pp_zero3":
-        zero3 = Zero3Plugin(
-            wrap_cls={torch.nn.Linear, torch.nn.Embedding, RmsNorm},
-            enable_prefetch=not args.zero3_disable_prefetch,
-        )
+        zero3 = Zero3Plugin(wrap_cls={torch.nn.Linear, torch.nn.Embedding, RmsNorm})
         return [PipelineParallelPlugin(schedule=args.pp_schedule), zero3], zero3
     if case == "pp_tp":
         return [TensorParallelPlugin(), PipelineParallelPlugin(schedule=args.pp_schedule)], zero3

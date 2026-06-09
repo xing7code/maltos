@@ -45,7 +45,7 @@ def _build_model(seed: int, hidden_size: int) -> TinyModel:
 
 
 def _build_core(model: TinyModel, world_size: int) -> tuple[RuntimeCore, Zero3Plugin]:
-    zero3 = Zero3Plugin(enable_prefetch=True)
+    zero3 = Zero3Plugin()
     core = RuntimeCore(
         mesh=MeshConfig(dp=world_size, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(zero_stage=3),
