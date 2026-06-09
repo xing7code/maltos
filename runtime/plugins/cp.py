@@ -16,11 +16,6 @@ from runtime.plugin import ContextParallelizableModule, PluginId, RuntimePlugin
 from runtime.plugins.cp_all_gather import AllGatherKvAttentionCore
 from runtime.plugins.cp_ring import RingAttentionCore
 
-# TODO: CP grad sync is currently deeply embedded in Zero1/2/3.
-# We should revisit how to factor CP shard-gradient synchronization into a
-# cleaner shared abstraction instead of teaching each ZeRO plugin its own
-# CP-specific sync path.
-
 
 class ContextParallelPlugin(RuntimePlugin):
     def __init__(self) -> None:
@@ -57,6 +52,9 @@ class ContextParallelPlugin(RuntimePlugin):
             and PluginId.ZERO2 not in active
             and PluginId.ZERO3 not in active
         )
+        zero_active = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
+        if zero_active:
+            runtime.register_post_dp_reduction_callback(self._cp_grad_sync_callback)
         self._validate_runtime_support()
 
     def transform_model(self, model: nn.Module) -> nn.Module:
@@ -100,6 +98,11 @@ class ContextParallelPlugin(RuntimePlugin):
             return
         if phase == RuntimePhase.PRE_STEP:
             self._wait_grad_sync()
+
+    def _cp_grad_sync_callback(self, grad: torch.Tensor) -> dist.Work | None:
+        if self.world_size <= 1:
+            return None
+        return dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.cp_group, async_op=True)
 
     def _make_grad_sync_hook(self):
         def hook(param: nn.Parameter) -> None:

@@ -135,6 +135,25 @@ class RuntimeCore:
     state: RuntimeState = field(default_factory=RuntimeState)
     optimizer: torch.optim.Optimizer | None = field(default=None, init=False)
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False)
+    _post_dp_reduction_callbacks: list[Callable[[torch.Tensor], "dist.Work | None"]] = field(
+        default_factory=list, init=False
+    )
+
+    def register_post_dp_reduction_callback(
+        self, cb: Callable[[torch.Tensor], "dist.Work | None"]
+    ) -> None:
+        """Register a callback invoked after each ZeRO bucket's DP reduction completes.
+
+        Plugins (e.g. CP) use this instead of embedding cross-plugin sync logic
+        directly into ZeRO. The callback receives the local gradient shard and
+        may return an async Work handle; ZeRO will wait on it before PRE_STEP.
+
+        The callback must be tensor-agnostic: it receives a flat 1D shard whose
+        shape and parameter identity vary per bucket. Selective per-parameter
+        logic is not supported.
+        """
+        self._post_dp_reduction_callbacks.append(cb)
+
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
             raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")

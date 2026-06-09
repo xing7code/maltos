@@ -73,8 +73,8 @@ class _Bucket:
     shard_start: int
     shard_end: int
     local_param: nn.Parameter
-    cp_handle: dist.Work | None = None
-    cp_pending_states: int = 0
+    pending_exec_reductions: int = 0
+    post_reduction_handles: list[dist.Work] = field(default_factory=list)
     exec_states: list["_BucketExecState"] = field(default_factory=list)
 
 
@@ -102,20 +102,18 @@ class Zero2Plugin(RuntimePlugin):
         )
         self.bucket_byte_size = bucket_mb_size * 1024 * 1024
         self.dp_group: dist.ProcessGroup | None = None
-        self.cp_group: dist.ProcessGroup | None = None
         self.world_size = 1
         self.rank = 0
         self.data_buffer: torch.Tensor | None = None
         self.buckets: list[_Bucket] = []
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
-        self._cp_sync_thread: threading.Thread | None = None
-        self._cp_sync_cond = threading.Condition()
+        self._post_reduction_thread: threading.Thread | None = None
+        self._post_reduction_cond = threading.Condition()
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
         self.dp_group = self.runtime.get_group(MeshAxis.DP)
-        self.cp_group = self.runtime.get_group(MeshAxis.CP)
         if self.dp_group is None:
             raise ValueError("Zero2Plugin requires mesh.dp > 1")
         self.world_size = dist.get_world_size(self.dp_group)
@@ -134,17 +132,16 @@ class Zero2Plugin(RuntimePlugin):
                 grad_accum_start=context.accum_start,
                 grad_accum_end=context.is_step_boundary,
             )
-            if context.is_step_boundary and self._use_cp_sync_worker():
-                self._maybe_start_cp_sync_worker()
+            if context.is_step_boundary and self._use_async_worker():
+                self._start_post_reduction_worker()
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
             if (
                 self.runtime.state.step_context.is_step_boundary
-                and self.cp_group is not None
-                and dist.get_world_size(self.cp_group) > 1
-                and not self._use_cp_sync_worker()
+                and not self._use_async_worker()
+                and self.runtime._post_dp_reduction_callbacks
             ):
-                self._launch_cp_grad_sync()
+                self._fire_post_reductions_sync()
         elif phase == RuntimePhase.PRE_STEP:
             self._wait_grad_sync()
         elif phase == RuntimePhase.POST_STEP:
@@ -260,10 +257,10 @@ class Zero2Plugin(RuntimePlugin):
                 if bucket.local_param.grad is None:
                     bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
                 state.handle = self._reduce_scatter_avg(bucket, state)
-                if self._use_cp_sync_worker():
-                    with self._cp_sync_cond:
-                        bucket.cp_pending_states -= 1
-                        self._cp_sync_cond.notify_all()
+                if self._use_async_worker():
+                    with self._post_reduction_cond:
+                        bucket.pending_exec_reductions -= 1
+                        self._post_reduction_cond.notify_all()
 
         return hook
 
@@ -311,33 +308,37 @@ class Zero2Plugin(RuntimePlugin):
             for handle in handles:
                 handle.wait()
 
-    def _maybe_start_cp_sync_worker(self) -> None:
-        if self.cp_group is None or dist.get_world_size(self.cp_group) <= 1:
-            self._cp_sync_thread = None
-            return
-        self._cp_sync_thread = threading.Thread(target=self._cp_sync_worker, daemon=True)
-        self._cp_sync_thread.start()
+    def _use_async_worker(self) -> bool:
+        return self.dp_group is not None and dist.get_backend(self.dp_group) != "gloo"
 
-    def _cp_sync_worker(self) -> None:
-        assert self.cp_group is not None
+    def _start_post_reduction_worker(self) -> None:
+        assert self.runtime is not None
+        if not self.runtime._post_dp_reduction_callbacks:
+            self._post_reduction_thread = None
+            return
+        self._post_reduction_thread = threading.Thread(target=self._post_reduction_worker, daemon=True)
+        self._post_reduction_thread.start()
+
+    def _post_reduction_worker(self) -> None:
+        assert self.runtime is not None
+        callbacks = self.runtime._post_dp_reduction_callbacks
         for bucket in self.buckets:
-            with self._cp_sync_cond:
-                self._cp_sync_cond.wait_for(lambda: bucket.cp_pending_states == 0)
+            with self._post_reduction_cond:
+                self._post_reduction_cond.wait_for(lambda: bucket.pending_exec_reductions == 0)
             for state in bucket.exec_states:
                 if state.handle is None:
                     raise RuntimeError("ZeRO2 bucket handle is None after backward")
                 state.handle.wait()
                 state.handle = None
-            if bucket.local_param.grad is None:
-                continue
-            bucket.cp_handle = dist.all_reduce(
-                bucket.local_param.grad,
-                op=dist.ReduceOp.SUM,
-                group=self.cp_group,
-                async_op=True,
-            )
+            if bucket.local_param.grad is not None:
+                for cb in callbacks:
+                    work = cb(bucket.local_param.grad)
+                    if work is not None:
+                        bucket.post_reduction_handles.append(work)
 
-    def _launch_cp_grad_sync(self) -> None:
+    def _fire_post_reductions_sync(self) -> None:
+        assert self.runtime is not None
+        callbacks = self.runtime._post_dp_reduction_callbacks
         for bucket in self.buckets:
             waited = False
             for state in bucket.exec_states:
@@ -349,23 +350,22 @@ class Zero2Plugin(RuntimePlugin):
                 waited = True
             if not waited:
                 raise RuntimeError("ZeRO2 bucket handle is None after backward")
-            if self.cp_group is None or dist.get_world_size(self.cp_group) <= 1:
-                continue
-            if bucket.local_param.grad is None:
-                continue
-            bucket.cp_handle = dist.all_reduce(
-                bucket.local_param.grad,
-                op=dist.ReduceOp.SUM,
-                group=self.cp_group,
-                async_op=True,
-            )
+            if bucket.local_param.grad is not None:
+                for cb in callbacks:
+                    work = cb(bucket.local_param.grad)
+                    if work is not None:
+                        bucket.post_reduction_handles.append(work)
 
     def _wait_grad_sync(self) -> None:
-        if self._cp_sync_thread is not None:
-            self._cp_sync_thread.join()
-            self._cp_sync_thread = None
+        if self._post_reduction_thread is not None:
+            self._post_reduction_thread.join()
+            self._post_reduction_thread = None
         for bucket in self.buckets:
-            if bucket.cp_handle is None:
+            if bucket.post_reduction_handles:
+                for handle in bucket.post_reduction_handles:
+                    handle.wait()
+                bucket.post_reduction_handles.clear()
+            else:
                 waited = False
                 for state in bucket.exec_states:
                     self._ensure_state_handle(bucket, state)
@@ -376,12 +376,6 @@ class Zero2Plugin(RuntimePlugin):
                     waited = True
                 if not waited:
                     continue
-                continue
-            bucket.cp_handle.wait()
-            bucket.cp_handle = None
-
-    def _use_cp_sync_worker(self) -> bool:
-        return self.dp_group is not None and dist.get_backend(self.dp_group) != "gloo"
 
     def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
         if grad_accum_start:
@@ -390,8 +384,8 @@ class Zero2Plugin(RuntimePlugin):
                     bucket.local_param.grad = torch.zeros_like(bucket.local_param.data)
                 else:
                     bucket.local_param.grad.zero_()
-                bucket.cp_handle = None
-                bucket.cp_pending_states = len(bucket.exec_states) if grad_accum_end else 0
+                bucket.post_reduction_handles.clear()
+                bucket.pending_exec_reductions = len(bucket.exec_states) if grad_accum_end else 0
         for bucket in self.buckets:
             state = self._exec_state(bucket)
             if state.handle is not None:
