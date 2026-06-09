@@ -12,55 +12,13 @@ from runtime.buffer_allocator import allocate_buffer
 from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
+from runtime.plugins.zero_common import AllReduceShardWork, GroupContext, ReduceScatterShardWork
 from state.state import ParamState
-
-
-class _AllReduceShardWork:
-    def __init__(
-        self,
-        work: dist.Work,
-        grad_buffer: torch.Tensor,
-        local_grad: torch.Tensor,
-        shard_start: int,
-        shard_end: int,
-    ):
-        self.work = work
-        self.grad_buffer = grad_buffer
-        self.local_grad = local_grad
-        self.shard_start = shard_start
-        self.shard_end = shard_end
-
-    def wait(self) -> None:
-        self.work.wait()
-        self.local_grad.add_(self.grad_buffer[self.shard_start : self.shard_end])
-
-
-class _ReduceScatterShardWork:
-    def __init__(
-        self,
-        work: dist.Work,
-        shard_buffer: torch.Tensor,
-        local_grad: torch.Tensor,
-    ):
-        self.work = work
-        self.shard_buffer = shard_buffer
-        self.local_grad = local_grad
-
-    def wait(self) -> None:
-        self.work.wait()
-        self.local_grad.add_(self.shard_buffer)
 
 
 class _ImmediateWork:
     def wait(self) -> None:
         return
-
-
-@dataclass(frozen=True)
-class _GroupContext:
-    group: dist.ProcessGroup | None
-    world_size: int
-    rank: int
 
 
 class _ExecDirection(str, Enum):
@@ -73,7 +31,7 @@ class _Bucket:
     module: nn.Module
     params: list[nn.Parameter]
     role: ParamRole
-    group_context: _GroupContext
+    group_context: GroupContext
     param_shapes: list[torch.Size]
     param_numels: list[int]
     buffer_size: int
@@ -94,7 +52,7 @@ class _BucketExecState:
     shard_buffer: torch.Tensor
     fwd_handle: dist.Work | _ImmediateWork | None = None
     bwd_handle: dist.Work | _ImmediateWork | None = None
-    grad_handle: dist.Work | _AllReduceShardWork | _ReduceScatterShardWork | _ImmediateWork | None = None
+    grad_handle: dist.Work | AllReduceShardWork | ReduceScatterShardWork | _ImmediateWork | None = None
     pending: int = 0
     attached: bool = False
     backward_materialized: bool = False
@@ -316,37 +274,30 @@ class Zero3Plugin(RuntimePlugin):
 
     def _prefetch_bucket(self, bucket: _Bucket, direction: _ExecDirection) -> None:
         state = self._exec_state(bucket)
+        is_fwd = direction == _ExecDirection.FORWARD
         if bucket.group_context.group is None or bucket.group_context.world_size == 1:
             state.data_buffer.copy_(bucket.local_param.detach())
-            immediate = _ImmediateWork()
-            if direction == _ExecDirection.FORWARD:
-                state.fwd_handle = immediate
-                return
-            if direction == _ExecDirection.BACKWARD:
-                state.bwd_handle = immediate
-                return
-            raise ValueError(f"unknown ZeRO3 prefetch direction={direction}")
-        if direction == _ExecDirection.FORWARD:
+            if is_fwd:
+                state.fwd_handle = _ImmediateWork()
+            else:
+                state.bwd_handle = _ImmediateWork()
+            return
+        if is_fwd:
             if state.fwd_handle is not None:
                 return
-            state.fwd_handle = dist.all_gather_into_tensor(
-                state.data_buffer,
-                bucket.local_param.detach().contiguous(),
-                group=bucket.group_context.group,
-                async_op=True,
-            )
-            return
-        if direction == _ExecDirection.BACKWARD:
+        else:
             if state.bwd_handle is not None:
                 return
-            state.bwd_handle = dist.all_gather_into_tensor(
-                state.data_buffer,
-                bucket.local_param.detach().contiguous(),
-                group=bucket.group_context.group,
-                async_op=True,
-            )
-            return
-        raise ValueError(f"unknown ZeRO3 prefetch direction={direction}")
+        handle = dist.all_gather_into_tensor(
+            state.data_buffer,
+            bucket.local_param.detach().contiguous(),
+            group=bucket.group_context.group,
+            async_op=True,
+        )
+        if is_fwd:
+            state.fwd_handle = handle
+        else:
+            state.bwd_handle = handle
 
     def _record_forward_bucket(self, bucket: _Bucket) -> None:
         if self.bucket_order_checked or bucket.index in self._observed_forward_set:
@@ -391,20 +342,17 @@ class Zero3Plugin(RuntimePlugin):
 
     def _materialize_full_params(self, bucket: _Bucket, direction: _ExecDirection) -> None:
         state = self._exec_state(bucket)
-        if direction == _ExecDirection.FORWARD:
-            if state.fwd_handle is None:
-                self._prefetch_bucket(bucket, direction=_ExecDirection.FORWARD)
-            assert state.fwd_handle is not None
-            state.fwd_handle.wait()
+        is_fwd = direction == _ExecDirection.FORWARD
+        handle = state.fwd_handle if is_fwd else state.bwd_handle
+        if handle is None:
+            self._prefetch_bucket(bucket, direction=direction)
+            handle = state.fwd_handle if is_fwd else state.bwd_handle
+        assert handle is not None
+        handle.wait()
+        if is_fwd:
             state.fwd_handle = None
-        elif direction == _ExecDirection.BACKWARD:
-            if state.bwd_handle is None:
-                self._prefetch_bucket(bucket, direction=_ExecDirection.BACKWARD)
-            assert state.bwd_handle is not None
-            state.bwd_handle.wait()
-            state.bwd_handle = None
         else:
-            raise ValueError(f"unknown ZeRO3 materialize direction={direction}")
+            state.bwd_handle = None
         self._bind_full_params(bucket, state.data_buffer)
 
     def _materialize_full_params_sync(self, bucket: _Bucket) -> None:
@@ -442,7 +390,7 @@ class Zero3Plugin(RuntimePlugin):
         self,
         bucket: _Bucket,
         state: _BucketExecState,
-    ) -> dist.Work | _AllReduceShardWork | _ReduceScatterShardWork:
+    ) -> dist.Work | AllReduceShardWork | ReduceScatterShardWork:
         assert self.runtime is not None
         if bucket.group_context.group is None or bucket.group_context.world_size == 1:
             bucket.local_param.grad.add_(state.grad_buffer[: bucket.local_param.numel()])
@@ -452,7 +400,7 @@ class Zero3Plugin(RuntimePlugin):
             shard_len = bucket.local_param.numel()
             shard_start = bucket.group_context.rank * shard_len
             shard_end = (bucket.group_context.rank + 1) * shard_len
-            return _AllReduceShardWork(work, state.grad_buffer, bucket.local_param.grad, shard_start, shard_end)
+            return AllReduceShardWork(work, state.grad_buffer, bucket.local_param.grad, shard_start, shard_end)
         work = dist.reduce_scatter_tensor(
             state.shard_buffer,
             state.grad_buffer,
@@ -460,7 +408,7 @@ class Zero3Plugin(RuntimePlugin):
             group=bucket.group_context.group,
             async_op=True,
         )
-        return _ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad)
+        return ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad)
 
     def materialize_model(self) -> None:
         self._materialized_buffers.clear()
@@ -657,15 +605,15 @@ class Zero3Plugin(RuntimePlugin):
     def _padded_len(self, numel: int, world_size: int) -> int:
         return (numel + world_size - 1) // world_size * world_size
 
-    def _group_context_for_role(self, role: ParamRole) -> _GroupContext:
+    def _group_context_for_role(self, role: ParamRole) -> GroupContext:
         assert self.runtime is not None
         if role == ParamRole.EXPERT:
             group = self.runtime.get_group(MeshAxis.EDP)
             if group is None:
-                return _GroupContext(None, 1, 0)
-            return _GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
+                return GroupContext(None, 1, 0)
+            return GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
         assert self.dp_group is not None
-        return _GroupContext(self.dp_group, self.world_size, self.rank)
+        return GroupContext(self.dp_group, self.world_size, self.rank)
 
     def _ensure_state_grad_handle(self, bucket: _Bucket, state: _BucketExecState) -> None:
         if state.grad_handle is not None:

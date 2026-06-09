@@ -10,42 +10,7 @@ import torch.nn as nn
 from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
-
-
-class _AllReduceShardWork:
-    def __init__(
-        self,
-        work: dist.Work,
-        grad_buffer: torch.Tensor,
-        local_grad: torch.Tensor,
-        shard_start: int,
-        shard_end: int,
-    ):
-        self.work = work
-        self.grad_buffer = grad_buffer
-        self.local_grad = local_grad
-        self.shard_start = shard_start
-        self.shard_end = shard_end
-
-    def wait(self) -> None:
-        self.work.wait()
-        self.local_grad.add_(self.grad_buffer[self.shard_start : self.shard_end])
-
-
-class _ReduceScatterShardWork:
-    def __init__(
-        self,
-        work: dist.Work,
-        shard_buffer: torch.Tensor,
-        local_grad: torch.Tensor,
-    ):
-        self.work = work
-        self.shard_buffer = shard_buffer
-        self.local_grad = local_grad
-
-    def wait(self) -> None:
-        self.work.wait()
-        self.local_grad.add_(self.shard_buffer)
+from runtime.plugins.zero_common import AllReduceShardWork, GroupContext, ReduceScatterShardWork
 
 
 class _LocalAddWork:
@@ -57,17 +22,10 @@ class _LocalAddWork:
         self.dst.add_(self.src)
 
 
-@dataclass(frozen=True)
-class _GroupContext:
-    group: dist.ProcessGroup | None
-    world_size: int
-    rank: int
-
-
 @dataclass
 class _Bucket:
     params: list[nn.Parameter]
-    group_context: _GroupContext
+    group_context: GroupContext
     role: "ParamRole"
     start: int
     end: int
@@ -84,7 +42,7 @@ class _BucketExecState:
     grad_buffer: torch.Tensor
     shard_buffer: torch.Tensor
     pending: int = 0
-    handle: dist.Work | _AllReduceShardWork | _ReduceScatterShardWork | _LocalAddWork | None = None
+    handle: dist.Work | AllReduceShardWork | ReduceScatterShardWork | _LocalAddWork | None = None
     attached: bool = False
 
 
@@ -153,9 +111,9 @@ class Zero2Plugin(RuntimePlugin):
     def _prepare_buffers_and_buckets(self, model: nn.Module) -> None:
         shared_params = self._role_params(model, ParamRole.SHARED)
         expert_params = self._role_params(model, ParamRole.EXPERT)
-        bucket_specs: list[tuple[_GroupContext, list[list[nn.Parameter]], ParamRole]] = []
+        bucket_specs: list[tuple[GroupContext, list[list[nn.Parameter]], ParamRole]] = []
         if shared_params:
-            bucket_specs.append((_GroupContext(self.dp_group, self.world_size, self.rank), self._build_param_buckets(shared_params), ParamRole.SHARED))
+            bucket_specs.append((GroupContext(self.dp_group, self.world_size, self.rank), self._build_param_buckets(shared_params), ParamRole.SHARED))
         if expert_params:
             bucket_specs.append((self._group_context_for_role(ParamRole.EXPERT), self._build_param_buckets(expert_params), ParamRole.EXPERT))
         if not bucket_specs:
@@ -163,7 +121,7 @@ class Zero2Plugin(RuntimePlugin):
 
         dtype = (shared_params or expert_params)[0].dtype
         device = (shared_params or expert_params)[0].device
-        flat_specs: list[tuple[_GroupContext, list[nn.Parameter], int, ParamRole]] = []
+        flat_specs: list[tuple[GroupContext, list[nn.Parameter], int, ParamRole]] = []
         for group_context, param_buckets, role in bucket_specs:
             for bucket_params in param_buckets:
                 padded_size = self._padded_len(sum(param.numel() for param in bucket_params), group_context.world_size)
@@ -270,7 +228,7 @@ class Zero2Plugin(RuntimePlugin):
         self,
         bucket: _Bucket,
         state: _BucketExecState,
-    ) -> dist.Work | _AllReduceShardWork | _ReduceScatterShardWork:
+    ) -> dist.Work | AllReduceShardWork | ReduceScatterShardWork:
         assert bucket.local_param.grad is not None
         bucket_numel = bucket.end - bucket.start
         full_grad = state.grad_buffer[:bucket_numel]
@@ -281,7 +239,7 @@ class Zero2Plugin(RuntimePlugin):
             shard_len = bucket.local_param.numel()
             shard_start = bucket.group_context.rank * shard_len
             shard_end = (bucket.group_context.rank + 1) * shard_len
-            return _AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end)
+            return AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end)
         work = dist.reduce_scatter_tensor(
             state.shard_buffer,
             full_grad,
@@ -289,7 +247,7 @@ class Zero2Plugin(RuntimePlugin):
             group=bucket.group_context.group,
             async_op=True,
         )
-        return _ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad)
+        return ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad)
 
     def _gather_updated_params(self) -> None:
         assert self.data_buffer is not None
@@ -412,15 +370,15 @@ class Zero2Plugin(RuntimePlugin):
     def _padded_len(self, numel: int, world_size: int) -> int:
         return (numel + world_size - 1) // world_size * world_size
 
-    def _group_context_for_role(self, role: ParamRole) -> _GroupContext:
+    def _group_context_for_role(self, role: ParamRole) -> GroupContext:
         assert self.runtime is not None
         if role == ParamRole.EXPERT:
             group = self.runtime.get_group(MeshAxis.EDP)
             if group is None:
-                return _GroupContext(None, 1, 0)
-            return _GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
+                return GroupContext(None, 1, 0)
+            return GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
         assert self.dp_group is not None
-        return _GroupContext(self.dp_group, self.world_size, self.rank)
+        return GroupContext(self.dp_group, self.world_size, self.rank)
 
     def _ensure_state_handle(self, bucket: _Bucket, state: _BucketExecState) -> None:
         if state.handle is not None:
@@ -432,6 +390,8 @@ class Zero2Plugin(RuntimePlugin):
         state.handle = self._reduce_scatter_avg(bucket, state)
 
     def _exec_state(self, bucket: _Bucket) -> _BucketExecState:
+        if len(bucket.exec_states) == 1:
+            return bucket.exec_states[0]
         assert self.runtime is not None
         context = self.runtime.state.step_context
         return bucket.exec_states[context.pp_cur_microbatch_idx]

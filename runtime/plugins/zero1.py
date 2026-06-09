@@ -10,6 +10,7 @@ import torch.nn as nn
 from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
+from runtime.plugins.zero_common import GroupContext
 
 
 class _AllReduceShardWork:
@@ -41,17 +42,10 @@ class _LocalCopyWork:
         self.dst.copy_(self.src)
 
 
-@dataclass(frozen=True)
-class _GroupContext:
-    group: dist.ProcessGroup | None
-    world_size: int
-    rank: int
-
-
 @dataclass
 class _Bucket:
     params: list[nn.Parameter]
-    group_context: _GroupContext
+    group_context: GroupContext
     role: "ParamRole"
     start: int
     end: int
@@ -129,9 +123,9 @@ class Zero1Plugin(RuntimePlugin):
     def _prepare_buffers_and_buckets(self, model: nn.Module) -> None:
         shared_params = self._role_params(model, ParamRole.SHARED)
         expert_params = self._role_params(model, ParamRole.EXPERT)
-        bucket_specs: list[tuple[_GroupContext, list[list[nn.Parameter]], ParamRole]] = []
+        bucket_specs: list[tuple[GroupContext, list[list[nn.Parameter]], ParamRole]] = []
         if shared_params:
-            bucket_specs.append((_GroupContext(self.dp_group, self.world_size, self.rank), self._build_param_buckets(shared_params), ParamRole.SHARED))
+            bucket_specs.append((GroupContext(self.dp_group, self.world_size, self.rank), self._build_param_buckets(shared_params), ParamRole.SHARED))
         if expert_params:
             bucket_specs.append((self._group_context_for_role(ParamRole.EXPERT), self._build_param_buckets(expert_params), ParamRole.EXPERT))
         if not bucket_specs:
@@ -139,7 +133,7 @@ class Zero1Plugin(RuntimePlugin):
 
         dtype = (shared_params or expert_params)[0].dtype
         device = (shared_params or expert_params)[0].device
-        flat_specs: list[tuple[_GroupContext, list[nn.Parameter], int, ParamRole]] = []
+        flat_specs: list[tuple[GroupContext, list[nn.Parameter], int, ParamRole]] = []
         for group_context, param_buckets, role in bucket_specs:
             for bucket_params in param_buckets:
                 padded_size = self._padded_len(sum(param.numel() for param in bucket_params), group_context.world_size)
@@ -340,15 +334,15 @@ class Zero1Plugin(RuntimePlugin):
     def _padded_len(self, numel: int, world_size: int) -> int:
         return (numel + world_size - 1) // world_size * world_size
 
-    def _group_context_for_role(self, role: ParamRole) -> _GroupContext:
+    def _group_context_for_role(self, role: ParamRole) -> GroupContext:
         assert self.runtime is not None
         if role == ParamRole.EXPERT:
             group = self.runtime.get_group(MeshAxis.EDP)
             if group is None:
-                return _GroupContext(None, 1, 0)
-            return _GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
+                return GroupContext(None, 1, 0)
+            return GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
         assert self.dp_group is not None
-        return _GroupContext(self.dp_group, self.world_size, self.rank)
+        return GroupContext(self.dp_group, self.world_size, self.rank)
 
     def _ensure_bucket_handle(self, bucket: _Bucket) -> None:
         if bucket.handle is not None:

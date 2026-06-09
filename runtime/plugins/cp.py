@@ -45,7 +45,8 @@ class ContextParallelPlugin(RuntimePlugin):
 
     def bind(self, runtime) -> None:
         super().bind(runtime)
-        active = {plugin.id for plugin in runtime.plugins if plugin is not self}
+        self._active_plugin_ids = {plugin.id for plugin in runtime.plugins if plugin is not self}
+        active = self._active_plugin_ids
         self._use_param_hook_sync = (
             PluginId.DP not in active
             and PluginId.ZERO1 not in active
@@ -126,8 +127,7 @@ class ContextParallelPlugin(RuntimePlugin):
             return
         if not self.runtime.state.step_context.is_step_boundary:
             return
-        active = {plugin.id for plugin in self.runtime.plugins if plugin is not self}
-        if PluginId.ZERO1 in active or PluginId.ZERO2 in active or PluginId.ZERO3 in active:
+        if PluginId.ZERO1 in self._active_plugin_ids or PluginId.ZERO2 in self._active_plugin_ids or PluginId.ZERO3 in self._active_plugin_ids:
             return
         self._grad_sync_handles.clear()
         for param in self.runtime.model.parameters():

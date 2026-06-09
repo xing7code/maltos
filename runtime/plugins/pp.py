@@ -233,7 +233,6 @@ class PipelineParallelPlugin(RuntimePlugin):
 
         if not torch.is_tensor(self.runtime.state.outputs):
             raise TypeError("non-last PP stage must return Tensor activations")
-        assert torch.is_tensor(self.runtime.state.outputs)
         boundary_activation = _cast_boundary_activation(self.runtime.state.outputs, self.runtime)
         self.runtime.state.outputs = boundary_activation
         state.output_activation = boundary_activation
