@@ -363,7 +363,14 @@ class Zero3Plugin(RuntimePlugin):
             state = self._exec_state(bucket)
             if not state.backward_materialized:
                 self._materialize_full_params(bucket, direction=_ExecDirection.BACKWARD)
-                if bucket.prev_bucket is not None:
+                # gloo does not support concurrent ops on groups sharing the same rank pair;
+                # skip prefetch here to avoid racing with EP alltoall in the current bucket's backward.
+                if (
+                    self.bucket_order_checked
+                    and bucket.prev_bucket is not None
+                    and bucket.group_context.group is not None
+                    and dist.get_backend(bucket.group_context.group) != "gloo"
+                ):
                     self._prefetch_bucket(bucket.prev_bucket, direction=_ExecDirection.BACKWARD)
                 state.backward_materialized = True
             return grad
