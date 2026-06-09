@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from types import MethodType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from runtime.core import RuntimeCore
 
 import torch
 import torch.distributed as dist
@@ -69,7 +73,7 @@ class PipelineParallelPlugin(RuntimePlugin):
         self.sequence_parallel_world_size = 1
         self.schedule = _PipelineScheduleKind(schedule)
 
-    def bind(self, runtime) -> None:
+    def bind(self, runtime: "RuntimeCore") -> None:
         super().bind(runtime)
         active_plugins = {plugin.id for plugin in runtime.plugins if plugin is not self}
         self.sequence_parallel_enabled = PluginId.SP in active_plugins

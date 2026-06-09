@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from runtime.core import RuntimeCore
 
 import torch
 import torch.distributed as dist
@@ -185,7 +189,7 @@ class ExpertParallelPlugin(RuntimePlugin):
         assert self.runtime is not None
         return self.runtime.get_group(MeshAxis.EDP)
 
-    def bind(self, runtime) -> None:
+    def bind(self, runtime: "RuntimeCore") -> None:
         super().bind(runtime)
         active = {plugin.id for plugin in runtime.plugins if plugin is not self}
         self._delegate_shared_dp_sync = bool({PluginId.DP, PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)

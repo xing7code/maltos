@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from runtime.core import RuntimeCore
 
 import torch
 import torch.distributed as dist
@@ -43,7 +46,7 @@ class ContextParallelPlugin(RuntimePlugin):
     def world_size(self) -> int:
         return dist.get_world_size(self.cp_group)
 
-    def bind(self, runtime) -> None:
+    def bind(self, runtime: "RuntimeCore") -> None:
         super().bind(runtime)
         self._active_plugin_ids = {plugin.id for plugin in runtime.plugins if plugin is not self}
         active = self._active_plugin_ids

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-import threading
 
 import torch
 import torch.distributed as dist
@@ -11,8 +10,8 @@ import torch.nn as nn
 from runtime.buffer_allocator import allocate_buffer
 from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
-from runtime.plugin import PluginId, RuntimePlugin
-from runtime.plugins.zero_common import AllReduceShardWork, GroupContext, ReduceScatterShardWork
+from runtime.plugin import PluginId
+from runtime.plugins.zero_common import AllReduceShardWork, GroupContext, ReduceScatterShardWork, _ZeroPluginBase
 from state.state import ParamState
 
 
@@ -58,7 +57,7 @@ class _BucketExecState:
     backward_materialized: bool = False
 
 
-class Zero3Plugin(RuntimePlugin):
+class Zero3Plugin(_ZeroPluginBase):
     """FSDP-lite ZeRO-3 plugin with module-level parameter materialization."""
 
     def __init__(
@@ -72,9 +71,6 @@ class Zero3Plugin(RuntimePlugin):
             runs_after={PluginId.PP, PluginId.CP, PluginId.TP, PluginId.SP},
         )
         self.wrap_cls = set(wrap_cls or {nn.Linear})
-        self.dp_group: dist.ProcessGroup | None = None
-        self.world_size = 1
-        self.rank = 0
         self.buckets: list[_Bucket] = []
         self._materialized_buffers: list[torch.Tensor] = []
         self.bucket_order_checked = False
@@ -83,13 +79,6 @@ class Zero3Plugin(RuntimePlugin):
         self._first_bucket: _Bucket | None = None
         self._last_bucket: _Bucket | None = None
         self.expert_params: list[nn.Parameter] = []
-        self.optimizer: torch.optim.Optimizer | None = None
-        self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
-        self._post_reduction_thread: threading.Thread | None = None
-        self._post_reduction_cond = threading.Condition()
-
-    def bind(self, runtime) -> None:
-        super().bind(runtime)
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
@@ -319,8 +308,7 @@ class Zero3Plugin(RuntimePlugin):
                 if (
                     self.bucket_order_checked
                     and bucket.prev_bucket is not None
-                    and bucket.group_context.group is not None
-                    and dist.get_backend(bucket.group_context.group) != "gloo"
+                    and bucket.group_context.supports_async_overlap
                 ):
                     self._prefetch_bucket(bucket.prev_bucket, direction=_ExecDirection.BACKWARD)
                 state.backward_materialized = True
@@ -395,7 +383,7 @@ class Zero3Plugin(RuntimePlugin):
         if bucket.group_context.group is None or bucket.group_context.world_size == 1:
             bucket.local_param.grad.add_(state.grad_buffer[: bucket.local_param.numel()])
             return _ImmediateWork()
-        if dist.get_backend(bucket.group_context.group) == "gloo":
+        if bucket.group_context.is_gloo:
             work = dist.all_reduce(state.grad_buffer, op=dist.ReduceOp.AVG, group=bucket.group_context.group, async_op=True)
             shard_len = bucket.local_param.numel()
             shard_start = bucket.group_context.rank * shard_len
@@ -492,17 +480,6 @@ class Zero3Plugin(RuntimePlugin):
             ).clone()
             bucket.post_reduction_handles.clear()
             self._free_full_params(bucket)
-
-    def _use_async_worker(self) -> bool:
-        return self.dp_group is not None and dist.get_backend(self.dp_group) != "gloo"
-
-    def _start_post_reduction_worker(self) -> None:
-        assert self.runtime is not None
-        if not self.runtime._post_grad_reduction_callbacks:
-            self._post_reduction_thread = None
-            return
-        self._post_reduction_thread = threading.Thread(target=self._post_reduction_worker, daemon=True)
-        self._post_reduction_thread.start()
 
     def _post_reduction_worker(self) -> None:
         assert self.runtime is not None
@@ -601,19 +578,6 @@ class Zero3Plugin(RuntimePlugin):
             backward_state.pending = len(bucket.params)
             backward_state.attached = False
             backward_state.backward_materialized = False
-
-    def _padded_len(self, numel: int, world_size: int) -> int:
-        return (numel + world_size - 1) // world_size * world_size
-
-    def _group_context_for_role(self, role: ParamRole) -> GroupContext:
-        assert self.runtime is not None
-        if role == ParamRole.EXPERT:
-            group = self.runtime.get_group(MeshAxis.EDP)
-            if group is None:
-                return GroupContext(None, 1, 0)
-            return GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
-        assert self.dp_group is not None
-        return GroupContext(self.dp_group, self.world_size, self.rank)
 
     def _ensure_state_grad_handle(self, bucket: _Bucket, state: _BucketExecState) -> None:
         if state.grad_handle is not None:

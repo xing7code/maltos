@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from runtime.core import RuntimeCore
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -43,7 +48,7 @@ class SequenceParallelPlugin(RuntimePlugin):
     def world_size(self) -> int:
         return dist.get_world_size(self.sp_group)
 
-    def bind(self, runtime) -> None:
+    def bind(self, runtime: "RuntimeCore") -> None:
         super().bind(runtime)
         active = {plugin.id for plugin in runtime.plugins if plugin is not self}
         zero_active = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)

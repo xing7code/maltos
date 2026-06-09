@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import threading
 
 import torch
 import torch.distributed as dist
@@ -9,8 +8,8 @@ import torch.nn as nn
 
 from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
-from runtime.plugin import PluginId, RuntimePlugin
-from runtime.plugins.zero_common import AllReduceShardWork, GroupContext, ReduceScatterShardWork
+from runtime.plugin import PluginId
+from runtime.plugins.zero_common import AllReduceShardWork, GroupContext, ReduceScatterShardWork, _ZeroPluginBase
 
 
 class _LocalAddWork:
@@ -46,7 +45,7 @@ class _BucketExecState:
     attached: bool = False
 
 
-class Zero2Plugin(RuntimePlugin):
+class Zero2Plugin(_ZeroPluginBase):
     """ZeRO-2 style optimizer and gradient sharding over the DP axis."""
 
     def __init__(
@@ -58,17 +57,10 @@ class Zero2Plugin(RuntimePlugin):
             name="zero2",
             owns_optimizer=True,
             runs_after={PluginId.PP, PluginId.CP, PluginId.TP, PluginId.SP},
+            bucket_mb_size=bucket_mb_size,
         )
-        self.bucket_byte_size = bucket_mb_size * 1024 * 1024
-        self.dp_group: dist.ProcessGroup | None = None
-        self.world_size = 1
-        self.rank = 0
         self.data_buffer: torch.Tensor | None = None
         self.buckets: list[_Bucket] = []
-        self.optimizer: torch.optim.Optimizer | None = None
-        self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
-        self._post_reduction_thread: threading.Thread | None = None
-        self._post_reduction_cond = threading.Condition()
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
@@ -164,29 +156,6 @@ class Zero2Plugin(RuntimePlugin):
         self._reset_buckets(grad_accum_start=True, grad_accum_end=True)
         self._add_param_hooks()
 
-    def _build_param_buckets(self, params: list[nn.Parameter]) -> list[list[nn.Parameter]]:
-        buckets: list[list[nn.Parameter]] = []
-        curr_bucket: list[nn.Parameter] = []
-        curr_bytes = 0
-        for param in params:
-            param_bytes = param.numel() * param.element_size()
-            if curr_bucket and curr_bytes + param_bytes > self.bucket_byte_size:
-                buckets.append(curr_bucket)
-                curr_bucket = []
-                curr_bytes = 0
-            curr_bucket.append(param)
-            curr_bytes += param_bytes
-        if curr_bucket:
-            buckets.append(curr_bucket)
-        return buckets
-
-    def _role_params(self, model: nn.Module, role: ParamRole) -> list[nn.Parameter]:
-        return [
-            param
-            for param in model.parameters()
-            if param.requires_grad and self.runtime.get_param_role(param) == role
-        ][::-1]
-
     def _add_param_hooks(self) -> None:
         for bucket in self.buckets:
             for param in bucket.params:
@@ -234,7 +203,7 @@ class Zero2Plugin(RuntimePlugin):
         full_grad = state.grad_buffer[:bucket_numel]
         if bucket.group_context.group is None or bucket.group_context.world_size == 1:
             return _LocalAddWork(full_grad[: bucket.local_param.numel()], bucket.local_param.grad)
-        if dist.get_backend(bucket.group_context.group) == "gloo":
+        if bucket.group_context.is_gloo:
             work = dist.all_reduce(full_grad, op=dist.ReduceOp.AVG, group=bucket.group_context.group, async_op=True)
             shard_len = bucket.local_param.numel()
             shard_start = bucket.group_context.rank * shard_len
@@ -267,17 +236,6 @@ class Zero2Plugin(RuntimePlugin):
                 )
             for handle in handles:
                 handle.wait()
-
-    def _use_async_worker(self) -> bool:
-        return self.dp_group is not None and dist.get_backend(self.dp_group) != "gloo"
-
-    def _start_post_reduction_worker(self) -> None:
-        assert self.runtime is not None
-        if not self.runtime._post_grad_reduction_callbacks:
-            self._post_reduction_thread = None
-            return
-        self._post_reduction_thread = threading.Thread(target=self._post_reduction_worker, daemon=True)
-        self._post_reduction_thread.start()
 
     def _post_reduction_worker(self) -> None:
         assert self.runtime is not None
@@ -366,19 +324,6 @@ class Zero2Plugin(RuntimePlugin):
         with torch.no_grad():
             for bucket in self.buckets:
                 bucket.local_param.data.copy_(self.data_buffer[bucket.shard_start : bucket.shard_end])
-
-    def _padded_len(self, numel: int, world_size: int) -> int:
-        return (numel + world_size - 1) // world_size * world_size
-
-    def _group_context_for_role(self, role: ParamRole) -> GroupContext:
-        assert self.runtime is not None
-        if role == ParamRole.EXPERT:
-            group = self.runtime.get_group(MeshAxis.EDP)
-            if group is None:
-                return GroupContext(None, 1, 0)
-            return GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
-        assert self.dp_group is not None
-        return GroupContext(self.dp_group, self.world_size, self.rank)
 
     def _ensure_state_handle(self, bucket: _Bucket, state: _BucketExecState) -> None:
         if state.handle is not None:
