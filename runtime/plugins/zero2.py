@@ -68,6 +68,7 @@ class _GroupContext:
 class _Bucket:
     params: list[nn.Parameter]
     group_context: _GroupContext
+    role: "ParamRole"
     start: int
     end: int
     shard_start: int
@@ -152,25 +153,25 @@ class Zero2Plugin(RuntimePlugin):
     def _prepare_buffers_and_buckets(self, model: nn.Module) -> None:
         shared_params = self._role_params(model, ParamRole.SHARED)
         expert_params = self._role_params(model, ParamRole.EXPERT)
-        bucket_specs: list[tuple[_GroupContext, list[list[nn.Parameter]]]] = []
+        bucket_specs: list[tuple[_GroupContext, list[list[nn.Parameter]], ParamRole]] = []
         if shared_params:
-            bucket_specs.append((_GroupContext(self.dp_group, self.world_size, self.rank), self._build_param_buckets(shared_params)))
+            bucket_specs.append((_GroupContext(self.dp_group, self.world_size, self.rank), self._build_param_buckets(shared_params), ParamRole.SHARED))
         if expert_params:
-            bucket_specs.append((self._group_context_for_role(ParamRole.EXPERT), self._build_param_buckets(expert_params)))
+            bucket_specs.append((self._group_context_for_role(ParamRole.EXPERT), self._build_param_buckets(expert_params), ParamRole.EXPERT))
         if not bucket_specs:
             return
 
         dtype = (shared_params or expert_params)[0].dtype
         device = (shared_params or expert_params)[0].device
-        flat_specs: list[tuple[_GroupContext, list[nn.Parameter], int]] = []
-        for group_context, param_buckets in bucket_specs:
+        flat_specs: list[tuple[_GroupContext, list[nn.Parameter], int, ParamRole]] = []
+        for group_context, param_buckets, role in bucket_specs:
             for bucket_params in param_buckets:
                 padded_size = self._padded_len(sum(param.numel() for param in bucket_params), group_context.world_size)
-                flat_specs.append((group_context, bucket_params, padded_size))
-        self.data_buffer = torch.zeros(sum(padded_size for _, _, padded_size in flat_specs), dtype=dtype, device=device)
+                flat_specs.append((group_context, bucket_params, padded_size, role))
+        self.data_buffer = torch.zeros(sum(padded_size for _, _, padded_size, _ in flat_specs), dtype=dtype, device=device)
 
         offset = 0
-        for group_context, bucket_params, padded_size in flat_specs:
+        for group_context, bucket_params, padded_size, role in flat_specs:
             param_offset = offset
             for param in bucket_params:
                 with torch.no_grad():
@@ -185,6 +186,7 @@ class Zero2Plugin(RuntimePlugin):
                 _Bucket(
                     params=bucket_params,
                     group_context=group_context,
+                    role=role,
                     start=offset,
                     end=offset + padded_size,
                     shard_start=shard_start,
@@ -331,7 +333,9 @@ class Zero2Plugin(RuntimePlugin):
                 state.handle.wait()
                 state.handle = None
             if bucket.local_param.grad is not None:
-                for cb in callbacks:
+                for cb, role_filter in callbacks:
+                    if role_filter is not None and bucket.role != role_filter:
+                        continue
                     work = cb(bucket.local_param.grad)
                     if work is not None:
                         bucket.post_reduction_handles.append(work)
@@ -340,6 +344,9 @@ class Zero2Plugin(RuntimePlugin):
         assert self.runtime is not None
         callbacks = self.runtime._post_dp_reduction_callbacks
         for bucket in self.buckets:
+            relevant = [(cb, rf) for cb, rf in callbacks if rf is None or rf == bucket.role]
+            if not relevant:
+                continue
             waited = False
             for state in bucket.exec_states:
                 self._ensure_state_handle(bucket, state)
@@ -351,7 +358,7 @@ class Zero2Plugin(RuntimePlugin):
             if not waited:
                 raise RuntimeError("ZeRO2 bucket handle is None after backward")
             if bucket.local_param.grad is not None:
-                for cb in callbacks:
+                for cb, _ in relevant:
                     work = cb(bucket.local_param.grad)
                     if work is not None:
                         bucket.post_reduction_handles.append(work)

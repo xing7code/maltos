@@ -118,7 +118,6 @@ class Zero3Plugin(RuntimePlugin):
         self.wrap_cls = set(wrap_cls or {nn.Linear})
         self.enable_prefetch = enable_prefetch
         self.dp_group: dist.ProcessGroup | None = None
-        self.tp_group: dist.ProcessGroup | None = None
         self.world_size = 1
         self.rank = 0
         self.buckets: list[_Bucket] = []
@@ -133,19 +132,16 @@ class Zero3Plugin(RuntimePlugin):
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self._post_reduction_thread: threading.Thread | None = None
         self._post_reduction_cond = threading.Condition()
-        self._expert_tp_sync = False
 
     def bind(self, runtime) -> None:
         super().bind(runtime)
         active_plugins = {plugin.id for plugin in runtime.plugins if plugin is not self}
         if PluginId.TP in active_plugins and nn.Linear in self.wrap_cls:
             self.wrap_cls.update({ColumnParallelLinear, RowParallelLinear})
-        self._expert_tp_sync = PluginId.SP in active_plugins
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         assert self.runtime is not None
         self.dp_group = self.runtime.get_group(MeshAxis.DP)
-        self.tp_group = self.runtime.get_group(MeshAxis.TP)
         if self.dp_group is None:
             raise ValueError("Zero3Plugin requires mesh.dp > 1")
         self.world_size = dist.get_world_size(self.dp_group)
@@ -570,7 +566,9 @@ class Zero3Plugin(RuntimePlugin):
                 state.grad_handle = None
             self._free_full_params(bucket)
             if bucket.local_param.grad is not None:
-                for cb in callbacks:
+                for cb, role_filter in callbacks:
+                    if role_filter is not None and bucket.role != role_filter:
+                        continue
                     work = cb(bucket.local_param.grad)
                     if work is not None:
                         bucket.post_reduction_handles.append(work)
@@ -579,6 +577,9 @@ class Zero3Plugin(RuntimePlugin):
         assert self.runtime is not None
         callbacks = self.runtime._post_dp_reduction_callbacks
         for bucket in self.buckets:
+            relevant = [(cb, rf) for cb, rf in callbacks if rf is None or rf == bucket.role]
+            if not relevant:
+                continue
             waited = False
             for state in bucket.exec_states:
                 self._ensure_state_grad_handle(bucket, state)
@@ -592,7 +593,7 @@ class Zero3Plugin(RuntimePlugin):
                 continue
             self._free_full_params(bucket)
             if bucket.local_param.grad is not None:
-                for cb in callbacks:
+                for cb, _ in relevant:
                     work = cb(bucket.local_param.grad)
                     if work is not None:
                         bucket.post_reduction_handles.append(work)
@@ -606,7 +607,6 @@ class Zero3Plugin(RuntimePlugin):
                 for handle in bucket.post_reduction_handles:
                     handle.wait()
                 bucket.post_reduction_handles.clear()
-                self._maybe_sync_expert_tp(bucket)
             else:
                 waited = False
                 for state in bucket.exec_states:
@@ -619,7 +619,6 @@ class Zero3Plugin(RuntimePlugin):
                 if not waited:
                     self._free_full_params(bucket)
                     continue
-                self._maybe_sync_expert_tp(bucket)
                 self._free_full_params(bucket)
 
     def _flush_partial_grad_state_for_checkpoint(self) -> None:
@@ -681,15 +680,6 @@ class Zero3Plugin(RuntimePlugin):
         state.grad_buffer.zero_()
         state.shard_buffer.zero_()
         state.grad_handle = self._reduce_scatter_avg(bucket, state)
-
-    def _maybe_sync_expert_tp(self, bucket: _Bucket) -> None:
-        if bucket.role != ParamRole.EXPERT or not self._expert_tp_sync:
-            return
-        if self.tp_group is None or dist.get_world_size(self.tp_group) <= 1:
-            return
-        if bucket.local_param.grad is None:
-            return
-        dist.all_reduce(bucket.local_param.grad, op=dist.ReduceOp.SUM, group=self.tp_group)
 
     def _prefetch_is_enabled(self) -> bool:
         if not self.enable_prefetch:

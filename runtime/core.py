@@ -135,12 +135,15 @@ class RuntimeCore:
     state: RuntimeState = field(default_factory=RuntimeState)
     optimizer: torch.optim.Optimizer | None = field(default=None, init=False)
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False)
-    _post_dp_reduction_callbacks: list[Callable[[torch.Tensor], "dist.Work | None"]] = field(
-        default_factory=list, init=False
-    )
+    _post_dp_reduction_callbacks: list[
+        tuple[Callable[[torch.Tensor], "dist.Work | None"], "ParamRole | None"]
+    ] = field(default_factory=list, init=False)
 
     def register_post_dp_reduction_callback(
-        self, cb: Callable[[torch.Tensor], "dist.Work | None"]
+        self,
+        cb: Callable[[torch.Tensor], "dist.Work | None"],
+        *,
+        role_filter: "ParamRole | None" = None,
     ) -> None:
         """Register a callback invoked after each ZeRO bucket's DP reduction completes.
 
@@ -151,8 +154,11 @@ class RuntimeCore:
         The callback must be tensor-agnostic: it receives a flat 1D shard whose
         shape and parameter identity vary per bucket. Selective per-parameter
         logic is not supported.
+
+        role_filter: if set, ZeRO only invokes this callback for buckets whose
+        ParamRole matches. Use ParamRole.EXPERT for expert-only grad syncs.
         """
-        self._post_dp_reduction_callbacks.append(cb)
+        self._post_dp_reduction_callbacks.append((cb, role_filter))
 
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
