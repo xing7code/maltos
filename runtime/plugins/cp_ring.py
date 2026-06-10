@@ -26,9 +26,7 @@ class _RingShift(torch.autograd.Function):
         ctx.send_to = send_to
         ctx.recv_from = recv_from
         ctx.alloc_key = alloc_key
-        ctx.rank = dist.get_rank(group)
-        ctx.world_size = dist.get_world_size(group)
-        if ctx.world_size == 1:
+        if dist.get_world_size(group) == 1:
             return x
         out = allocate_buffer(
             key=f"{alloc_key}.forward",
@@ -43,13 +41,13 @@ class _RingShift(torch.autograd.Function):
             out,
             send_rank=send_global_rank,
             recv_rank=recv_global_rank,
-            rank=ctx.rank,
+            group=group,
         )
         return out
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        if ctx.world_size == 1:
+        if dist.get_world_size(ctx.group) == 1:
             return grad_output, None, None, None, None
         grad_input = allocate_buffer(
             key=f"{ctx.alloc_key}.backward",
@@ -64,7 +62,7 @@ class _RingShift(torch.autograd.Function):
             grad_input,
             send_rank=send_global_rank,
             recv_rank=recv_global_rank,
-            rank=ctx.rank,
+            group=ctx.group,
         )
         return grad_input, None, None, None, None
 
@@ -86,14 +84,14 @@ def _pairwise_send_recv(
     *,
     send_rank: int,
     recv_rank: int,
-    rank: int,
+    group: dist.ProcessGroup,
 ) -> None:
-    if rank % 2 == 0:
-        dist.send(send_tensor, dst=send_rank)
-        dist.recv(recv_tensor, src=recv_rank)
-        return
-    dist.recv(recv_tensor, src=recv_rank)
-    dist.send(send_tensor, dst=send_rank)
+    ops = [
+        dist.P2POp(dist.isend, send_tensor, send_rank, group),
+        dist.P2POp(dist.irecv, recv_tensor, recv_rank, group),
+    ]
+    for work in dist.batch_isend_irecv(ops):
+        work.wait()
 
 
 class RingAttentionCore(nn.Module):
@@ -224,7 +222,7 @@ def _ring_exchange_tensor(
         out,
         send_rank=send_global_rank,
         recv_rank=recv_global_rank,
-        rank=dist.get_rank(group),
+        group=group,
     )
     return out
 
