@@ -59,6 +59,7 @@ class PipelineParallelPlugin(RuntimePlugin):
                 PluginId.ZERO3,
                 PluginId.TP,
                 PluginId.SP,
+                PluginId.EP,
                 PluginId.PRECISION,
             },
         )
