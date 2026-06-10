@@ -523,15 +523,9 @@ class Zero3Plugin(_ZeroPluginBase):
             self._post_reduction_thread.join()
             self._post_reduction_thread = None
         for bucket in self.buckets:
-            if bucket.post_reduction_handles:
-                for handle in bucket.post_reduction_handles:
-                    handle.wait()
-                bucket.post_reduction_handles.clear()
-            else:
-                for state in bucket.exec_states:
-                    self._ensure_state_grad_handle(bucket, state)
-                    state.grad_handle.wait()
-                    state.grad_handle = None
+            for handle in bucket.post_reduction_handles:
+                handle.wait()
+            bucket.post_reduction_handles.clear()
             self._free_full_params(bucket)
 
     def _flush_partial_grad_state_for_checkpoint(self) -> None:
@@ -583,8 +577,9 @@ class Zero3Plugin(_ZeroPluginBase):
             return
         if bucket.local_param.grad is None:
             bucket.local_param.grad = torch.zeros_like(bucket.local_param.data)
-        state.grad_buffer.zero_()
-        state.shard_buffer.zero_()
+        # Do NOT zero grad_buffer here: _reset_buckets already zeroed it at PRE_BACKWARD.
+        # Zeroing here erases valid gradients when called after a completed reduction
+        # (handle was waited and set to None by _fire_post_reductions_sync).
         state.grad_handle = self._reduce_scatter_avg(bucket, state)
 
 

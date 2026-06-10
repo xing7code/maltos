@@ -282,21 +282,9 @@ class Zero2Plugin(_ZeroPluginBase):
             self._post_reduction_thread.join()
             self._post_reduction_thread = None
         for bucket in self.buckets:
-            if bucket.post_reduction_handles:
-                for handle in bucket.post_reduction_handles:
-                    handle.wait()
-                bucket.post_reduction_handles.clear()
-            else:
-                waited = False
-                for state in bucket.exec_states:
-                    self._ensure_state_handle(bucket, state)
-                    if state.handle is None:
-                        continue
-                    state.handle.wait()
-                    state.handle = None
-                    waited = True
-                if not waited:
-                    continue
+            for handle in bucket.post_reduction_handles:
+                handle.wait()
+            bucket.post_reduction_handles.clear()
 
     def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
         if grad_accum_start:
@@ -328,8 +316,9 @@ class Zero2Plugin(_ZeroPluginBase):
             return
         if bucket.local_param.grad is None:
             bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
-        state.grad_buffer.zero_()
-        state.shard_buffer.zero_()
+        # Do NOT zero grad_buffer here: _reset_buckets already zeroed it at PRE_BACKWARD.
+        # Zeroing here would erase valid gradients when this is called after a completed
+        # reduction (handle was waited and set to None by _fire_post_reductions_sync).
         state.handle = self._reduce_scatter_avg(bucket, state)
 
     def _exec_state(self, bucket: _Bucket) -> _BucketExecState:

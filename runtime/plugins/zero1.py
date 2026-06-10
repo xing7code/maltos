@@ -281,16 +281,9 @@ class Zero1Plugin(_ZeroPluginBase):
             self._post_reduction_thread.join()
             self._post_reduction_thread = None
         for bucket in self.buckets:
-            if bucket.post_reduction_handles:
-                for handle in bucket.post_reduction_handles:
-                    handle.wait()
-                bucket.post_reduction_handles.clear()
-            else:
-                self._ensure_bucket_handle(bucket)
-                if bucket.handle is None:
-                    continue
-                bucket.handle.wait()
-                bucket.handle = None
+            for handle in bucket.post_reduction_handles:
+                handle.wait()
+            bucket.post_reduction_handles.clear()
 
     def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
         assert self.grad_buffer is not None
