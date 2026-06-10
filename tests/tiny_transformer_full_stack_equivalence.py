@@ -198,7 +198,7 @@ def _make_zero_plugin(args: argparse.Namespace) -> Zero1Plugin | Zero2Plugin | Z
     return Zero3Plugin(wrap_cls=_ZERO3_WRAP_CLS)
 
 
-def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespace) -> RuntimeCore:
+def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
     model = TinyTransformerTpSp(**_MODEL_KWARGS)
     model.load_state_dict(reference_model.state_dict())
     plugins = [
@@ -214,10 +214,11 @@ def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespa
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=plugins,
+        device=device,
     )
 
 
-def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespace) -> RuntimeCore:
+def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
     model = TinyTransformerTpSp(**_MODEL_KWARGS)
     model.load_state_dict(reference_model.state_dict())
     plugins = [
@@ -237,6 +238,7 @@ def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespac
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=plugins,
+        device=device,
     )
 
 
@@ -247,6 +249,11 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         rank=rank,
         world_size=args.world_size,
     )
+    device: torch.device | None = None
+    if args.backend == "nccl":
+        local_rank = rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
     if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
         raise ValueError("full stack equivalence expects world_size == dp_size * pp_size * cp_size * tp_size")
     if args.batch_size % args.dp_size != 0:
@@ -256,9 +263,9 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
 
-    baseline_core = _make_baseline_core(reference_model, args)
+    baseline_core = _make_baseline_core(reference_model, args, device)
     baseline_core.setup()
-    runtime_core = _make_runtime_core(reference_model, args)
+    runtime_core = _make_runtime_core(reference_model, args, device)
     runtime_core.setup()
 
     dp_idx = rank // (args.pp_size * args.cp_size * args.tp_size)

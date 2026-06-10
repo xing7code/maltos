@@ -198,7 +198,7 @@ def _build_zero3() -> Zero3Plugin:
     )
 
 
-def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Namespace) -> RuntimeCore:
+def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
     model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
     model.load_state_dict(reference_model.state_dict())
     return RuntimeCore(
@@ -213,10 +213,11 @@ def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Name
             ExpertParallelPlugin(),
             _build_zero3(),
         ],
+        device=device,
     )
 
 
-def _make_runtime_core(reference_model: TinyMoETransformer, args: argparse.Namespace) -> RuntimeCore:
+def _make_runtime_core(reference_model: TinyMoETransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
     model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
     model.load_state_dict(reference_model.state_dict())
     return RuntimeCore(
@@ -232,6 +233,7 @@ def _make_runtime_core(reference_model: TinyMoETransformer, args: argparse.Names
             ExpertParallelPlugin(),
             _build_zero3(),
         ],
+        device=device,
     )
 
 
@@ -242,6 +244,11 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         rank=rank,
         world_size=args.world_size,
     )
+    device: torch.device | None = None
+    if args.backend == "nccl":
+        local_rank = rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
     if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
         raise ValueError("EP full stack expects world_size == dp_size * pp_size * cp_size * tp_size")
     if args.batch_size % args.dp_size != 0:
@@ -251,8 +258,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
 
-    baseline_core = _make_baseline_core(reference_model, args)
-    runtime_core = _make_runtime_core(reference_model, args)
+    baseline_core = _make_baseline_core(reference_model, args, device)
+    runtime_core = _make_runtime_core(reference_model, args, device)
     baseline_core.setup()
     runtime_core.setup()
     baseline_core.model.train()

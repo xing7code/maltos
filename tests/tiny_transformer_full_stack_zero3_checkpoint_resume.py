@@ -149,7 +149,7 @@ def _reduce_loss(loss: torch.Tensor, core: RuntimeCore) -> torch.Tensor:
     return reduced
 
 
-def _build_runtime(model: TinyTransformerTpSp, args: argparse.Namespace) -> tuple[RuntimeCore, Zero3Plugin]:
+def _build_runtime(model: TinyTransformerTpSp, args: argparse.Namespace, device: torch.device | None = None) -> tuple[RuntimeCore, Zero3Plugin]:
     zero3 = Zero3Plugin(
         wrap_cls=_ZERO3_WRAP_CLS,
     )
@@ -173,6 +173,7 @@ def _build_runtime(model: TinyTransformerTpSp, args: argparse.Namespace) -> tupl
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=plugins,
+        device=device,
     )
     core.setup()
     return core, zero3
@@ -185,6 +186,11 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         rank=rank,
         world_size=args.world_size,
     )
+    device: torch.device | None = None
+    if args.backend == "nccl":
+        local_rank = rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
     if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
         raise ValueError("world size must equal dp_size * pp_size * cp_size * tp_size")
     if args.global_batch_size % args.dp_size != 0:
@@ -202,7 +208,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     continuous_model = TinyTransformerTpSp(**_MODEL_KWARGS)
     continuous_model.load_state_dict(reference_model.state_dict())
-    continuous_core, continuous_zero3 = _build_runtime(continuous_model, args)
+    continuous_core, continuous_zero3 = _build_runtime(continuous_model, args, device)
 
     dist.barrier()
 
@@ -226,7 +232,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     restored_model = TinyTransformerTpSp(**_MODEL_KWARGS)
     restored_model.load_state_dict(reference_model.state_dict())
-    restored_core, restored_zero3 = _build_runtime(restored_model, args)
+    restored_core, restored_zero3 = _build_runtime(restored_model, args, device)
     load_sharded_checkpoint(restored_core.state_manager, args.checkpoint_dir)
     dist.barrier()
     restored_second_loss, should_step = restored_core.run_step(causal_lm_batch(second_local))
