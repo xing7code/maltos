@@ -6,7 +6,7 @@ Current stack under test:
   - CP=optional
   - TP=2
   - SP
-  - ZeRO1/2/3
+  - ZeRO0/1/2/3
 
 The baseline removes PP but keeps the rest of the stack so we can isolate
 pipeline-runtime correctness while preserving the same CP/TP/SP/ZeRO semantics.
@@ -31,10 +31,11 @@ import torch.multiprocessing as mp
 from helpers import causal_lm_batch
 from models import TinyTransformer, TinyTransformerTpSp
 from models.tiny_transformer import RmsNorm
-from parallel import ParallelPlan
+from parallel import ContextParallelAttentionCoreType, ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
 from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
+from runtime.core import RuntimePhase
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
@@ -71,7 +72,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tp-size", type=int, default=2)
     parser.add_argument("--pp-microbatches", type=int, default=2)
     parser.add_argument("--pp-schedule", choices=("afab", "1f1b"), default="afab")
-    parser.add_argument("--zero-stage", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--zero-stage", type=int, choices=(0, 1, 2, 3), default=3)
+    parser.add_argument("--cp-attn-core", choices=("all_gather_kv", "ring"), default="all_gather_kv")
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29569)
     parser.add_argument("--backend", type=str, default="gloo")
@@ -112,10 +114,12 @@ def _logical_tensor(
 ) -> torch.Tensor:
     shard_axis = shard_rules.get(name)
     if shard_axis == TpSpShardAxis.PARAM_OUT:
-        assert tp_group is not None
+        if tp_group is None:
+            return tensor.detach().clone()
         return torch.cat(_all_gather_tensor(tensor, tp_group), dim=0)
     if shard_axis == TpSpShardAxis.PARAM_IN:
-        assert tp_group is not None
+        if tp_group is None:
+            return tensor.detach().clone()
         return torch.cat(_all_gather_tensor(tensor, tp_group), dim=1)
     return tensor.detach().clone()
 
@@ -140,16 +144,17 @@ def _logical_named_zero_grads(
     shard_rules: dict[str, str],
     tp_group: dist.ProcessGroup | None,
 ) -> dict[str, torch.Tensor]:
-    dp_group = core.get_group(MeshAxis.DP)
-    if dp_group is None:
-        raise ValueError("full stack ZeRO grad materialization requires DP group")
     name_by_param = {id(param): name for name, param in core.model.named_parameters()}
     logical_grads: dict[str, torch.Tensor] = {}
     for bucket in zero_plugin.buckets:
         local_grad = bucket.local_param.grad
         if local_grad is None:
             continue
-        full_bucket_grad = torch.cat(_all_gather_tensor(local_grad.detach(), dp_group), dim=0)
+        shard_group = bucket.group_context.group
+        if shard_group is None:
+            full_bucket_grad = local_grad.detach()
+        else:
+            full_bucket_grad = torch.cat(_all_gather_tensor(local_grad.detach(), shard_group), dim=0)
         offset = 0
         logical_names = getattr(bucket, "logical_names", None)
         param_shapes = getattr(bucket, "param_shapes", None)
@@ -169,6 +174,27 @@ def _logical_named_zero_grads(
     return logical_grads
 
 
+def _logical_named_grads(
+    core: RuntimeCore,
+    zero_plugin: Zero1Plugin | Zero2Plugin | Zero3Plugin | None,
+    shard_rules: dict[str, str],
+    tp_group: dist.ProcessGroup | None,
+) -> dict[str, torch.Tensor]:
+    if zero_plugin is None:
+        def _norm(name: str) -> str:
+            return name[len("module."):] if name.startswith("module.") else name
+        return {
+            _norm(name): _logical_tensor(
+                _norm(name),
+                param.grad.detach() if param.grad is not None else torch.zeros_like(param),
+                shard_rules,
+                tp_group,
+            )
+            for name, param in core.model.named_parameters()
+        }
+    return _logical_named_zero_grads(core, zero_plugin, shard_rules, tp_group)
+
+
 def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tuple[str, float]:
     worst_name = ""
     worst_diff = 0.0
@@ -180,17 +206,16 @@ def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tup
     return worst_name, worst_diff
 
 
-def _get_zero_plugin(core: RuntimeCore) -> Zero1Plugin | Zero2Plugin | Zero3Plugin:
-    zero_plugin = next(
+def _find_zero_plugin(core: RuntimeCore) -> Zero1Plugin | Zero2Plugin | Zero3Plugin | None:
+    return next(
         (plugin for plugin in core.plugins if isinstance(plugin, (Zero1Plugin, Zero2Plugin, Zero3Plugin))),
         None,
     )
-    if zero_plugin is None:
-        raise RuntimeError("full stack equivalence expects a ZeRO plugin")
-    return zero_plugin
 
 
-def _make_zero_plugin(args: argparse.Namespace) -> Zero1Plugin | Zero2Plugin | Zero3Plugin:
+def _make_zero_plugin(args: argparse.Namespace) -> Zero1Plugin | Zero2Plugin | Zero3Plugin | None:
+    if args.zero_stage == 0:
+        return None
     if args.zero_stage == 1:
         return Zero1Plugin(bucket_mb_size=0)
     if args.zero_stage == 2:
@@ -201,16 +226,20 @@ def _make_zero_plugin(args: argparse.Namespace) -> Zero1Plugin | Zero2Plugin | Z
 def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
     model = TinyTransformerTpSp(**_MODEL_KWARGS)
     model.load_state_dict(reference_model.state_dict())
-    plugins = [
-        TensorParallelPlugin(),
-        SequenceParallelPlugin(),
-    ]
+    plugins = []
+    if args.tp_size > 1:
+        plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
     if args.cp_size > 1:
         plugins.append(ContextParallelPlugin())
-    plugins.append(_make_zero_plugin(args))
+    zero_plugin = _make_zero_plugin(args)
+    if zero_plugin is not None:
+        plugins.append(zero_plugin)
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=1),
-        plan=ParallelPlan(zero_stage=args.zero_stage),
+        plan=ParallelPlan(
+            zero_stage=args.zero_stage,
+            cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
+        ),
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=plugins,
@@ -221,19 +250,22 @@ def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespa
 def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
     model = TinyTransformerTpSp(**_MODEL_KWARGS)
     model.load_state_dict(reference_model.state_dict())
-    plugins = [
-        TensorParallelPlugin(),
-        SequenceParallelPlugin(),
-    ]
+    plugins = []
+    if args.tp_size > 1:
+        plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
     if args.cp_size > 1:
         plugins.append(ContextParallelPlugin())
-    plugins.append(PipelineParallelPlugin(schedule=args.pp_schedule))
-    plugins.append(_make_zero_plugin(args))
+    if args.pp_size > 1:
+        plugins.append(PipelineParallelPlugin(schedule=args.pp_schedule))
+    zero_plugin = _make_zero_plugin(args)
+    if zero_plugin is not None:
+        plugins.append(zero_plugin)
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=1),
         plan=ParallelPlan(
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
             zero_stage=args.zero_stage,
+            cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
         ),
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
@@ -243,17 +275,18 @@ def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespac
 
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
-    dist.init_process_group(
-        backend=args.backend,
-        init_method=f"tcp://{args.master_addr}:{args.master_port}",
-        rank=rank,
-        world_size=args.world_size,
-    )
     device: torch.device | None = None
     if args.backend == "nccl":
         local_rank = rank % torch.cuda.device_count()
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
+    dist.init_process_group(
+        backend=args.backend,
+        init_method=f"tcp://{args.master_addr}:{args.master_port}",
+        rank=rank,
+        world_size=args.world_size,
+        device_id=device,
+    )
     if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
         raise ValueError("full stack equivalence expects world_size == dp_size * pp_size * cp_size * tp_size")
     if args.batch_size % args.dp_size != 0:
@@ -278,16 +311,18 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if not baseline_should_step or not runtime_should_step:
         raise AssertionError("full stack test expects grad_accum_steps=1, should_step must be True")
 
-    baseline_zero = _get_zero_plugin(baseline_core)
-    runtime_zero = _get_zero_plugin(runtime_core)
+    baseline_zero = _find_zero_plugin(baseline_core)
+    runtime_zero = _find_zero_plugin(runtime_core)
 
     baseline_tp_group = baseline_core.get_group(MeshAxis.TP)
     runtime_tp_group = runtime_core.get_group(MeshAxis.TP)
     baseline_shard_rules = _rule_by_param_name(baseline_core.model)
     runtime_shard_rules = _rule_by_param_name(runtime_core.model)
 
-    baseline_grads = _logical_named_zero_grads(baseline_core, baseline_zero, baseline_shard_rules, baseline_tp_group)
-    runtime_grads = _logical_named_zero_grads(runtime_core, runtime_zero, runtime_shard_rules, runtime_tp_group)
+    baseline_core._run_phase(RuntimePhase.PRE_STEP)
+    runtime_core._run_phase(RuntimePhase.PRE_STEP)
+    baseline_grads = _logical_named_grads(baseline_core, baseline_zero, baseline_shard_rules, baseline_tp_group)
+    runtime_grads = _logical_named_grads(runtime_core, runtime_zero, runtime_shard_rules, runtime_tp_group)
     grad_name, grad_diff = _max_diff(runtime_grads, baseline_grads)
 
     baseline_core.step_optimizer()
@@ -312,9 +347,9 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         dist.all_reduce(avg_baseline_loss, op=dist.ReduceOp.AVG, group=dp_group)
         dist.all_reduce(avg_runtime_loss, op=dist.ReduceOp.AVG, group=dp_group)
 
-    loss_diff_tensor = torch.tensor(abs(avg_baseline_loss.item() - avg_runtime_loss.item()), dtype=torch.float64)
-    grad_diff_tensor = torch.tensor(grad_diff, dtype=torch.float64)
-    step_diff_tensor = torch.tensor(step_diff, dtype=torch.float64)
+    loss_diff_tensor = torch.tensor(abs(avg_baseline_loss.item() - avg_runtime_loss.item()), dtype=torch.float64, device=device)
+    grad_diff_tensor = torch.tensor(grad_diff, dtype=torch.float64, device=device)
+    step_diff_tensor = torch.tensor(step_diff, dtype=torch.float64, device=device)
     dist.all_reduce(loss_diff_tensor, op=dist.ReduceOp.MAX)
     dist.all_reduce(grad_diff_tensor, op=dist.ReduceOp.MAX)
     dist.all_reduce(step_diff_tensor, op=dist.ReduceOp.MAX)

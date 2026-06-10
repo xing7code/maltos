@@ -79,17 +79,13 @@ class Zero2Plugin(_ZeroPluginBase):
         if phase == RuntimePhase.PRE_BACKWARD:
             assert self.runtime is not None
             context = self.runtime.state.step_context
-            self._reset_buckets(
-                grad_accum_start=context.accum_start,
-                grad_accum_end=context.is_step_boundary,
-            )
+            self._reset_buckets(grad_accum_start=context.accum_start)
             if context.is_step_boundary and self._use_async_worker():
                 self._start_post_reduction_worker()
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
-            if (
-                self.runtime.state.step_context.is_step_boundary
-                and not self._use_async_worker()
+            if self.runtime.state.step_context.is_step_boundary and (
+                not self._use_async_worker() or not self.runtime._post_grad_reduction_callbacks
             ):
                 self._fire_post_reductions_sync()
         elif phase == RuntimePhase.PRE_STEP:
@@ -152,7 +148,7 @@ class Zero2Plugin(_ZeroPluginBase):
             )
             offset += padded_size
 
-        self._reset_buckets(grad_accum_start=True, grad_accum_end=True)
+        self._reset_buckets(grad_accum_start=True)
         self._add_param_hooks()
 
     def _add_param_hooks(self) -> None:
@@ -286,7 +282,7 @@ class Zero2Plugin(_ZeroPluginBase):
                 handle.wait()
             bucket.post_reduction_handles.clear()
 
-    def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
+    def _reset_buckets(self, *, grad_accum_start: bool) -> None:
         if grad_accum_start:
             for bucket in self.buckets:
                 if bucket.local_param.grad is None:
@@ -294,7 +290,7 @@ class Zero2Plugin(_ZeroPluginBase):
                 else:
                     bucket.local_param.grad.zero_()
                 bucket.post_reduction_handles.clear()
-                bucket.pending_exec_reductions = len(bucket.exec_states) if grad_accum_end else 0
+                bucket.pending_exec_reductions = len(bucket.exec_states)
         for bucket in self.buckets:
             state = self._exec_state(bucket)
             if state.handle is not None:

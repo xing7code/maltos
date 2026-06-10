@@ -318,14 +318,14 @@ class PipelineParallelPlugin(RuntimePlugin):
             dtype=dtype,
             device=device,
         )
-        work = dist.irecv(buffer, src=self.prev_global_rank)
-        return buffer, work
+        works = dist.batch_isend_irecv([dist.P2POp(dist.irecv, buffer, self.prev_global_rank, self.pp_group)])
+        return buffer, works[0]
 
     def _send_activation_async(self, tensor: torch.Tensor) -> tuple[torch.Tensor, dist.Work]:
         assert self.next_global_rank is not None
         buffer = tensor.contiguous()
-        work = dist.isend(buffer, dst=self.next_global_rank)
-        return buffer, work
+        works = dist.batch_isend_irecv([dist.P2POp(dist.isend, buffer, self.next_global_rank, self.pp_group)])
+        return buffer, works[0]
 
     def _recv_grad_async(self, output_activation: torch.Tensor) -> tuple[torch.Tensor, dist.Work]:
         assert self.next_global_rank is not None
@@ -337,14 +337,14 @@ class PipelineParallelPlugin(RuntimePlugin):
             dtype=output_activation.dtype,
             device=output_activation.device,
         )
-        work = dist.irecv(grad, src=self.next_global_rank)
-        return grad, work
+        works = dist.batch_isend_irecv([dist.P2POp(dist.irecv, grad, self.next_global_rank, self.pp_group)])
+        return grad, works[0]
 
     def _send_grad_async(self, tensor: torch.Tensor) -> tuple[torch.Tensor, dist.Work]:
         assert self.prev_global_rank is not None
         buffer = tensor.contiguous()
-        work = dist.isend(buffer, dst=self.prev_global_rank)
-        return buffer, work
+        works = dist.batch_isend_irecv([dist.P2POp(dist.isend, buffer, self.prev_global_rank, self.pp_group)])
+        return buffer, works[0]
 
     def _stage_global_rank(self, stage_index: int) -> int:
         assert self.runtime is not None

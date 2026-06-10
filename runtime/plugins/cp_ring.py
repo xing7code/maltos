@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
 from runtime.buffer_allocator import allocate_buffer
+
+if TYPE_CHECKING:
+    from runtime.core import StepContext
 
 
 class _RingShift(torch.autograd.Function):
@@ -92,9 +97,10 @@ def _pairwise_send_recv(
 
 
 class RingAttentionCore(nn.Module):
-    def __init__(self, group: dist.ProcessGroup) -> None:
+    def __init__(self, group: dist.ProcessGroup, step_context: "StepContext | None" = None) -> None:
         super().__init__()
         self.group = group
+        self._step_context = step_context
 
     def forward(
         self,
@@ -142,6 +148,7 @@ class RingAttentionCore(nn.Module):
             device=q.device,
         )
 
+        mb_idx = self._step_context.pp_cur_microbatch_idx if self._step_context is not None else 0
         for step in range(world_size):
             current_k, current_v = current_kv.split(k.size(-1), dim=-1)
             running_max, running_lse, running_acc = _update_online_attention_state(
@@ -161,7 +168,7 @@ class RingAttentionCore(nn.Module):
                 self.group,
                 send_to,
                 recv_from,
-                alloc_key=f"cp.ring.{id(self)}.step_{step}",
+                alloc_key=f"cp.ring.{id(self)}.mb{mb_idx}.step_{step}",
             )
             current_positions = _ring_exchange_tensor(
                 current_positions,

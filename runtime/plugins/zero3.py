@@ -109,10 +109,7 @@ class Zero3Plugin(_ZeroPluginBase):
         elif phase == RuntimePhase.PRE_BACKWARD:
             assert self.runtime is not None
             context = self.runtime.state.step_context
-            self._reset_buckets(
-                grad_accum_start=context.accum_start,
-                grad_accum_end=context.is_step_boundary,
-            )
+            self._reset_buckets(grad_accum_start=context.accum_start)
             if context.is_step_boundary and self._use_async_worker():
                 self._start_post_reduction_worker()
             if (
@@ -123,9 +120,8 @@ class Zero3Plugin(_ZeroPluginBase):
                 self._prefetch_bucket(self._last_bucket, direction=_ExecDirection.BACKWARD)
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
-            if (
-                self.runtime.state.step_context.is_step_boundary
-                and not self._use_async_worker()
+            if self.runtime.state.step_context.is_step_boundary and (
+                not self._use_async_worker() or not self.runtime._post_grad_reduction_callbacks
             ):
                 self._fire_post_reductions_sync()
         elif phase == RuntimePhase.PRE_STEP:
@@ -167,7 +163,7 @@ class Zero3Plugin(_ZeroPluginBase):
             bucket = self._make_bucket(index, module, params, logical_names)
             self.buckets.append(bucket)
 
-        self._reset_buckets(grad_accum_start=True, grad_accum_end=True)
+        self._reset_buckets(grad_accum_start=True)
         self._add_hooks()
         for bucket in self.buckets:
             self._free_full_params(bucket)
@@ -562,7 +558,7 @@ class Zero3Plugin(_ZeroPluginBase):
                     state.fwd_handle = None
             self._free_full_params(bucket)
 
-    def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
+    def _reset_buckets(self, *, grad_accum_start: bool) -> None:
         self._materialized_buffers.clear()
         for bucket in self.buckets:
             if grad_accum_start:
@@ -571,7 +567,7 @@ class Zero3Plugin(_ZeroPluginBase):
                 else:
                     bucket.local_param.grad.zero_()
                 bucket.post_reduction_handles.clear()
-            bucket.pending_exec_reductions = len(bucket.exec_states) if grad_accum_end else 0
+                bucket.pending_exec_reductions = len(bucket.exec_states)
             for state in bucket.exec_states:
                 if grad_accum_start:
                     state.grad_handle = None

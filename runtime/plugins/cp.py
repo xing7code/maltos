@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from runtime.core import RuntimeCore
+    from runtime.core import RuntimeCore, StepContext
 
 import torch
 import torch.distributed as dist
@@ -85,6 +85,7 @@ class ContextParallelPlugin(RuntimePlugin):
             module.attn_core = _build_cp_attention_core(
                 self.cp_group,
                 self.runtime.plan.cp_attn_core,
+                step_context=self.runtime.state.step_context,
             )
         return model
 
@@ -158,11 +159,12 @@ class ContextParallelPlugin(RuntimePlugin):
 def _build_cp_attention_core(
     group: dist.ProcessGroup,
     attention_core_type: ContextParallelAttentionCoreType,
+    step_context: "StepContext | None" = None,
 ) -> ContextParallelAttentionCore:
     if attention_core_type == ContextParallelAttentionCoreType.ALL_GATHER_KV:
         return AllGatherKvAttentionCore(group)
     if attention_core_type == ContextParallelAttentionCoreType.RING:
-        return RingAttentionCore(group)
+        return RingAttentionCore(group, step_context=step_context)
     raise ValueError(f"unsupported CP attention_core={attention_core_type!r}")
 
 

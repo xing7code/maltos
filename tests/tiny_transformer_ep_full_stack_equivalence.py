@@ -12,7 +12,7 @@ import torch.multiprocessing as mp
 from helpers import causal_lm_batch
 from models import TinyMoETransformer, TinyMoETransformerTpSp
 from models.tiny_transformer import RmsNorm
-from parallel import ParallelPlan
+from parallel import ContextParallelAttentionCoreType, ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
 from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
@@ -22,6 +22,8 @@ from runtime.plugins.ep import ExpertParallelPlugin, _ExpertParallelMoE
 from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.zero1 import Zero1Plugin
+from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
 
 
@@ -34,7 +36,7 @@ _MODEL_KWARGS = dict(
     n_layers=4,
     vocab_size=256,
     max_seq_len=64,
-    num_experts=4,
+    num_experts=8,
 )
 
 _ZERO3_WRAP_CLS = {torch.nn.Linear, torch.nn.Embedding, RmsNorm}
@@ -42,6 +44,16 @@ _LOSS_ATOL = 5e-3
 _GRAD_ATOL = 2e-2
 _STEP_ATOL = 5e-4
 _LR = 1e-2
+
+
+def _make_zero_plugin(args: argparse.Namespace) -> Zero1Plugin | Zero2Plugin | Zero3Plugin | None:
+    if args.zero_stage == 0:
+        return None
+    if args.zero_stage == 1:
+        return Zero1Plugin(bucket_mb_size=0)
+    if args.zero_stage == 2:
+        return Zero2Plugin(bucket_mb_size=0)
+    return Zero3Plugin(wrap_cls=_ZERO3_WRAP_CLS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +66,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ep-size", type=int, default=2)
     parser.add_argument("--pp-microbatches", type=int, default=2)
     parser.add_argument("--pp-schedule", choices=("afab", "1f1b"), default="afab")
+    parser.add_argument("--zero-stage", type=int, choices=(0, 1, 2, 3), default=3)
+    parser.add_argument("--cp-attn-core", choices=("all_gather_kv", "ring"), default="all_gather_kv")
+    parser.add_argument("--no-reuse-tp-for-ep", dest="reuse_tp_for_ep", action="store_false")
+    parser.add_argument("--no-reuse-cp-for-ep", dest="reuse_cp_for_ep", action="store_false")
+    parser.set_defaults(reuse_tp_for_ep=True, reuse_cp_for_ep=True)
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29644)
     parser.add_argument("--backend", type=str, default="gloo")
@@ -128,6 +145,79 @@ def _gather_object_dict(local: dict[str, torch.Tensor], group: dist.ProcessGroup
     return merged
 
 
+def _bucket_grad_by_param_id(
+    zero_plugin: Zero2Plugin | Zero3Plugin,
+) -> dict[int, torch.Tensor]:
+    """Build {id(param): full_grad_cpu} from ZeRO2/3 bucket data after PRE_STEP.
+
+    param.grad after PRE_STEP only reflects the last micro-batch's grad_buffer
+    (per-exec_state design). local_param.grad is the accumulated shard across
+    all micro-batches. All-gather over the shard group to recover the full grad.
+    """
+    result: dict[int, torch.Tensor] = {}
+    for bucket in zero_plugin.buckets:
+        if bucket.local_param.grad is None:
+            continue
+        shard_group = bucket.group_context.group
+        if shard_group is not None:
+            full_grad = torch.cat(_all_gather_tensor(bucket.local_param.grad.detach(), shard_group), dim=0)
+        else:
+            full_grad = bucket.local_param.grad.detach().clone()
+        if hasattr(bucket, "param_numels"):  # ZeRO3
+            offset = 0
+            for param, numel, shape in zip(bucket.params, bucket.param_numels, bucket.param_shapes):
+                result[id(param)] = full_grad[offset : offset + numel].view(shape).cpu()
+                offset += numel
+        else:  # ZeRO2
+            offset = 0
+            for param in bucket.params:
+                numel = param.numel()
+                result[id(param)] = full_grad[offset : offset + numel].view(param.shape).cpu()
+                offset += numel
+    return result
+
+
+def _logical_named_grads_ep_zero23(
+    core: "RuntimeCore",
+    zero_plugin: Zero2Plugin | Zero3Plugin,
+    shard_rules: dict[str, str],
+    tp_group: dist.ProcessGroup | None,
+    pp_group: dist.ProcessGroup | None,
+    ep_group: dist.ProcessGroup | None,
+    *,
+    pp_partitioned: bool,
+) -> dict[str, torch.Tensor]:
+    """Gradient comparison helper for ZeRO2/3: reads from local_param.grad, not param.grad."""
+    device = next(core.model.parameters()).device
+    grad_by_pid = _bucket_grad_by_param_id(zero_plugin)
+
+    shared_tensors: dict[str, torch.Tensor] = {}
+    for name, param in core.model.named_parameters():
+        if ".local_experts." in name:
+            continue
+        grad = grad_by_pid.get(id(param), torch.zeros_like(param).cpu())
+        shared_tensors[name] = _logical_tensor(name, grad.to(device), shard_rules, tp_group).cpu()
+    if pp_partitioned:
+        shared_tensors = _gather_object_dict(shared_tensors, pp_group)
+    tensors = {name: tensor.to(device) for name, tensor in shared_tensors.items()}
+
+    expert_tensors: dict[str, torch.Tensor] = {}
+    for module_name, module in core.model.named_modules():
+        if not isinstance(module, _ExpertParallelMoE):
+            continue
+        for local_idx, global_idx in enumerate(module.local_expert_ids):
+            expert = module.local_experts[local_idx]
+            for param_name, param in expert.named_parameters():
+                full_name = f"{module_name}.experts.{global_idx}.{param_name}"
+                expert_tensors[full_name] = grad_by_pid.get(id(param), torch.zeros_like(param).cpu())
+    expert_tensors = _gather_object_dict(expert_tensors, ep_group)
+    if pp_partitioned:
+        expert_tensors = _gather_object_dict(expert_tensors, pp_group)
+    for name, tensor in expert_tensors.items():
+        tensors[name] = tensor.to(device)
+    return tensors
+
+
 def _logical_named_tensors(
     model: torch.nn.Module,
     shard_rules: dict[str, str],
@@ -192,27 +282,30 @@ def _reduce_loss(loss: torch.Tensor, core: RuntimeCore) -> torch.Tensor:
     return reduced
 
 
-def _build_zero3() -> Zero3Plugin:
-    return Zero3Plugin(
-        wrap_cls=_ZERO3_WRAP_CLS,
-    )
-
-
 def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
     model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
     model.load_state_dict(reference_model.state_dict())
+    plugins = []
+    if args.tp_size > 1:
+        plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
+    if args.cp_size > 1:
+        plugins.append(ContextParallelPlugin())
+    plugins.append(ExpertParallelPlugin())
+    zero_plugin = _make_zero_plugin(args)
+    if zero_plugin is not None:
+        plugins.append(zero_plugin)
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=args.ep_size),
-        plan=ParallelPlan(zero_stage=3, pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches)),
+        plan=ParallelPlan(
+            zero_stage=args.zero_stage,
+            pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
+            cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
+            reuse_tp_for_ep=args.reuse_tp_for_ep,
+            reuse_cp_for_ep=args.reuse_cp_for_ep,
+        ),
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
-        plugins=[
-            TensorParallelPlugin(),
-            SequenceParallelPlugin(),
-            ContextParallelPlugin(),
-            ExpertParallelPlugin(),
-            _build_zero3(),
-        ],
+        plugins=plugins,
         device=device,
     )
 
@@ -220,35 +313,46 @@ def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Name
 def _make_runtime_core(reference_model: TinyMoETransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
     model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
     model.load_state_dict(reference_model.state_dict())
+    plugins = []
+    if args.tp_size > 1:
+        plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
+    if args.cp_size > 1:
+        plugins.append(ContextParallelPlugin())
+    if args.pp_size > 1:
+        plugins.append(PipelineParallelPlugin(schedule=args.pp_schedule))
+    plugins.append(ExpertParallelPlugin())
+    zero_plugin = _make_zero_plugin(args)
+    if zero_plugin is not None:
+        plugins.append(zero_plugin)
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=args.ep_size),
-        plan=ParallelPlan(zero_stage=3, pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches)),
+        plan=ParallelPlan(
+            zero_stage=args.zero_stage,
+            pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
+            cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
+            reuse_tp_for_ep=args.reuse_tp_for_ep,
+            reuse_cp_for_ep=args.reuse_cp_for_ep,
+        ),
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
-        plugins=[
-            TensorParallelPlugin(),
-            SequenceParallelPlugin(),
-            ContextParallelPlugin(),
-            PipelineParallelPlugin(schedule=args.pp_schedule),
-            ExpertParallelPlugin(),
-            _build_zero3(),
-        ],
+        plugins=plugins,
         device=device,
     )
 
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
-    dist.init_process_group(
-        backend=args.backend,
-        init_method=f"tcp://{args.master_addr}:{args.master_port}",
-        rank=rank,
-        world_size=args.world_size,
-    )
     device: torch.device | None = None
     if args.backend == "nccl":
         local_rank = rank % torch.cuda.device_count()
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
+    dist.init_process_group(
+        backend=args.backend,
+        init_method=f"tcp://{args.master_addr}:{args.master_port}",
+        rank=rank,
+        world_size=args.world_size,
+        device_id=device,
+    )
     if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
         raise ValueError("EP full stack expects world_size == dp_size * pp_size * cp_size * tp_size")
     if args.batch_size % args.dp_size != 0:
@@ -282,8 +386,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_core._run_phase(RuntimePhase.PRE_STEP)
     runtime_core._run_phase(RuntimePhase.PRE_STEP)
 
-    baseline_zero3 = next(plugin for plugin in baseline_core.plugins if isinstance(plugin, Zero3Plugin))
-    runtime_zero3 = next(plugin for plugin in runtime_core.plugins if isinstance(plugin, Zero3Plugin))
+    baseline_zero3 = next((plugin for plugin in baseline_core.plugins if isinstance(plugin, Zero3Plugin)), None)
+    runtime_zero3 = next((plugin for plugin in runtime_core.plugins if isinstance(plugin, Zero3Plugin)), None)
+    baseline_zero23 = next((p for p in baseline_core.plugins if isinstance(p, (Zero2Plugin, Zero3Plugin))), None)
+    runtime_zero23 = next((p for p in runtime_core.plugins if isinstance(p, (Zero2Plugin, Zero3Plugin))), None)
     shard_rules = _rule_by_param_name(TinyMoETransformerTpSp(**_MODEL_KWARGS))
     baseline_tp_group = baseline_core.get_group(MeshAxis.TP)
     runtime_tp_group = runtime_core.get_group(MeshAxis.TP)
@@ -294,31 +400,33 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     baseline_pp_partitioned = any(isinstance(plugin, PipelineParallelPlugin) for plugin in baseline_core.plugins)
     runtime_pp_partitioned = any(isinstance(plugin, PipelineParallelPlugin) for plugin in runtime_core.plugins)
 
-    baseline_grads = _logical_named_tensors(
-        baseline_core.model,
-        shard_rules,
-        baseline_tp_group,
-        baseline_pp_group,
-        baseline_ep_group,
-        grads=True,
-        pp_partitioned=baseline_pp_partitioned,
-    )
-    runtime_grads = _logical_named_tensors(
-        runtime_core.model,
-        shard_rules,
-        runtime_tp_group,
-        runtime_pp_group,
-        runtime_ep_group,
-        grads=True,
-        pp_partitioned=runtime_pp_partitioned,
-    )
+    if baseline_zero23 is not None:
+        baseline_grads = _logical_named_grads_ep_zero23(
+            baseline_core, baseline_zero23, shard_rules, baseline_tp_group,
+            baseline_pp_group, baseline_ep_group, pp_partitioned=baseline_pp_partitioned,
+        )
+        runtime_grads = _logical_named_grads_ep_zero23(
+            runtime_core, runtime_zero23, shard_rules, runtime_tp_group,
+            runtime_pp_group, runtime_ep_group, pp_partitioned=runtime_pp_partitioned,
+        )
+    else:
+        baseline_grads = _logical_named_tensors(
+            baseline_core.model, shard_rules, baseline_tp_group,
+            baseline_pp_group, baseline_ep_group, grads=True, pp_partitioned=baseline_pp_partitioned,
+        )
+        runtime_grads = _logical_named_tensors(
+            runtime_core.model, shard_rules, runtime_tp_group,
+            runtime_pp_group, runtime_ep_group, grads=True, pp_partitioned=runtime_pp_partitioned,
+        )
     grad_name, grad_diff = _max_diff(baseline_grads, runtime_grads)
 
     baseline_core.step_optimizer()
     runtime_core.step_optimizer()
 
-    baseline_zero3.materialize_model()
-    runtime_zero3.materialize_model()
+    if baseline_zero3 is not None:
+        baseline_zero3.materialize_model()
+    if runtime_zero3 is not None:
+        runtime_zero3.materialize_model()
     baseline_params = _logical_named_tensors(
         baseline_core.model,
         shard_rules,
@@ -338,8 +446,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         pp_partitioned=runtime_pp_partitioned,
     )
     step_name, step_diff = _max_diff(baseline_params, runtime_params)
-    baseline_zero3.reshard_model()
-    runtime_zero3.reshard_model()
+    if baseline_zero3 is not None:
+        baseline_zero3.reshard_model()
+    if runtime_zero3 is not None:
+        runtime_zero3.reshard_model()
 
     if rank == 0:
         loss_diff = abs(reduced_baseline_loss.item() - reduced_runtime_loss.item())

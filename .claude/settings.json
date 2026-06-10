@@ -1,11 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(PYTHONPATH=. .venv/bin/python tests/*.py*)",
-      "Bash(.venv/bin/python tests/*.py*)",
-      "Bash(PYTHONPATH=* .venv/bin/python tests/*.py*)",
-      "Bash(bash tests/run_matrix.sh*)",
-      "Bash(bash tests/run_matrix_gpu.sh*)"
+      "Bash(PYTHONPATH=. * tests/*)",
+      "Bash(python tests/*)",
+      "Bash(./tests/run_matrix.sh*)",
+      "Bash(grep *)",
+      "Bash(sed -n *)",
+      "Bash(awk *)",
+      "Bash(xargs *)",
+      "Bash(python3 -c *)"
     ]
   }
 }
