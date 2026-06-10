@@ -98,7 +98,11 @@ class Zero3Plugin(_ZeroPluginBase):
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
             assert self.runtime is not None
-            if self.bucket_order_checked and self._first_bucket is not None:
+            if (
+                self.bucket_order_checked
+                and self._first_bucket is not None
+                and self._first_bucket.group_context.supports_async_overlap
+            ):
                 self._prefetch_bucket(self._first_bucket, direction=_ExecDirection.FORWARD)
         elif phase == RuntimePhase.POST_FORWARD:
             self._finalize_bucket_order()
@@ -111,7 +115,11 @@ class Zero3Plugin(_ZeroPluginBase):
             )
             if context.is_step_boundary and self._use_async_worker():
                 self._start_post_reduction_worker()
-            if self.bucket_order_checked and self._last_bucket is not None:
+            if (
+                self.bucket_order_checked
+                and self._last_bucket is not None
+                and self._last_bucket.group_context.supports_async_overlap
+            ):
                 self._prefetch_bucket(self._last_bucket, direction=_ExecDirection.BACKWARD)
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
@@ -219,7 +227,13 @@ class Zero3Plugin(_ZeroPluginBase):
         def hook(_module: nn.Module, _inputs) -> None:
             self._record_forward_bucket(bucket)
             self._materialize_full_params(bucket, direction=_ExecDirection.FORWARD)
-            if self.bucket_order_checked and bucket.next_bucket is not None:
+            # gloo does not support concurrent ops on groups sharing the same rank pair;
+            # skip prefetch here to avoid racing with EP alltoall in the current bucket's forward.
+            if (
+                self.bucket_order_checked
+                and bucket.next_bucket is not None
+                and bucket.group_context.supports_async_overlap
+            ):
                 self._prefetch_bucket(bucket.next_bucket, direction=_ExecDirection.FORWARD)
 
         return hook
@@ -577,9 +591,14 @@ class Zero3Plugin(_ZeroPluginBase):
             return
         if bucket.local_param.grad is None:
             bucket.local_param.grad = torch.zeros_like(bucket.local_param.data)
-        # Do NOT zero grad_buffer here: _reset_buckets already zeroed it at PRE_BACKWARD.
-        # Zeroing here erases valid gradients when called after a completed reduction
-        # (handle was waited and set to None by _fire_post_reductions_sync).
+        # Zero buffers for exec_states whose backward hook never fired. _reset_buckets zeros
+        # only the exec_state for the CURRENT pp_cur_microbatch_idx at each PRE_BACKWARD.
+        # In AFAB with pp=2, exec_state[0] is not zeroed until the second PRE_BACKWARD, so
+        # exec_state[1] (first backward) may still have torch.empty garbage when its hook does
+        # not fire (e.g. EP expert not selected in that microbatch). Without this zero_(), the
+        # uninitialized buffer propagates NaN through the reduce-scatter.
+        state.grad_buffer.zero_()
+        state.shard_buffer.zero_()
         state.grad_handle = self._reduce_scatter_avg(bucket, state)
 
 

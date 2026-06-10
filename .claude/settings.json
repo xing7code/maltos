@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONPATH=. .venv/bin/python tests/*.py*)",
+      "Bash(.venv/bin/python tests/*.py*)",
+      "Bash(PYTHONPATH=* .venv/bin/python tests/*.py*)",
+      "Bash(bash tests/run_matrix.sh*)",
+      "Bash(bash tests/run_matrix_gpu.sh*)"
+    ]
+  }
+}
