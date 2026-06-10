@@ -20,16 +20,32 @@ class _AllReduceShardWork:
         local_grad: torch.Tensor,
         shard_start: int,
         shard_end: int,
+        correction: float = 1.0,
     ):
         self.work = work
         self.grad_buffer = grad_buffer
         self.local_grad = local_grad
         self.shard_start = shard_start
         self.shard_end = shard_end
+        self.correction = correction
 
     def wait(self) -> None:
         self.work.wait()
-        self.local_grad.copy_(self.grad_buffer[self.shard_start : self.shard_end])
+        shard = self.grad_buffer[self.shard_start : self.shard_end]
+        self.local_grad.copy_(shard if self.correction == 1.0 else shard * self.correction)
+
+
+class _CorrectedWork:
+    """Wraps a dist.Work and multiplies the output tensor by correction on wait()."""
+
+    def __init__(self, work: dist.Work, tensor: torch.Tensor, correction: float) -> None:
+        self.work = work
+        self.tensor = tensor
+        self.correction = correction
+
+    def wait(self) -> None:
+        self.work.wait()
+        self.tensor.mul_(self.correction)
 
 
 class _LocalCopyWork:
@@ -52,7 +68,7 @@ class _Bucket:
     shard_end: int
     local_param: nn.Parameter
     pending: int
-    handle: dist.Work | _AllReduceShardWork | _LocalCopyWork | None = None
+    handle: dist.Work | _AllReduceShardWork | _LocalCopyWork | _CorrectedWork | None = None
     post_reduction_handles: list[dist.Work] = field(default_factory=list)
 
 
@@ -102,7 +118,6 @@ class Zero1Plugin(_ZeroPluginBase):
             if (
                 self.runtime.state.step_context.is_step_boundary
                 and not self._use_async_worker()
-                and self.runtime._post_grad_reduction_callbacks
             ):
                 self._fire_post_reductions_sync()
         elif phase == RuntimePhase.PRE_STEP:
@@ -117,7 +132,7 @@ class Zero1Plugin(_ZeroPluginBase):
         expert_params = self._role_params(model, ParamRole.EXPERT)
         bucket_specs: list[tuple[GroupContext, list[list[nn.Parameter]], ParamRole]] = []
         if shared_params:
-            bucket_specs.append((GroupContext(self.dp_group, self.world_size, self.rank), self._build_param_buckets(shared_params), ParamRole.SHARED))
+            bucket_specs.append((self._group_context_for_role(ParamRole.SHARED), self._build_param_buckets(shared_params), ParamRole.SHARED))
         if expert_params:
             bucket_specs.append((self._group_context_for_role(ParamRole.EXPERT), self._build_param_buckets(expert_params), ParamRole.EXPERT))
         if not bucket_specs:
@@ -183,7 +198,7 @@ class Zero1Plugin(_ZeroPluginBase):
 
         return hook
 
-    def _reduce_scatter_avg(self, bucket: _Bucket) -> dist.Work | _AllReduceShardWork:
+    def _reduce_scatter_avg(self, bucket: _Bucket) -> dist.Work | _AllReduceShardWork | _LocalCopyWork | _CorrectedWork:
         assert self.grad_buffer is not None
         assert bucket.local_param.grad is not None
         full_grad = self.grad_buffer[bucket.start : bucket.end]
@@ -193,14 +208,17 @@ class Zero1Plugin(_ZeroPluginBase):
             work = dist.all_reduce(full_grad, op=dist.ReduceOp.AVG, group=bucket.group_context.group, async_op=True)
             shard_start = bucket.shard_start - bucket.start
             shard_end = bucket.shard_end - bucket.start
-            return _AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end)
-        return dist.reduce_scatter_tensor(
+            return _AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end, bucket.group_context.correction)
+        work = dist.reduce_scatter_tensor(
             bucket.local_param.grad,
             full_grad,
             op=dist.ReduceOp.AVG,
             group=bucket.group_context.group,
             async_op=True,
         )
+        if bucket.group_context.correction == 1.0:
+            return work
+        return _CorrectedWork(work, bucket.local_param.grad, bucket.group_context.correction)
 
     def _gather_updated_params(self) -> None:
         assert self.data_buffer is not None
@@ -245,15 +263,15 @@ class Zero1Plugin(_ZeroPluginBase):
         assert self.runtime is not None
         callbacks = self.runtime._post_grad_reduction_callbacks
         for bucket in self.buckets:
-            relevant = [(cb, rf) for cb, rf in callbacks if rf is None or rf == bucket.role]
-            if not relevant:
-                continue
             self._ensure_bucket_handle(bucket)
             if bucket.handle is None:
                 raise RuntimeError("ZeRO1 bucket handle is None after backward")
             bucket.handle.wait()
+            bucket.handle = None
             if bucket.local_param.grad is not None:
-                for cb, _ in relevant:
+                for cb, role_filter in callbacks:
+                    if role_filter is not None and bucket.role != role_filter:
+                        continue
                     work = cb(bucket.local_param.grad)
                     if work is not None:
                         bucket.post_reduction_handles.append(work)

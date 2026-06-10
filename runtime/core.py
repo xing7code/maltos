@@ -187,7 +187,7 @@ class RuntimeCore:
         )
         self._validate_mesh_and_plan()
         if self.group_manager is None:
-            self.group_manager = ProcessGroupManager.from_mesh(self.mesh)
+            self.group_manager = ProcessGroupManager.from_plan(self.plan, self.mesh)
         self.plugins = self._resolve_plugin_order(self.plugins)
 
     def setup(self) -> None:

@@ -58,7 +58,9 @@ class ContextParallelPlugin(RuntimePlugin):
         )
         zero_active = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
         ep_active = PluginId.EP in active
-        if zero_active or ep_active:
+        # When ZeRO is active it shards over DCP (DP×CP) internally, so no separate CP
+        # callback is needed. Without ZeRO, EP still needs the CP callback for non-expert params.
+        if ep_active and not zero_active:
             runtime.register_post_grad_reduction_callback(self._cp_grad_sync_callback)
         self._validate_runtime_support()
 

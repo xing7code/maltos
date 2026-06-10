@@ -150,17 +150,20 @@ def _logical_named_sharded_grads(
 
 
 def _logical_named_zero_shard_grads(core: RuntimeCore, zero_plugin: Zero1Plugin | Zero2Plugin | Zero3Plugin) -> dict[str, torch.Tensor]:
+    # ZeRO shards over DCP (DP×CP); gather from DCP group to reconstruct the full grad.
+    dcp_group = core.get_group(MeshAxis.DCP)
     dp_group = core.get_group(MeshAxis.DP)
-    if dp_group is None:
-        raise ValueError("ZeRO1 grad materialization requires DP group")
+    gather_group = dcp_group if dcp_group is not None else dp_group
+    if gather_group is None:
+        raise ValueError("ZeRO grad materialization requires DP or DCP group")
     name_by_param = {id(param): name for name, param in core.model.named_parameters()}
     logical_grads: dict[str, torch.Tensor] = {}
     for bucket in zero_plugin.buckets:
         local_grad = bucket.local_param.grad
         if local_grad is None:
             continue
-        gathered = [torch.empty_like(local_grad) for _ in range(dist.get_world_size(dp_group))]
-        dist.all_gather(gathered, local_grad.contiguous(), group=dp_group)
+        gathered = [torch.empty_like(local_grad) for _ in range(dist.get_world_size(gather_group))]
+        dist.all_gather(gathered, local_grad.contiguous(), group=gather_group)
         full_grad = torch.cat(gathered, dim=0)
         offset = 0
         logical_names = getattr(bucket, "logical_names", None)
@@ -241,10 +244,11 @@ def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespac
         plugins.append(Zero2Plugin(bucket_mb_size=0))
     if args.case == "cp_zero3":
         plugins.append(Zero3Plugin(wrap_cls={torch.nn.Linear, torch.nn.Embedding, RmsNorm}))
+    _zero_stage = {"cp_zero1": 1, "cp_zero2": 2, "cp_zero3": 3}.get(args.case, 0)
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, pp=1, cp=args.cp_size, tp=args.tp_size, ep=1),
         plan=ParallelPlan(
-            zero_stage=1 if args.case == "cp_zero1" else 2 if args.case == "cp_zero2" else 3 if args.case == "cp_zero3" else 0,
+            zero_stage=_zero_stage,
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
         ),
         model=model,

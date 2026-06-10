@@ -17,6 +17,10 @@ class GroupContext:
     group: dist.ProcessGroup | None
     world_size: int
     rank: int
+    # Multiplier applied to local_grad after ReduceOp.AVG to correct for non-uniform
+    # averaging semantics. AVG divides by world_size, but the desired divisor may differ
+    # (e.g. only avg over DP, not CP). correction = world_size / desired_avg_factor.
+    correction: float = 1.0
 
     @property
     def is_gloo(self) -> bool:
@@ -35,16 +39,21 @@ class AllReduceShardWork:
         local_grad: torch.Tensor,
         shard_start: int,
         shard_end: int,
+        correction: float = 1.0,
     ):
         self.work = work
         self.grad_buffer = grad_buffer
         self.local_grad = local_grad
         self.shard_start = shard_start
         self.shard_end = shard_end
+        self.correction = correction
 
     def wait(self) -> None:
         self.work.wait()
-        self.local_grad.add_(self.grad_buffer[self.shard_start : self.shard_end])
+        shard = self.grad_buffer[self.shard_start : self.shard_end]
+        if self.correction != 1.0:
+            shard = shard * self.correction
+        self.local_grad.add_(shard)
 
 
 class ReduceScatterShardWork:
@@ -53,14 +62,17 @@ class ReduceScatterShardWork:
         work: dist.Work,
         shard_buffer: torch.Tensor,
         local_grad: torch.Tensor,
+        correction: float = 1.0,
     ):
         self.work = work
         self.shard_buffer = shard_buffer
         self.local_grad = local_grad
+        self.correction = correction
 
     def wait(self) -> None:
         self.work.wait()
-        self.local_grad.add_(self.shard_buffer)
+        shard = self.shard_buffer if self.correction == 1.0 else self.shard_buffer * self.correction
+        self.local_grad.add_(shard)
 
 
 class _ZeroPluginBase(RuntimePlugin):
@@ -86,13 +98,35 @@ class _ZeroPluginBase(RuntimePlugin):
 
     def _group_context_for_role(self, role: ParamRole) -> GroupContext:
         assert self.runtime is not None
+        mesh = self.runtime.mesh
         if role == ParamRole.EXPERT:
-            group = self.runtime.get_group(MeshAxis.EDP)
+            group = self.runtime.get_group(MeshAxis.EREP)
             if group is None:
                 return GroupContext(None, 1, 0)
-            return GroupContext(group, dist.get_world_size(group), dist.get_rank(group))
-        assert self.dp_group is not None
-        return GroupContext(self.dp_group, self.world_size, self.rank)
+            plan = self.runtime.plan
+            reuse_tp = getattr(plan, 'reuse_tp_for_ep', True)
+            reuse_cp = getattr(plan, 'reuse_cp_for_ep', True)
+            if reuse_tp and reuse_cp:
+                # EREP spans (TP*CP/EP) seq slots × DP data slots.
+                # correction = TP*CP/EP when EP ≤ TP*CP (seq multiplicity); else 1.0.
+                correction = float(mesh.tp * mesh.cp // mesh.ep) if mesh.ep <= mesh.tp * mesh.cp else 1.0
+            elif reuse_tp and not reuse_cp:
+                # EP groups per-CP; EREP spans TP/EP TP positions × DP data slots.
+                # CP is not in EREP (groups are per-CP), so no CP factor.
+                correction = float(mesh.tp // mesh.ep) if mesh.ep <= mesh.tp else 1.0
+            elif not reuse_tp and reuse_cp:
+                # EP groups per-TP; EREP spans CP/EP seq slots × DP data slots.
+                correction = float(mesh.cp // mesh.ep) if mesh.ep <= mesh.cp else 1.0
+            else:
+                # EP uses DP only; EREP = pure DP replicas, no seq multiplicity.
+                correction = 1.0
+            return GroupContext(group, dist.get_world_size(group), dist.get_rank(group), correction=correction)
+        # SHARED: shard over DCP (DP × CP); AVG divides by dp*cp, want to divide by dp only.
+        dcp_group = self.runtime.get_group(MeshAxis.DCP)
+        if dcp_group is None:
+            assert self.dp_group is not None
+            return GroupContext(self.dp_group, self.world_size, self.rank)
+        return GroupContext(dcp_group, dist.get_world_size(dcp_group), dist.get_rank(dcp_group), correction=float(mesh.cp))
 
     def _padded_len(self, numel: int, world_size: int) -> int:
         return (numel + world_size - 1) // world_size * world_size

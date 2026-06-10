@@ -93,6 +93,11 @@ echo "=== tiny transformer ep equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_tp_sp_zero2 --world-size 8 --dp-size 4 --ep-size 2 --tp-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_tp_sp_zero3 --world-size 8 --dp-size 4 --ep-size 2 --tp-size 2
 
+echo "=== tiny transformer ep+cp+zero equivalence ==="
+"${PYTHON_BIN}" tests/tiny_transformer_ep_cp_zero_equivalence.py --case ep_cp_zero1 --world-size 4 --dp-size 2 --cp-size 2 --ep-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_ep_cp_zero_equivalence.py --case ep_cp_zero2 --world-size 4 --dp-size 2 --cp-size 2 --ep-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_ep_cp_zero_equivalence.py --case ep_cp_zero3 --world-size 4 --dp-size 2 --cp-size 2 --ep-size 2
+
 echo "=== tiny transformer ep zero3 checkpoint/resume ==="
 "${PYTHON_BIN}" tests/tiny_transformer_ep_zero3_checkpoint_resume.py --world-size 2 --dp-size 2 --ep-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_ep_zero3_accum2_midstep_resume.py --world-size 2 --dp-size 2 --ep-size 2

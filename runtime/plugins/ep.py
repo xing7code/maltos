@@ -187,7 +187,7 @@ class ExpertParallelPlugin(RuntimePlugin):
     @property
     def edp_group(self) -> dist.ProcessGroup | None:
         assert self.runtime is not None
-        return self.runtime.get_group(MeshAxis.EDP)
+        return self.runtime.get_group(MeshAxis.EREP)
 
     def bind(self, runtime: "RuntimeCore") -> None:
         super().bind(runtime)
@@ -286,11 +286,6 @@ class ExpertParallelPlugin(RuntimePlugin):
         mesh = self.runtime.mesh
         if mesh.ep <= 1:
             raise ValueError("ExpertParallelPlugin requires mesh.ep > 1")
-        if mesh.dp < mesh.ep:
-            raise ValueError(
-                "ExpertParallelPlugin requires dp >= ep, "
-                f"got dp={mesh.dp}, ep={mesh.ep}"
-            )
         if mesh.pp < 1 or mesh.cp < 1:
             raise ValueError(
                 "ExpertParallelPlugin requires pp>=1 and cp>=1, "

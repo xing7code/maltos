@@ -118,7 +118,6 @@ class Zero3Plugin(_ZeroPluginBase):
             if (
                 self.runtime.state.step_context.is_step_boundary
                 and not self._use_async_worker()
-                and self.runtime._post_grad_reduction_callbacks
             ):
                 self._fire_post_reductions_sync()
         elif phase == RuntimePhase.PRE_STEP:
@@ -381,14 +380,15 @@ class Zero3Plugin(_ZeroPluginBase):
     ) -> dist.Work | AllReduceShardWork | ReduceScatterShardWork:
         assert self.runtime is not None
         if bucket.group_context.group is None or bucket.group_context.world_size == 1:
-            bucket.local_param.grad.add_(state.grad_buffer[: bucket.local_param.numel()])
+            shard = state.grad_buffer[: bucket.local_param.numel()]
+            bucket.local_param.grad.add_(shard if bucket.group_context.correction == 1.0 else shard * bucket.group_context.correction)
             return _ImmediateWork()
         if bucket.group_context.is_gloo:
             work = dist.all_reduce(state.grad_buffer, op=dist.ReduceOp.AVG, group=bucket.group_context.group, async_op=True)
             shard_len = bucket.local_param.numel()
             shard_start = bucket.group_context.rank * shard_len
             shard_end = (bucket.group_context.rank + 1) * shard_len
-            return AllReduceShardWork(work, state.grad_buffer, bucket.local_param.grad, shard_start, shard_end)
+            return AllReduceShardWork(work, state.grad_buffer, bucket.local_param.grad, shard_start, shard_end, bucket.group_context.correction)
         work = dist.reduce_scatter_tensor(
             state.shard_buffer,
             state.grad_buffer,
@@ -396,7 +396,7 @@ class Zero3Plugin(_ZeroPluginBase):
             group=bucket.group_context.group,
             async_op=True,
         )
-        return ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad)
+        return ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad, bucket.group_context.correction)
 
     def materialize_model(self) -> None:
         self._materialized_buffers.clear()
@@ -505,16 +505,15 @@ class Zero3Plugin(_ZeroPluginBase):
         assert self.runtime is not None
         callbacks = self.runtime._post_grad_reduction_callbacks
         for bucket in self.buckets:
-            relevant = [(cb, rf) for cb, rf in callbacks if rf is None or rf == bucket.role]
-            if not relevant:
-                continue
             for state in bucket.exec_states:
                 self._ensure_state_grad_handle(bucket, state)
                 state.grad_handle.wait()
                 state.grad_handle = None
             self._free_full_params(bucket)
             if bucket.local_param.grad is not None:
-                for cb, _ in relevant:
+                for cb, role_filter in callbacks:
+                    if role_filter is not None and bucket.role != role_filter:
+                        continue
                     work = cb(bucket.local_param.grad)
                     if work is not None:
                         bucket.post_reduction_handles.append(work)

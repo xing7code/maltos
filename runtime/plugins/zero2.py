@@ -90,7 +90,6 @@ class Zero2Plugin(_ZeroPluginBase):
             if (
                 self.runtime.state.step_context.is_step_boundary
                 and not self._use_async_worker()
-                and self.runtime._post_grad_reduction_callbacks
             ):
                 self._fire_post_reductions_sync()
         elif phase == RuntimePhase.PRE_STEP:
@@ -105,7 +104,7 @@ class Zero2Plugin(_ZeroPluginBase):
         expert_params = self._role_params(model, ParamRole.EXPERT)
         bucket_specs: list[tuple[GroupContext, list[list[nn.Parameter]], ParamRole]] = []
         if shared_params:
-            bucket_specs.append((GroupContext(self.dp_group, self.world_size, self.rank), self._build_param_buckets(shared_params), ParamRole.SHARED))
+            bucket_specs.append((self._group_context_for_role(ParamRole.SHARED), self._build_param_buckets(shared_params), ParamRole.SHARED))
         if expert_params:
             bucket_specs.append((self._group_context_for_role(ParamRole.EXPERT), self._build_param_buckets(expert_params), ParamRole.EXPERT))
         if not bucket_specs:
@@ -208,7 +207,7 @@ class Zero2Plugin(_ZeroPluginBase):
             shard_len = bucket.local_param.numel()
             shard_start = bucket.group_context.rank * shard_len
             shard_end = (bucket.group_context.rank + 1) * shard_len
-            return AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end)
+            return AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end, bucket.group_context.correction)
         work = dist.reduce_scatter_tensor(
             state.shard_buffer,
             full_grad,
@@ -216,7 +215,7 @@ class Zero2Plugin(_ZeroPluginBase):
             group=bucket.group_context.group,
             async_op=True,
         )
-        return ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad)
+        return ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad, bucket.group_context.correction)
 
     def _gather_updated_params(self) -> None:
         assert self.data_buffer is not None
@@ -260,9 +259,6 @@ class Zero2Plugin(_ZeroPluginBase):
         assert self.runtime is not None
         callbacks = self.runtime._post_grad_reduction_callbacks
         for bucket in self.buckets:
-            relevant = [(cb, rf) for cb, rf in callbacks if rf is None or rf == bucket.role]
-            if not relevant:
-                continue
             waited = False
             for state in bucket.exec_states:
                 self._ensure_state_handle(bucket, state)
@@ -274,7 +270,9 @@ class Zero2Plugin(_ZeroPluginBase):
             if not waited:
                 raise RuntimeError("ZeRO2 bucket handle is None after backward")
             if bucket.local_param.grad is not None:
-                for cb, _ in relevant:
+                for cb, role_filter in callbacks:
+                    if role_filter is not None and bucket.role != role_filter:
+                        continue
                     work = cb(bucket.local_param.grad)
                     if work is not None:
                         bucket.post_reduction_handles.append(work)
