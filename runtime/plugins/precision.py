@@ -38,7 +38,17 @@ class PrecisionPlugin(RuntimePlugin):
         super().__init__(
             id=PluginId.PRECISION,
             name="precision",
-            runs_after={PluginId.TP, PluginId.SP, PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3},
+            runs_after={
+                PluginId.TP,
+                PluginId.SP,
+                PluginId.DP,
+                PluginId.PP,
+                PluginId.CP,
+                PluginId.EP,
+                PluginId.ZERO1,
+                PluginId.ZERO2,
+                PluginId.ZERO3,
+            },
         )
         self.compute_dtype = compute_dtype
         self.use_grad_scaler = use_grad_scaler

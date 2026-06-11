@@ -3,6 +3,12 @@
 #
 # CPU (default):  ./tests/run_matrix.sh
 # GPU (nccl):     BACKEND=nccl ./tests/run_matrix.sh
+# Continue on Vast with files:
+#   edit local_notes/matrix_blacklist.txt, then run: BACKEND=nccl ./tests/run_matrix.sh
+# Run only a subset:
+#   edit local_notes/matrix_whitelist.txt, then run: BACKEND=gloo ./tests/run_matrix.sh
+# Keep going and emit reports:
+#   KEEP_GOING=1 BACKEND=nccl ./tests/run_matrix.sh
 #
 # Full-stack matrix: 4-choose-3 from {dp, pp, cp, tp}, each=2, world=8.
 # ep=dp*cp*tp (max expert sharding, no extra ranks).
@@ -15,9 +21,19 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 BACKEND="${BACKEND:-gloo}"
+WHITELIST="${WHITELIST:-local_notes/matrix_whitelist.txt}"
+BLACKLIST="${BLACKLIST:-local_notes/matrix_blacklist.txt}"
+CASE_FILTER="${CASE_FILTER:-}"
+MAX_CASES="${MAX_CASES:-}"
+KEEP_GOING="${KEEP_GOING:-}"
+REPORT_FILE="${REPORT_FILE:-local_notes/matrix_report.log}"
+FAILURES_FILE="${FAILURES_FILE:-local_notes/matrix_failures.txt}"
+PASSES_FILE="${PASSES_FILE:-local_notes/matrix_passes.txt}"
 export PYTHONPATH="${PYTHONPATH:-.}"
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-180}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-180}"
+mkdir -p local_notes
+touch "${WHITELIST}" "${BLACKLIST}" "${REPORT_FILE}" "${FAILURES_FILE}" "${PASSES_FILE}"
 
 # ── Single-feature tests (always gloo) ─────────────────────────────────────────
 if [ "${BACKEND}" = "gloo" ]; then
@@ -130,12 +146,26 @@ echo "=== tiny transformer ep+cp+zero equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_ep_cp_zero_equivalence.py --case ep_cp_zero1 --world-size 4 --dp-size 2 --cp-size 2 --ep-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_ep_cp_zero_equivalence.py --case ep_cp_zero2 --world-size 4 --dp-size 2 --cp-size 2 --ep-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_ep_cp_zero_equivalence.py --case ep_cp_zero3 --world-size 4 --dp-size 2 --cp-size 2 --ep-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_ep_cp_zero_equivalence.py --case ep_cp_zero1 --world-size 4 --dp-size 2 --cp-size 2 --ep-size 2 --no-reuse-cp-for-ep
+"${PYTHON_BIN}" tests/tiny_transformer_ep_cp_zero_equivalence.py --case ep_cp_zero2 --world-size 4 --dp-size 2 --cp-size 2 --ep-size 2 --no-reuse-cp-for-ep
+"${PYTHON_BIN}" tests/tiny_transformer_ep_cp_zero_equivalence.py --case ep_cp_zero3 --world-size 4 --dp-size 2 --cp-size 2 --ep-size 2 --no-reuse-cp-for-ep
 
 echo "=== tiny transformer ep+pp+zero equivalence ==="
 for c in ep_pp_zero0 ep_pp_zero1 ep_pp_zero2 ep_pp_zero3; do
   echo "--- ep_pp case: ${c} ---"
   "${PYTHON_BIN}" tests/tiny_transformer_ep_pp_zero_equivalence.py --case "${c}"
 done
+
+echo "=== ep full-stack no-reuse targeted coverage ==="
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
+  --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 2 \
+  --zero-stage 1 --cp-attn-core ring --no-reuse-cp-for-ep
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
+  --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 --ep-size 2 \
+  --zero-stage 1 --no-reuse-tp-for-ep
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
+  --world-size 8 --dp-size 2 --pp-size 1 --cp-size 2 --tp-size 2 --ep-size 2 \
+  --zero-stage 1 --cp-attn-core ring --no-reuse-tp-for-ep --no-reuse-cp-for-ep
 
 echo "=== tiny transformer ep zero3 checkpoint/resume ==="
 "${PYTHON_BIN}" tests/tiny_transformer_ep_zero3_checkpoint_resume.py --world-size 2 --dp-size 2 --ep-size 2
@@ -156,7 +186,33 @@ fi  # BACKEND=gloo
 
 # ── Full-stack matrix (backend: ${BACKEND}) ─────────────────────────────────────
 echo "=== full-stack matrix (backend=${BACKEND}) ==="
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_matrix_runner.py \
-  --backend "${BACKEND}" \
+MATRIX_ARGS=(
+  --backend "${BACKEND}"
   --world-size 8
+)
+if [ -n "${WHITELIST}" ]; then
+  MATRIX_ARGS+=(--whitelist "${WHITELIST}")
+fi
+if [ -n "${BLACKLIST}" ]; then
+  MATRIX_ARGS+=(--blacklist "${BLACKLIST}")
+fi
+if [ -n "${CASE_FILTER}" ]; then
+  MATRIX_ARGS+=(--case-filter "${CASE_FILTER}")
+fi
+if [ -n "${MAX_CASES}" ]; then
+  MATRIX_ARGS+=(--max-cases "${MAX_CASES}")
+fi
+if [ "${KEEP_GOING}" = "1" ]; then
+  MATRIX_ARGS+=(--keep-going)
+fi
+if [ -n "${REPORT_FILE}" ]; then
+  MATRIX_ARGS+=(--report-file "${REPORT_FILE}")
+fi
+if [ -n "${FAILURES_FILE}" ]; then
+  MATRIX_ARGS+=(--failures-file "${FAILURES_FILE}")
+fi
+if [ -n "${PASSES_FILE}" ]; then
+  MATRIX_ARGS+=(--passes-file "${PASSES_FILE}")
+fi
+"${PYTHON_BIN}" tests/tiny_transformer_full_stack_matrix_runner.py "${MATRIX_ARGS[@]}"
 echo "=== matrix PASS ==="

@@ -151,6 +151,7 @@ def build_full_stack_matrix_cases(
     backend: str,
     world_size: int,
     case_names: list[str] | None = None,
+    blacklist_names: list[str] | None = None,
     case_filter: str | None = None,
     max_cases: int | None = None,
 ) -> list[MatrixCase]:
@@ -159,18 +160,29 @@ def build_full_stack_matrix_cases(
     def add(case: MatrixCase) -> None:
         cases.append(case)
 
-    def add_full_eq(prefix: str, **common: object) -> None:
-        for z in (0, 1, 2, 3):
+    def add_full_eq(prefix: str, *, zero_stages: tuple[int, ...], onef1b_zero_stages: tuple[int, ...] = (), **common: object) -> None:
+        for z in zero_stages:
             add(_case(f"{prefix}/full_eq/z{z}", "full_eq", backend=backend, world_size=world_size, zero_stage=z, **common))
+        for z in onef1b_zero_stages:
+            add(
+                _case(
+                    f"{prefix}/full_eq/1f1b_z{z}",
+                    "full_eq",
+                    backend=backend,
+                    world_size=world_size,
+                    pp_schedule="1f1b",
+                    zero_stage=z,
+                    **common,
+                )
+            )
 
     def add_full_resume_suite(
         prefix: str,
         *,
-        include_zero12: bool,
+        zero_stages: tuple[int, ...],
         schedule_accums: tuple[tuple[str, int], ...],
         **common: object,
     ) -> None:
-        zero_stages = (1, 2, 3) if include_zero12 else (3,)
         for z in zero_stages:
             for schedule, accum in schedule_accums:
                 suffix = f"z{z}_{schedule}_acc{accum}"
@@ -184,8 +196,8 @@ def build_full_stack_matrix_cases(
                 )
                 add(_case(f"{prefix}/full_resume/{suffix}", "full_resume", needs_checkpoint_dir=True, **overrides))
 
-    def add_ep_full_eq(prefix: str, *, onef1b_zero_stages: tuple[int, ...], **common: object) -> None:
-        for z in (0, 1, 2, 3):
+    def add_ep_full_eq(prefix: str, *, zero_stages: tuple[int, ...], onef1b_zero_stages: tuple[int, ...], **common: object) -> None:
+        for z in zero_stages:
             add(_case(f"{prefix}/ep_full_eq/z{z}", "ep_full_eq", backend=backend, world_size=world_size, zero_stage=z, **common))
         for z in onef1b_zero_stages:
             add(
@@ -221,51 +233,66 @@ def build_full_stack_matrix_cases(
                 add(_case(f"{prefix}/ep_full_resume/{suffix}", "ep_full_resume", needs_checkpoint_dir=True, **overrides))
 
     # A
-    add_full_eq("A", dp_size=2, pp_size=2, cp_size=2, tp_size=1, cp_attn_core="ring")
-    add(_case("A/full_eq/1f1b_z3", "full_eq", backend=backend, world_size=world_size, dp_size=2, pp_size=2, cp_size=2, tp_size=1, pp_schedule="1f1b", zero_stage=3, cp_attn_core="ring"))
+    add_full_eq(
+        "A",
+        zero_stages=(0, 1, 2, 3),
+        onef1b_zero_stages=(0, 1, 2, 3),
+        dp_size=2,
+        pp_size=2,
+        cp_size=2,
+        tp_size=1,
+        cp_attn_core="ring",
+    )
     add_full_resume_suite(
         "A",
-        include_zero12=True,
+        zero_stages=(0, 1, 2, 3),
         schedule_accums=(("afab", 1), ("1f1b", 1), ("afab", 2), ("1f1b", 2)),
         dp_size=2, pp_size=2, cp_size=2, tp_size=1, cp_attn_core="ring",
     )
-    add_ep_full_eq("A", onef1b_zero_stages=(1, 2, 3), dp_size=2, pp_size=2, cp_size=2, tp_size=1, ep_size=4, cp_attn_core="ring")
+    add_ep_full_eq("A", zero_stages=(0, 1, 2, 3), onef1b_zero_stages=(0, 1, 2, 3), dp_size=2, pp_size=2, cp_size=2, tp_size=1, ep_size=4, cp_attn_core="ring")
     add_ep_full_resume_suite(
         "A",
-        zero_stages=(1, 2, 3),
-        schedule_accums=(("afab", 1), ("1f1b", 1), ("afab", 2)),
+        zero_stages=(0, 1, 2, 3),
+        schedule_accums=(("afab", 1), ("1f1b", 1), ("afab", 2), ("1f1b", 2)),
         dp_size=2, pp_size=2, cp_size=2, tp_size=1, ep_size=4, cp_attn_core="ring",
     )
 
     # B
-    add_full_eq("B", dp_size=2, pp_size=2, cp_size=1, tp_size=2)
-    add(_case("B/full_eq/1f1b_z3", "full_eq", backend=backend, world_size=world_size, dp_size=2, pp_size=2, cp_size=1, tp_size=2, pp_schedule="1f1b", zero_stage=3))
+    add_full_eq(
+        "B",
+        zero_stages=(0, 1, 2, 3),
+        onef1b_zero_stages=(0, 1, 2, 3),
+        dp_size=2,
+        pp_size=2,
+        cp_size=1,
+        tp_size=2,
+    )
     add_full_resume_suite(
         "B",
-        include_zero12=True,
+        zero_stages=(0, 1, 2, 3),
         schedule_accums=(("afab", 1), ("1f1b", 1), ("afab", 2), ("1f1b", 2)),
         dp_size=2, pp_size=2, cp_size=1, tp_size=2,
     )
-    add_ep_full_eq("B", onef1b_zero_stages=(3,), dp_size=2, pp_size=2, cp_size=1, tp_size=2, ep_size=4)
+    add_ep_full_eq("B", zero_stages=(0, 1, 2, 3), onef1b_zero_stages=(0, 1, 2, 3), dp_size=2, pp_size=2, cp_size=1, tp_size=2, ep_size=4)
     add_ep_full_resume_suite(
         "B",
-        zero_stages=(3,),
-        schedule_accums=(("afab", 1), ("1f1b", 1), ("afab", 2)),
+        zero_stages=(0, 1, 2, 3),
+        schedule_accums=(("afab", 1), ("1f1b", 1), ("afab", 2), ("1f1b", 2)),
         dp_size=2, pp_size=2, cp_size=1, tp_size=2, ep_size=4,
     )
 
     # C
-    add_full_eq("C", dp_size=2, pp_size=1, cp_size=2, tp_size=2, cp_attn_core="ring")
+    add_full_eq("C", zero_stages=(0, 1, 2, 3), dp_size=2, pp_size=1, cp_size=2, tp_size=2, cp_attn_core="ring")
     add_full_resume_suite(
         "C",
-        include_zero12=True,
+        zero_stages=(0, 1, 2, 3),
         schedule_accums=(("afab", 1), ("afab", 2)),
         dp_size=2, pp_size=1, cp_size=2, tp_size=2, cp_attn_core="ring",
     )
-    add_ep_full_eq("C", onef1b_zero_stages=(), dp_size=2, pp_size=1, cp_size=2, tp_size=2, ep_size=8, cp_attn_core="ring")
+    add_ep_full_eq("C", zero_stages=(0, 1, 2, 3), onef1b_zero_stages=(), dp_size=2, pp_size=1, cp_size=2, tp_size=2, ep_size=8, cp_attn_core="ring")
     add_ep_full_resume_suite(
         "C",
-        zero_stages=(3,),
+        zero_stages=(0, 1, 2, 3),
         schedule_accums=(("afab", 1), ("afab", 2)),
         dp_size=2, pp_size=1, cp_size=2, tp_size=2, ep_size=8, cp_attn_core="ring",
     )
@@ -273,7 +300,7 @@ def build_full_stack_matrix_cases(
     # D
     add(_case("D/full_eq/z0", "full_eq", backend=backend, world_size=world_size, dp_size=1, pp_size=2, cp_size=2, tp_size=2, zero_stage=0, cp_attn_core="ring"))
     add(_case("D/full_eq/1f1b_z0", "full_eq", backend=backend, world_size=world_size, dp_size=1, pp_size=2, cp_size=2, tp_size=2, pp_schedule="1f1b", zero_stage=0, cp_attn_core="ring"))
-    for schedule, accum, global_batch_size in (("afab", 1, 8), ("1f1b", 1, 8), ("afab", 2, 4)):
+    for schedule, accum, global_batch_size in (("afab", 1, 8), ("1f1b", 1, 8), ("afab", 2, 4), ("1f1b", 2, 4)):
         add(
             _case(
                 f"D/full_resume/z0_{schedule}_acc{accum}",
@@ -294,7 +321,7 @@ def build_full_stack_matrix_cases(
         )
     add(_case("D/ep_full_eq/z0", "ep_full_eq", backend=backend, world_size=world_size, dp_size=1, pp_size=2, cp_size=2, tp_size=2, ep_size=4, zero_stage=0, cp_attn_core="ring"))
     add(_case("D/ep_full_eq/1f1b_z0", "ep_full_eq", backend=backend, world_size=world_size, dp_size=1, pp_size=2, cp_size=2, tp_size=2, ep_size=4, pp_schedule="1f1b", zero_stage=0, cp_attn_core="ring"))
-    for schedule, accum, global_batch_size in (("afab", 1, 8), ("1f1b", 1, 8), ("afab", 2, 4)):
+    for schedule, accum, global_batch_size in (("afab", 1, 8), ("1f1b", 1, 8), ("afab", 2, 4), ("1f1b", 2, 4)):
         add(
             _case(
                 f"D/ep_full_resume/z0_{schedule}_acc{accum}",
@@ -331,6 +358,15 @@ def build_full_stack_matrix_cases(
             missing_str = ", ".join(missing)
             raise ValueError(f"unknown matrix case name(s): {missing_str}")
         cases = [case_by_name[name] for name in ordered_names]
+    if blacklist_names:
+        excluded: set[str] = set()
+        for value in blacklist_names:
+            for name in value.split(","):
+                normalized = name.strip()
+                if normalized:
+                    excluded.add(normalized)
+        if excluded:
+            cases = [case for case in cases if case.name not in excluded]
     if case_filter:
         cases = [case for case in cases if case_filter in case.name]
     if max_cases is not None:
