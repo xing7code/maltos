@@ -143,6 +143,48 @@ def _runtime_local_expert_tensors(model: torch.nn.Module, *, grads: bool) -> dic
     return tensors
 
 
+def _bucket_grad_by_param_id(
+    zero_plugin: Zero1Plugin | Zero2Plugin | Zero3Plugin,
+) -> dict[int, torch.Tensor]:
+    result: dict[int, torch.Tensor] = {}
+    for bucket in zero_plugin.buckets:
+        if bucket.local_param.grad is None:
+            continue
+        shard_group = bucket.group_context.group
+        if shard_group is not None:
+            full_grad = torch.cat(_all_gather_tensor(bucket.local_param.grad.detach(), shard_group), dim=0)
+        else:
+            full_grad = bucket.local_param.grad.detach().clone()
+        if hasattr(bucket, "param_numels"):
+            offset = 0
+            for param, numel, shape in zip(bucket.params, bucket.param_numels, bucket.param_shapes):
+                result[id(param)] = full_grad[offset : offset + numel].view(shape).cpu()
+                offset += numel
+            continue
+        offset = 0
+        for param in bucket.params:
+            numel = param.numel()
+            result[id(param)] = full_grad[offset : offset + numel].view(param.shape).cpu()
+            offset += numel
+    return result
+
+
+def _runtime_local_expert_zero_grads(
+    model: torch.nn.Module,
+    grad_by_pid: dict[int, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    tensors: dict[str, torch.Tensor] = {}
+    for module_name, module in model.named_modules():
+        if not isinstance(module, _ExpertParallelMoE):
+            continue
+        for local_idx, global_idx in enumerate(module.local_expert_ids):
+            expert = module.local_experts[local_idx]
+            for param_name, param in expert.named_parameters():
+                full_name = f"{module_name}.experts.{global_idx}.{param_name}"
+                tensors[full_name] = grad_by_pid.get(id(param), torch.zeros_like(param).cpu())
+    return tensors
+
+
 def _runtime_logical_named_tensors(
     model: torch.nn.Module,
     shard_rules: dict[str, str],
@@ -165,6 +207,30 @@ def _runtime_logical_named_tensors(
         for shard in gathered:
             for name, tensor in shard.items():
                 tensors[name] = tensor.to(next(model.parameters()).device)
+    return tensors
+
+
+def _runtime_logical_named_zero_grads(
+    model: torch.nn.Module,
+    zero_plugin: Zero1Plugin | Zero2Plugin | Zero3Plugin,
+    shard_rules: dict[str, str],
+    tp_group: dist.ProcessGroup | None,
+    ep_group: dist.ProcessGroup | None,
+) -> dict[str, torch.Tensor]:
+    device = next(model.parameters()).device
+    grad_by_pid = _bucket_grad_by_param_id(zero_plugin)
+    tensors: dict[str, torch.Tensor] = {}
+    for name, param in model.named_parameters():
+        if ".local_experts." in name:
+            continue
+        grad = grad_by_pid.get(id(param), torch.zeros_like(param).cpu())
+        tensors[name] = _logical_tensor(name, grad.to(device), shard_rules, tp_group)
+    if ep_group is not None:
+        gathered: list[dict[str, torch.Tensor]] = [None for _ in range(dist.get_world_size(ep_group))]  # type: ignore[list-item]
+        dist.all_gather_object(gathered, _runtime_local_expert_zero_grads(model, grad_by_pid), group=ep_group)
+        for shard in gathered:
+            for name, tensor in shard.items():
+                tensors[name] = tensor.to(device)
     return tensors
 
 
@@ -285,7 +351,11 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     tp_group = core.get_group(MeshAxis.TP)
     ep_group = core.get_group(MeshAxis.EP)
     baseline_grads = _baseline_named_tensors(baseline_model, grads=True)
-    runtime_grads = _runtime_logical_named_tensors(core.model, shard_rules, tp_group, ep_group, grads=True)
+    runtime_grads = (
+        _runtime_logical_named_zero_grads(core.model, zero_plugin, shard_rules, tp_group, ep_group)
+        if zero_plugin is not None
+        else _runtime_logical_named_tensors(core.model, shard_rules, tp_group, ep_group, grads=True)
+    )
     grad_name, grad_diff = _max_diff(baseline_grads, runtime_grads)
 
     baseline_optimizer.step()

@@ -145,18 +145,18 @@ def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> No
     model_artifact = _find_artifact(manifest, kind="model", rank=rank)
     if model_artifact is None:
         raise ValueError(f"manifest missing model artifact for rank={rank}")
-    model_state = torch.load(checkpoint_dir / model_artifact.path, map_location="cpu")
+    model_state = torch.load(checkpoint_dir / model_artifact.path, map_location="cpu", weights_only=True)
 
     trainer_artifact = _find_artifact(manifest, kind="trainer", rank=rank)
     if trainer_artifact is None:
         raise ValueError(f"manifest missing trainer artifact for rank={rank}")
     with torch.serialization.safe_globals([PpStatus]):
-        trainer_state = torch.load(checkpoint_dir / trainer_artifact.path, map_location="cpu")
+        trainer_state = torch.load(checkpoint_dir / trainer_artifact.path, map_location="cpu", weights_only=True)
 
     optim_source_rank = manifest.optimizer_source_ranks[rank]
     optimizer_artifact = _find_artifact(manifest, kind="optimizer", rank=optim_source_rank)
     optim_state = (
-        torch.load(checkpoint_dir / optimizer_artifact.path, map_location="cpu")
+        torch.load(checkpoint_dir / optimizer_artifact.path, map_location="cpu", weights_only=True)
         if optimizer_artifact is not None
         else None
     )

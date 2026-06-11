@@ -20,6 +20,7 @@ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-180
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-180}"
 
 # ── Single-feature tests (always gloo) ─────────────────────────────────────────
+if [ "${BACKEND}" = "gloo" ]; then
 
 echo "=== compileall ==="
 "${PYTHON_BIN}" -m compileall data models parallel runtime state tests train utils tools
@@ -151,6 +152,8 @@ echo "=== tp+sp+zero3+bf16+clip+accum2 mid-step checkpoint resume ==="
 echo "=== pretraining loader + tp+sp+zero3+bf16+clip+accum2 checkpoint resume ==="
 "${PYTHON_BIN}" tests/pretraining_loader_tp_sp_zero3_bf16_clip_accum2_resume.py
 
+fi  # BACKEND=gloo
+
 # ── Full-stack matrix (backend: ${BACKEND}) ─────────────────────────────────────
 
 # ── A: dp=2 pp=2 cp=2 tp=1, world=8 ───────────────────────────────────────────
@@ -183,13 +186,37 @@ for z in 0 1 2 3; do
 done
 "${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
   --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
+  --pp-schedule 1f1b --zero-stage 1 --cp-attn-core ring
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
+  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
+  --pp-schedule 1f1b --zero-stage 2 --cp-attn-core ring
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
+  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
   --pp-schedule 1f1b --zero-stage 3 --cp-attn-core ring
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
+  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
+  --zero-stage 1 --grad-accum-steps 1 --cp-attn-core ring
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
+  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
+  --zero-stage 2 --grad-accum-steps 1 --cp-attn-core ring
 "${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
   --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
   --grad-accum-steps 1 --cp-attn-core ring
 "${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
   --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
+  --zero-stage 1 --pp-schedule 1f1b --grad-accum-steps 1 --cp-attn-core ring
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
+  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
+  --zero-stage 2 --pp-schedule 1f1b --grad-accum-steps 1 --cp-attn-core ring
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
+  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
   --pp-schedule 1f1b --grad-accum-steps 1 --cp-attn-core ring
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
+  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
+  --zero-stage 1 --grad-accum-steps 2 --cp-attn-core ring
+"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
+  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
+  --zero-stage 2 --grad-accum-steps 2 --cp-attn-core ring
 "${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
   --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
   --grad-accum-steps 2 --cp-attn-core ring

@@ -1,14 +1,19 @@
 {
   "permissions": {
     "allow": [
-      "Bash(PYTHONPATH=. * tests/*)",
+      "Bash(PYTHONPATH=. .venv/bin/python tests/*)",
+      "Bash(PYTHONPATH=. python tests/*)",
+      "Bash(.venv/bin/python tests/*)",
       "Bash(python tests/*)",
+      "Bash(python3 -c *)",
       "Bash(./tests/run_matrix.sh*)",
+      "Bash(BACKEND=* ./tests/run_matrix.sh*)",
+      "Bash(BACKEND=* PYTHONPATH=. ./tests/run_matrix.sh*)",
       "Bash(grep *)",
       "Bash(sed -n *)",
       "Bash(awk *)",
       "Bash(xargs *)",
-      "Bash(python3 -c *)"
+      "Bash(bash -n *)"
     ]
   }
 }

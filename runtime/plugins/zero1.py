@@ -115,9 +115,8 @@ class Zero1Plugin(_ZeroPluginBase):
                 self._start_post_reduction_worker()
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
-            if (
-                self.runtime.state.step_context.is_step_boundary
-                and not self._use_async_worker()
+            if self.runtime.state.step_context.is_step_boundary and (
+                not self._use_async_worker() or not self.runtime._post_grad_reduction_callbacks
             ):
                 self._fire_post_reductions_sync()
         elif phase == RuntimePhase.PRE_STEP:

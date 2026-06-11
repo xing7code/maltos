@@ -394,11 +394,11 @@ class Zero3Plugin(_ZeroPluginBase):
             bucket.local_param.grad.add_(shard if bucket.group_context.correction == 1.0 else shard * bucket.group_context.correction)
             return _ImmediateWork()
         if bucket.group_context.is_gloo:
-            work = dist.all_reduce(state.grad_buffer, op=dist.ReduceOp.AVG, group=bucket.group_context.group, async_op=True)
+            work = dist.all_reduce(state.grad_buffer, op=dist.ReduceOp.SUM, group=bucket.group_context.group, async_op=True)
             shard_len = bucket.local_param.numel()
             shard_start = bucket.group_context.rank * shard_len
             shard_end = (bucket.group_context.rank + 1) * shard_len
-            return AllReduceShardWork(work, state.grad_buffer, bucket.local_param.grad, shard_start, shard_end, bucket.group_context.correction)
+            return AllReduceShardWork(work, state.grad_buffer, bucket.local_param.grad, shard_start, shard_end, bucket.group_context.correction / bucket.group_context.world_size)
         work = dist.reduce_scatter_tensor(
             state.shard_buffer,
             state.grad_buffer,

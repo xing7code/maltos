@@ -199,11 +199,11 @@ class Zero2Plugin(_ZeroPluginBase):
         if bucket.group_context.group is None or bucket.group_context.world_size == 1:
             return _LocalAddWork(full_grad[: bucket.local_param.numel()], bucket.local_param.grad)
         if bucket.group_context.is_gloo:
-            work = dist.all_reduce(full_grad, op=dist.ReduceOp.AVG, group=bucket.group_context.group, async_op=True)
+            work = dist.all_reduce(full_grad, op=dist.ReduceOp.SUM, group=bucket.group_context.group, async_op=True)
             shard_len = bucket.local_param.numel()
             shard_start = bucket.group_context.rank * shard_len
             shard_end = (bucket.group_context.rank + 1) * shard_len
-            return AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end, bucket.group_context.correction)
+            return AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end, bucket.group_context.correction / bucket.group_context.world_size)
         work = dist.reduce_scatter_tensor(
             state.shard_buffer,
             full_grad,

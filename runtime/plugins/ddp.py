@@ -11,6 +11,11 @@ from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
 
 
+class _NullWork:
+    def wait(self) -> None:
+        pass
+
+
 class DataParallelPlugin(RuntimePlugin):
     """RuntimeCore data parallel gradient synchronization."""
 
@@ -28,6 +33,8 @@ class DataParallelPlugin(RuntimePlugin):
         dp_group = self.runtime.get_group(MeshAxis.DP)
         if dp_group is None:
             return
+        is_gloo = dist.get_backend(dp_group) == "gloo"
+        world_size = dist.get_world_size(dp_group)
         handles = []
         for name, param in self.runtime.model.named_parameters():
             if not param.requires_grad:
@@ -36,9 +43,13 @@ class DataParallelPlugin(RuntimePlugin):
                 continue
             if param.grad is None:
                 raise RuntimeError(f"param={name} requires grad but has no gradient")
-            handle = dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=dp_group, async_op=self.async_op)
-            if self.async_op:
-                handles.append(handle)
+            if is_gloo:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=dp_group)
+                param.grad.div_(world_size)
+            else:
+                handle = dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=dp_group, async_op=self.async_op)
+                if self.async_op:
+                    handles.append(handle)
         for handle in handles:
             handle.wait()
 
@@ -81,16 +92,24 @@ class _Bucket:
             param.grad = view
 
     def make_hook(self):
+        is_gloo = dist.get_backend(self.group) == "gloo"
+        world_size = dist.get_world_size(self.group)
+
         def hook(param):
             self.pending -= 1
             if self.pending == 0:
                 assert self.flat_buffer is not None
-                self.handle = dist.all_reduce(
-                    self.flat_buffer,
-                    op=dist.ReduceOp.AVG,
-                    group=self.group,
-                    async_op=True,
-                )
+                if is_gloo:
+                    dist.all_reduce(self.flat_buffer, op=dist.ReduceOp.SUM, group=self.group)
+                    self.flat_buffer.div_(world_size)
+                    self.handle = _NullWork()
+                else:
+                    self.handle = dist.all_reduce(
+                        self.flat_buffer,
+                        op=dist.ReduceOp.AVG,
+                        group=self.group,
+                        async_op=True,
+                    )
 
         return hook
 

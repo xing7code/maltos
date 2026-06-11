@@ -1,4 +1,4 @@
-"""Full-stack PP+CP+TP+SP+EP+ZeRO3 checkpoint/resume tests.
+"""Full-stack PP+CP+TP+SP+EP+ZeRO checkpoint/resume tests.
 
 --grad-accum-steps 1  step-boundary checkpoint (default)
 --grad-accum-steps 2  mid-step checkpoint
@@ -28,6 +28,8 @@ from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.zero1 import Zero1Plugin
+from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
 from state import load_sharded_checkpoint, save_sharded_checkpoint
 
@@ -64,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
-    parser.add_argument("--zero-stage", type=int, choices=(0, 3), default=3)
+    parser.add_argument("--zero-stage", type=int, choices=(0, 1, 2, 3), default=3)
     parser.add_argument("--disable-precision", action="store_true")
     parser.add_argument("--disable-grad-clip", action="store_true")
     return parser.parse_args()
@@ -200,8 +202,14 @@ def _check_bf16_metadata(cont: RuntimeCore, rest: RuntimeCore) -> None:
 
 def _build_runtime(
     model: TinyMoETransformerTpSp, args: argparse.Namespace, device: torch.device | None = None,
-) -> tuple[RuntimeCore, Zero3Plugin | None]:
-    zero3 = Zero3Plugin(wrap_cls=_ZERO3_WRAP_CLS) if args.zero_stage == 3 else None
+) -> tuple[RuntimeCore, Zero1Plugin | Zero2Plugin | Zero3Plugin | None]:
+    zero_plugin: Zero1Plugin | Zero2Plugin | Zero3Plugin | None = None
+    if args.zero_stage == 1:
+        zero_plugin = Zero1Plugin(bucket_mb_size=0)
+    elif args.zero_stage == 2:
+        zero_plugin = Zero2Plugin(bucket_mb_size=0)
+    elif args.zero_stage == 3:
+        zero_plugin = Zero3Plugin(wrap_cls=_ZERO3_WRAP_CLS)
     plugins = []
     if args.tp_size > 1:
         plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
@@ -210,8 +218,8 @@ def _build_runtime(
     if args.pp_size > 1:
         plugins.append(PipelineParallelPlugin(schedule=args.pp_schedule))
     plugins.append(ExpertParallelPlugin())
-    if zero3 is not None:
-        plugins.append(zero3)
+    if zero_plugin is not None:
+        plugins.append(zero_plugin)
     if not args.disable_precision:
         plugins.append(PrecisionPlugin(compute_dtype=torch.bfloat16))
     if not args.disable_grad_clip:
@@ -232,7 +240,7 @@ def _build_runtime(
         device=device,
     )
     core.setup()
-    return core, zero3
+    return core, zero_plugin
 
 
 def _compare_params(
@@ -255,7 +263,7 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
 
     cont_model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
     cont_model.load_state_dict(reference_model.state_dict())
-    cont_core, cont_zero3 = _build_runtime(cont_model, args, device)
+    cont_core, cont_zero = _build_runtime(cont_model, args, device)
     dist.barrier()
 
     dp_idx, _, _, _ = cont_core.mesh.rank_coordinates(rank)
@@ -278,7 +286,7 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
 
     rest_model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
     rest_model.load_state_dict(reference_model.state_dict())
-    rest_core, rest_zero3 = _build_runtime(rest_model, args, device)
+    rest_core, rest_zero = _build_runtime(rest_model, args, device)
     load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
     dist.barrier()
     rest_loss, should_step = rest_core.run_step(causal_lm_batch(local_b))
@@ -289,10 +297,10 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
 
     cont_loss_r = _reduce_loss(cont_loss, cont_core)
     rest_loss_r = _reduce_loss(rest_loss, rest_core)
-    if cont_zero3 is not None:
-        cont_zero3.materialize_model()
-    if rest_zero3 is not None:
-        rest_zero3.materialize_model()
+    if isinstance(cont_zero, Zero3Plugin):
+        cont_zero.materialize_model()
+    if isinstance(rest_zero, Zero3Plugin):
+        rest_zero.materialize_model()
     param_name, param_diff = _compare_params(cont_core, rest_core, cont_model, device)
 
     if rank == 0:
@@ -307,10 +315,10 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
         _check_bf16_metadata(cont_core, rest_core)
         print("PASS")
 
-    if cont_zero3 is not None:
-        cont_zero3.reshard_model()
-    if rest_zero3 is not None:
-        rest_zero3.reshard_model()
+    if isinstance(cont_zero, Zero3Plugin):
+        cont_zero.reshard_model()
+    if isinstance(rest_zero, Zero3Plugin):
+        rest_zero.reshard_model()
 
 
 def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.device | None) -> None:
@@ -318,7 +326,7 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
 
     cont_model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
     cont_model.load_state_dict(reference_model.state_dict())
-    cont_core, cont_zero3 = _build_runtime(cont_model, args, device)
+    cont_core, cont_zero = _build_runtime(cont_model, args, device)
 
     dp_idx, _, _, _ = cont_core.mesh.rank_coordinates(rank)
     local_bs = args.global_batch_size // args.dp_size
@@ -345,7 +353,7 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
 
     rest_model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
     rest_model.load_state_dict(reference_model.state_dict())
-    rest_core, rest_zero3 = _build_runtime(rest_model, args, device)
+    rest_core, rest_zero = _build_runtime(rest_model, args, device)
     load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
     if rest_core.state.step != 0 or rest_core.state.step_context.microbatch_idx != 1:
         raise AssertionError("EP midstep: restored core must recover mid-step state")
@@ -368,10 +376,10 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
     ]
     loss_diffs = [(tag, abs(lhs.item() - rhs.item())) for tag, lhs, rhs in loss_pairs]
 
-    if cont_zero3 is not None:
-        cont_zero3.materialize_model()
-    if rest_zero3 is not None:
-        rest_zero3.materialize_model()
+    if isinstance(cont_zero, Zero3Plugin):
+        cont_zero.materialize_model()
+    if isinstance(rest_zero, Zero3Plugin):
+        rest_zero.materialize_model()
     param_name, param_diff = _compare_params(cont_core, rest_core, cont_model, device)
 
     if rank == 0:
@@ -386,10 +394,10 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
         _check_bf16_metadata(cont_core, rest_core)
         print("PASS")
 
-    if cont_zero3 is not None:
-        cont_zero3.reshard_model()
-    if rest_zero3 is not None:
-        rest_zero3.reshard_model()
+    if isinstance(cont_zero, Zero3Plugin):
+        cont_zero.reshard_model()
+    if isinstance(rest_zero, Zero3Plugin):
+        rest_zero.reshard_model()
 
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
