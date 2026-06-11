@@ -12,10 +12,16 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from data import PretrainingDataLoader, TokenShardDataset
+from distributed_test_utils import (
+    max_diff as _max_diff,
+    named_tensors as _named_tensors,
+    normalize_param_name as _normalize_param_name,
+    rule_by_param_name as _rule_by_param_name,
+    supports_bf16_autocast as _supports_bf16_autocast,
+)
 from models import TinyTransformer, TinyTransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
-from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.precision import PrecisionPlugin
@@ -59,16 +65,6 @@ def _mesh_indices(rank: int, tp_size: int) -> tuple[int, int]:
     return rank // tp_size, rank % tp_size
 
 
-def _supports_bf16_autocast() -> bool:
-    try:
-        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-            x = torch.randn(8, 8)
-            _ = x @ x
-        return True
-    except Exception:
-        return False
-
-
 def _build_reference(seed: int) -> TinyTransformer:
     torch.manual_seed(seed)
     return TinyTransformer(**_MODEL_KWARGS)
@@ -94,63 +90,6 @@ def _build_loader(seq_len: int, dp_idx: int, dp_size: int, seed: int) -> Pretrai
 
 def _batch_tuple(batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     return batch["input_ids"], batch["labels"]
-
-
-def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[torch.Tensor]:
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, tensor.contiguous(), group=group)
-    return gathered
-
-
-def _rule_by_param_name(model: TinyTransformerTpSp) -> dict[str, str]:
-    rules = {}
-    for rule in model.tpsp_parallelize_spec().rules:
-        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
-            rules[f"{rule.module_path}.weight"] = rule.shard_axis
-            rules[f"{rule.module_path}.bias"] = rule.shard_axis
-    return rules
-
-
-def _logical_tensor(
-    name: str,
-    tensor: torch.Tensor,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-) -> torch.Tensor:
-    shard_axis = shard_rules.get(name)
-    if shard_axis == TpSpShardAxis.PARAM_OUT:
-        assert tp_group is not None
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=0)
-    if shard_axis == TpSpShardAxis.PARAM_IN:
-        assert tp_group is not None
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=1)
-    return tensor.detach().clone()
-
-
-def _logical_named_tensors(
-    model: torch.nn.Module,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-) -> dict[str, torch.Tensor]:
-    def _normalize_name(name: str) -> str:
-        return name[len("module.") :] if name.startswith("module.") else name
-
-    return {
-        _normalize_name(name): _logical_tensor(_normalize_name(name), param.detach(), shard_rules, tp_group)
-        for name, param in model.named_parameters()
-    }
-
-
-def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tuple[str, float]:
-    worst_name = ""
-    worst_diff = 0.0
-    for name, lhs_tensor in lhs.items():
-        diff = (lhs_tensor - rhs[name]).abs().max().item()
-        if diff > worst_diff:
-            worst_name = name
-            worst_diff = diff
-    return worst_name, worst_diff
-
 
 def _build_runtime(model: TinyTransformerTpSp, dp_size: int, tp_size: int) -> tuple[RuntimeCore, Zero3Plugin]:
     zero3 = Zero3Plugin(
@@ -254,8 +193,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     restored_zero3.materialize_model()
     shard_rules = _rule_by_param_name(continuous_model)
     tp_group = continuous_core.get_group(MeshAxis.TP)
-    continuous_params = _logical_named_tensors(continuous_core.model, shard_rules, tp_group)
-    restored_params = _logical_named_tensors(restored_core.model, shard_rules, tp_group)
+    continuous_params = _named_tensors(continuous_core.model, shard_rules, tp_group, normalize_name=_normalize_param_name)
+    restored_params = _named_tensors(restored_core.model, shard_rules, tp_group, normalize_name=_normalize_param_name)
     param_name, param_diff = _max_diff(continuous_params, restored_params)
 
     if rank == 0:

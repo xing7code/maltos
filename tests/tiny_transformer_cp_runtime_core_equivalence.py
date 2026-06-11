@@ -9,10 +9,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from distributed_test_utils import (
+    all_gather_tensor as _all_gather_tensor,
+    max_diff as _max_diff,
+    named_tensors as _named_tensors,
+    rule_by_param_name as _rule_by_param_name,
+)
 from helpers import causal_lm_batch
 from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
 from parallel.context import ContextParallelAttentionCoreType
-from parallel.specs import TpSpShardAxis
 from parallel import ParallelPlan
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.cp import ContextParallelPlugin
@@ -83,72 +88,6 @@ def _build_sharded_model(args: argparse.Namespace) -> TinyTransformer:
         return TinyTransformerTp(**_MODEL_KWARGS)
     return TinyTransformer(**_MODEL_KWARGS)
 
-
-def _logical_named_grads(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    return {
-        name: param.grad.detach().clone()
-        for name, param in model.named_parameters()
-        if param.grad is not None
-    }
-
-
-def _rule_by_param_name(model: TinyTransformer) -> dict[str, str]:
-    if not hasattr(model, "tpsp_parallelize_spec"):
-        return {}
-    rules = {}
-    for rule in model.tpsp_parallelize_spec().rules:
-        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
-            rules[f"{rule.module_path}.weight"] = rule.shard_axis
-            rules[f"{rule.module_path}.bias"] = rule.shard_axis
-    return rules
-
-
-def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup | None) -> list[torch.Tensor]:
-    if group is None:
-        return [tensor.detach().clone()]
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, tensor.contiguous(), group=group)
-    return gathered
-
-
-def _logical_tensor(
-    name: str,
-    tensor: torch.Tensor,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-) -> torch.Tensor:
-    shard_axis = shard_rules.get(name)
-    if shard_axis == TpSpShardAxis.PARAM_OUT:
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=0)
-    if shard_axis == TpSpShardAxis.PARAM_IN:
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=1)
-    return tensor.detach().clone()
-
-
-def _logical_named_tensors(
-    model: torch.nn.Module,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-) -> dict[str, torch.Tensor]:
-    return {
-        name: _logical_tensor(name, param.detach(), shard_rules, tp_group)
-        for name, param in model.named_parameters()
-    }
-
-
-def _logical_named_sharded_grads(
-    model: torch.nn.Module,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-) -> dict[str, torch.Tensor]:
-    grads = {}
-    for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
-        grads[name] = _logical_tensor(name, param.grad.detach(), shard_rules, tp_group)
-    return grads
-
-
 def _logical_named_zero_shard_grads(core: RuntimeCore, zero_plugin: Zero1Plugin | Zero2Plugin | Zero3Plugin) -> dict[str, torch.Tensor]:
     # ZeRO shards over DCP (DP×CP); gather from DCP group to reconstruct the full grad.
     dcp_group = core.get_group(MeshAxis.DCP)
@@ -180,25 +119,6 @@ def _logical_named_zero_shard_grads(core: RuntimeCore, zero_plugin: Zero1Plugin 
             logical_grads[name] = full_grad[offset : offset + numel].view_as(param).detach().clone()
             offset += numel
     return logical_grads
-
-
-def _logical_named_params(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    return {
-        name: param.detach().clone()
-        for name, param in model.named_parameters()
-    }
-
-
-def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tuple[str, float]:
-    worst_name = ""
-    worst_diff = 0.0
-    for name, lhs_tensor in lhs.items():
-        diff = (lhs_tensor - rhs[name]).abs().max().item()
-        if diff > worst_diff:
-            worst_name = name
-            worst_diff = diff
-    return worst_name, worst_diff
-
 
 def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespace) -> RuntimeCore:
     model = TinyTransformer(**_MODEL_KWARGS)
@@ -313,7 +233,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     runtime_tp_group = runtime_core.get_group(MeshAxis.TP)
     baseline_shard_rules = _rule_by_param_name(baseline_core.model)
     runtime_shard_rules = _rule_by_param_name(runtime_core.model)
-    baseline_grads = _logical_named_sharded_grads(baseline_core.model, baseline_shard_rules, baseline_tp_group)
+    baseline_grads = _named_tensors(baseline_core.model, baseline_shard_rules, baseline_tp_group, grads=True)
     zero_plugin = next(
         (plugin for plugin in runtime_core.plugins if isinstance(plugin, (Zero1Plugin, Zero2Plugin, Zero3Plugin))),
         None,
@@ -321,7 +241,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     runtime_grads = (
         _logical_named_zero_shard_grads(runtime_core, zero_plugin)
         if zero_plugin is not None
-        else _logical_named_sharded_grads(runtime_core.model, runtime_shard_rules, runtime_tp_group)
+        else _named_tensors(runtime_core.model, runtime_shard_rules, runtime_tp_group, grads=True)
     )
     grad_name, grad_diff = _max_diff(runtime_grads, baseline_grads)
 
@@ -330,8 +250,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     zero3 = next((plugin for plugin in runtime_core.plugins if isinstance(plugin, Zero3Plugin)), None)
     if zero3 is not None:
         zero3.materialize_model()
-    baseline_params = _logical_named_tensors(baseline_core.model, baseline_shard_rules, baseline_tp_group)
-    runtime_params = _logical_named_tensors(runtime_core.model, runtime_shard_rules, runtime_tp_group)
+    baseline_params = _named_tensors(baseline_core.model, baseline_shard_rules, baseline_tp_group)
+    runtime_params = _named_tensors(runtime_core.model, runtime_shard_rules, runtime_tp_group)
     step_name, step_diff = _max_diff(runtime_params, baseline_params)
 
     loss_diff_tensor = torch.tensor(abs(runtime_loss_value - baseline_loss_value), dtype=torch.float64)

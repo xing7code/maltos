@@ -16,12 +16,16 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from distributed_test_utils import (
+    max_diff as _max_diff,
+    named_tensors as _named_tensors,
+    rule_by_param_name as _rule_by_param_name,
+)
 from helpers import causal_lm_batch
 from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
-from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ddp import DataParallelPlugin
@@ -127,7 +131,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     tp_group = core.get_group(MeshAxis.TP)
     shard_rules = _rule_by_param_name(core.model)
-    logical_params = _logical_named_tensors(core.model, shard_rules, tp_group)
+    logical_params = _named_tensors(core.model, shard_rules, tp_group)
 
     local_param_diff = 0.0
     local_param_name = ""
@@ -168,6 +172,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if zero3 is not None:
         zero3.reshard_model()
     dist.destroy_process_group()
+
+
 def _make_plugins(args: argparse.Namespace):
     case = args.case
     zero3: Zero3Plugin | None = None
@@ -242,52 +248,8 @@ def _run_baseline(rank: int, args: argparse.Namespace) -> tuple[float, dict[str,
     baseline_core.step_optimizer()
     baseline_tp_group = baseline_core.get_group(MeshAxis.TP)
     shard_rules = _rule_by_param_name(baseline_core.model)
-    baseline_params = _logical_named_tensors(baseline_core.model, shard_rules, baseline_tp_group)
+    baseline_params = _named_tensors(baseline_core.model, shard_rules, baseline_tp_group)
     return baseline_loss.item(), baseline_params
-
-
-def _rule_by_param_name(model) -> dict[str, str]:
-    if not hasattr(model, "tpsp_parallelize_spec"):
-        return {}
-    rules = {}
-    for rule in model.tpsp_parallelize_spec().rules:
-        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
-            rules[f"{rule.module_path}.weight"] = rule.shard_axis
-            rules[f"{rule.module_path}.bias"] = rule.shard_axis
-    return rules
-
-
-def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[torch.Tensor]:
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, tensor.contiguous(), group=group)
-    return gathered
-
-
-def _logical_tensor(
-    name: str,
-    tensor: torch.Tensor,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-) -> torch.Tensor:
-    shard_axis = shard_rules.get(name)
-    if shard_axis == TpSpShardAxis.PARAM_OUT:
-        assert tp_group is not None
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=0)
-    if shard_axis == TpSpShardAxis.PARAM_IN:
-        assert tp_group is not None
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=1)
-    return tensor.detach().clone()
-
-
-def _logical_named_tensors(
-    model: torch.nn.Module,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-) -> dict[str, torch.Tensor]:
-    return {
-        name: _logical_tensor(name, param.detach(), shard_rules, tp_group)
-        for name, param in model.named_parameters()
-    }
 
 
 def main() -> None:

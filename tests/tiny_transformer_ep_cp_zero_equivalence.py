@@ -17,6 +17,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from distributed_test_utils import max_diff as _max_diff, named_tensors as _named_tensors, reduce_loss as _reduce_loss
+from distributed_test_utils import moe_named_tensors as _moe_named_tensors
 from helpers import causal_lm_batch
 from models import TinyMoETransformer
 from models.tiny_transformer import RmsNorm
@@ -26,7 +28,7 @@ from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.core import RuntimePhase
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ddp import BucketDataParallelPlugin
-from runtime.plugins.ep import ExpertParallelPlugin, _ExpertParallelMoE
+from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
@@ -83,54 +85,6 @@ def _build_reference(seed: int, dp_size: int, batch_size: int, seq_len: int) -> 
     tokens = torch.cat([_tokens_for_dp(seed, dp_idx, local_batch, seq_len) for dp_idx in range(dp_size)], dim=0)
     model = TinyMoETransformer(**_MODEL_KWARGS)
     return model, tokens
-
-
-def _runtime_expert_tensors(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    for module_name, module in model.named_modules():
-        if not isinstance(module, _ExpertParallelMoE):
-            continue
-        for local_idx, global_idx in enumerate(module.local_expert_ids):
-            expert = module.local_experts[local_idx]
-            for param_name, param in expert.named_parameters():
-                tensors[f"{module_name}.experts.{global_idx}.{param_name}"] = param.detach().clone().cpu()
-    return tensors
-
-
-def _runtime_named_params(
-    model: torch.nn.Module,
-    ep_group: dist.ProcessGroup | None,
-) -> dict[str, torch.Tensor]:
-    params: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if ".local_experts." in name:
-            continue
-        params[name] = param.detach().clone().cpu()
-    if ep_group is not None:
-        gathered: list[dict[str, torch.Tensor]] = [None for _ in range(dist.get_world_size(ep_group))]  # type: ignore[list-item]
-        dist.all_gather_object(gathered, _runtime_expert_tensors(model), group=ep_group)
-        for shard in gathered:
-            for name, tensor in shard.items():
-                params[name] = tensor.cpu()
-    return params
-
-
-def _baseline_named_params(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    return {name: param.detach().clone().cpu() for name, param in model.named_parameters()}
-
-
-def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tuple[str, float]:
-    worst_name = ""
-    worst_diff = 0.0
-    for name, lhs_tensor in lhs.items():
-        rhs_tensor = rhs[name].to(lhs_tensor.device, lhs_tensor.dtype)
-        diff = float((lhs_tensor - rhs_tensor).abs().max().item())
-        if diff > worst_diff:
-            worst_name = name
-            worst_diff = diff
-    return worst_name, worst_diff
-
-
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
     dist.init_process_group(
         backend=args.backend,
@@ -199,13 +153,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     # Reduce runtime loss over CP then DP to match reference.
     # Reference uses mean CE; each CP rank holds one slice, sum over CP = full-sequence mean CE.
-    runtime_loss = loss.detach().clone()
-    cp_group = core.get_group(MeshAxis.CP)
-    dp_group = core.get_group(MeshAxis.DP)
-    if cp_group is not None:
-        dist.all_reduce(runtime_loss, op=dist.ReduceOp.SUM, group=cp_group)
-    if dp_group is not None:
-        dist.all_reduce(runtime_loss, op=dist.ReduceOp.AVG, group=dp_group)
+    runtime_loss = _reduce_loss(loss, core)
 
     # Flush async grad sync before comparing.
     core._run_phase(RuntimePhase.PRE_STEP)
@@ -216,8 +164,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         zero_plugin.materialize_model()
 
     ep_group = core.get_group(MeshAxis.EP)
-    ref_params = _baseline_named_params(reference_model)
-    runtime_params = _runtime_named_params(core.model, ep_group)
+    ref_params = _named_tensors(reference_model, {}, None, device=torch.device("cpu"))
+    runtime_params = _moe_named_tensors(core.model, {}, None, ep_group, device=torch.device("cpu"))
     step_name, step_diff = _max_diff(ref_params, runtime_params)
 
     if isinstance(zero_plugin, Zero3Plugin):

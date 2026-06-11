@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from distributed_test_utils import moe_named_tensors as _moe_named_tensors
 from helpers import causal_lm_batch
 from models import TinyMoETransformer
 from models.tiny_transformer import RmsNorm
@@ -21,7 +22,7 @@ from parallel import ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.ddp import BucketDataParallelPlugin
-from runtime.plugins.ep import ExpertParallelPlugin, _ExpertParallelMoE
+from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
@@ -77,37 +78,6 @@ def _build_reference(seed: int, dp_size: int, batch_size: int, seq_len: int) -> 
     model = TinyMoETransformer(**_MODEL_KWARGS)
     tokens = torch.cat([_tokens_for_dp(seed, dp_idx, batch_size, seq_len) for dp_idx in range(dp_size)], dim=0)
     return model, tokens
-
-
-def _runtime_local_expert_tensors(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    for module_name, module in model.named_modules():
-        if not isinstance(module, _ExpertParallelMoE):
-            continue
-        for local_idx, global_idx in enumerate(module.local_expert_ids):
-            expert = module.local_experts[local_idx]
-            for param_name, param in expert.named_parameters():
-                tensors[f"{module_name}.experts.{global_idx}.{param_name}"] = param.detach().clone().cpu()
-    return tensors
-
-
-def _runtime_named_params(
-    model: torch.nn.Module,
-    ep_group: dist.ProcessGroup | None,
-) -> dict[str, torch.Tensor]:
-    params: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if ".local_experts." in name:
-            continue
-        params[name] = param.detach().clone().cpu()
-    if ep_group is not None:
-        gathered: list[dict[str, torch.Tensor]] = [None for _ in range(dist.get_world_size(ep_group))]  # type: ignore
-        dist.all_gather_object(gathered, _runtime_local_expert_tensors(model), group=ep_group)
-        for shard in gathered:
-            for name, tensor in shard.items():
-                params[name] = tensor
-    return params
-
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
     dist.init_process_group(
@@ -181,7 +151,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     # Gather params owned by this PP stage (including EP-gathered expert params).
     ep_group = core.get_group(MeshAxis.EP)
-    runtime_params = _runtime_named_params(core.model, ep_group)
+    runtime_params = _moe_named_tensors(core.model, {}, None, ep_group, device=torch.device("cpu"))
 
     # Compare only params owned by this PP stage.
     local_param_diff = 0.0

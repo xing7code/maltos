@@ -1,4 +1,4 @@
-"""Full-stack PP+CP+TP+SP+ZeRO3 checkpoint/resume tests.
+"""Full-stack PP+CP+TP+SP+ZeRO checkpoint/resume tests.
 
 --grad-accum-steps 1  step-boundary checkpoint (default)
 --grad-accum-steps 2  mid-step checkpoint
@@ -14,12 +14,19 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from distributed_test_utils import (
+    max_diff as _max_diff,
+    named_tensors as _named_tensors,
+    normalize_param_name as _normalize_param_name,
+    reduce_loss as _reduce_loss,
+    rule_by_param_name as _rule_by_param_name,
+    supports_bf16_autocast as _supports_bf16_autocast,
+)
 from helpers import causal_lm_batch
 from models import TinyTransformer, TinyTransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ContextParallelAttentionCoreType, ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
-from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
@@ -27,6 +34,8 @@ from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.zero1 import Zero1Plugin
+from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
 from state import load_sharded_checkpoint, save_sharded_checkpoint
 
@@ -59,19 +68,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
-    parser.add_argument("--zero-stage", type=int, choices=(0, 3), default=3)
+    parser.add_argument("--zero-stage", type=int, choices=(0, 1, 2, 3), default=3)
     parser.add_argument("--disable-precision", action="store_true")
     parser.add_argument("--disable-grad-clip", action="store_true")
     return parser.parse_args()
-
-
-def _supports_bf16_autocast() -> bool:
-    try:
-        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-            _ = torch.randn(8, 8) @ torch.randn(8, 8)
-        return True
-    except Exception:
-        return False
 
 
 def _build_reference(seed: int, batch_size: int, seq_len: int) -> tuple[TinyTransformer, torch.Tensor, torch.Tensor]:
@@ -81,63 +81,6 @@ def _build_reference(seed: int, batch_size: int, seq_len: int) -> tuple[TinyTran
         torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len)),
         torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len)),
     )
-
-
-def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[torch.Tensor]:
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, tensor.contiguous(), group=group)
-    return gathered
-
-
-def _rule_by_param_name(model: TinyTransformerTpSp) -> dict[str, str]:
-    rules = {}
-    for rule in model.tpsp_parallelize_spec().rules:
-        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
-            rules[f"{rule.module_path}.weight"] = rule.shard_axis
-            rules[f"{rule.module_path}.bias"] = rule.shard_axis
-    return rules
-
-
-def _logical_tensor(
-    name: str, tensor: torch.Tensor, shard_rules: dict[str, str], tp_group: dist.ProcessGroup | None,
-) -> torch.Tensor:
-    axis = shard_rules.get(name)
-    if axis == TpSpShardAxis.PARAM_OUT:
-        if tp_group is None:
-            return tensor.detach().clone()
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=0)
-    if axis == TpSpShardAxis.PARAM_IN:
-        if tp_group is None:
-            return tensor.detach().clone()
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=1)
-    return tensor.detach().clone()
-
-
-def _logical_named_tensors(
-    model: torch.nn.Module, shard_rules: dict[str, str], tp_group: dist.ProcessGroup | None,
-) -> dict[str, torch.Tensor]:
-    def _norm(n: str) -> str:
-        return n[len("module."):] if n.startswith("module.") else n
-    return {_norm(n): _logical_tensor(_norm(n), p.detach(), shard_rules, tp_group) for n, p in model.named_parameters()}
-
-
-def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tuple[str, float]:
-    worst_name, worst_diff = next(iter(lhs), ""), 0.0
-    for name, t in lhs.items():
-        d = (t - rhs[name]).abs().max().item()
-        if d > worst_diff:
-            worst_name, worst_diff = name, d
-    return worst_name, worst_diff
-
-
-def _reduce_loss(loss: torch.Tensor, core: RuntimeCore) -> torch.Tensor:
-    reduced = loss.detach().clone()
-    if (cp_group := core.get_group(MeshAxis.CP)) is not None:
-        dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=cp_group)
-    if (dp_group := core.get_group(MeshAxis.DP)) is not None:
-        dist.all_reduce(reduced, op=dist.ReduceOp.AVG, group=dp_group)
-    return reduced
-
 
 def _check_bf16_metadata(cont: RuntimeCore, rest: RuntimeCore) -> None:
     if cont.state.metadata.get("loss_scale") is not None:
@@ -152,8 +95,14 @@ def _check_bf16_metadata(cont: RuntimeCore, rest: RuntimeCore) -> None:
 
 def _build_runtime(
     model: TinyTransformerTpSp, args: argparse.Namespace, device: torch.device | None = None,
-) -> tuple[RuntimeCore, Zero3Plugin | None]:
-    zero3 = Zero3Plugin(wrap_cls=_ZERO3_WRAP_CLS) if args.zero_stage == 3 else None
+) -> tuple[RuntimeCore, Zero1Plugin | Zero2Plugin | Zero3Plugin | None]:
+    zero_plugin: Zero1Plugin | Zero2Plugin | Zero3Plugin | None = None
+    if args.zero_stage == 1:
+        zero_plugin = Zero1Plugin(bucket_mb_size=0)
+    elif args.zero_stage == 2:
+        zero_plugin = Zero2Plugin(bucket_mb_size=0)
+    elif args.zero_stage == 3:
+        zero_plugin = Zero3Plugin(wrap_cls=_ZERO3_WRAP_CLS)
     plugins = []
     if args.tp_size > 1:
         plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
@@ -161,8 +110,8 @@ def _build_runtime(
         plugins.append(ContextParallelPlugin())
     if args.pp_size > 1:
         plugins.append(PipelineParallelPlugin(schedule=args.pp_schedule))
-    if zero3 is not None:
-        plugins.append(zero3)
+    if zero_plugin is not None:
+        plugins.append(zero_plugin)
     if not args.disable_precision:
         plugins.append(PrecisionPlugin(compute_dtype=torch.bfloat16))
     if not args.disable_grad_clip:
@@ -181,7 +130,7 @@ def _build_runtime(
         device=device,
     )
     core.setup()
-    return core, zero3
+    return core, zero_plugin
 
 
 def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device | None) -> None:
@@ -189,7 +138,7 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
 
     cont_model = TinyTransformerTpSp(**_MODEL_KWARGS)
     cont_model.load_state_dict(reference_model.state_dict())
-    cont_core, cont_zero3 = _build_runtime(cont_model, args, device)
+    cont_core, cont_zero = _build_runtime(cont_model, args, device)
     rest_core: RuntimeCore | None = None
     try:
         dist.barrier()
@@ -214,7 +163,7 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
 
         rest_model = TinyTransformerTpSp(**_MODEL_KWARGS)
         rest_model.load_state_dict(reference_model.state_dict())
-        rest_core, rest_zero3 = _build_runtime(rest_model, args, device)
+        rest_core, rest_zero = _build_runtime(rest_model, args, device)
         load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
         dist.barrier()
         rest_loss, should_step = rest_core.run_step(causal_lm_batch(local_b))
@@ -225,15 +174,15 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
 
         cont_loss_r = _reduce_loss(cont_loss, cont_core)
         rest_loss_r = _reduce_loss(rest_loss, rest_core)
-        if cont_zero3 is not None:
-            cont_zero3.materialize_model()
-        if rest_zero3 is not None:
-            rest_zero3.materialize_model()
+        if isinstance(cont_zero, Zero3Plugin):
+            cont_zero.materialize_model()
+        if isinstance(rest_zero, Zero3Plugin):
+            rest_zero.materialize_model()
         shard_rules = _rule_by_param_name(cont_model)
         tp_group = cont_core.get_group(MeshAxis.TP)
         param_name, param_diff = _max_diff(
-            _logical_named_tensors(cont_core.model, shard_rules, tp_group),
-            _logical_named_tensors(rest_core.model, shard_rules, tp_group),
+            _named_tensors(cont_core.model, shard_rules, tp_group, normalize_name=_normalize_param_name),
+            _named_tensors(rest_core.model, shard_rules, tp_group, normalize_name=_normalize_param_name),
         )
 
         if rank == 0:
@@ -258,7 +207,7 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
 
     cont_model = TinyTransformerTpSp(**_MODEL_KWARGS)
     cont_model.load_state_dict(reference_model.state_dict())
-    cont_core, cont_zero3 = _build_runtime(cont_model, args, device)
+    cont_core, cont_zero = _build_runtime(cont_model, args, device)
     rest_core: RuntimeCore | None = None
     try:
         dp_idx = rank // (args.pp_size * args.cp_size * args.tp_size)
@@ -286,7 +235,7 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
 
         rest_model = TinyTransformerTpSp(**_MODEL_KWARGS)
         rest_model.load_state_dict(reference_model.state_dict())
-        rest_core, rest_zero3 = _build_runtime(rest_model, args, device)
+        rest_core, rest_zero = _build_runtime(rest_model, args, device)
         load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
         if rest_core.state.step != 0 or rest_core.state.step_context.microbatch_idx != 1:
             raise AssertionError("restored core must recover mid-step state")
@@ -309,15 +258,15 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
         ]
         loss_diffs = [(tag, abs(lhs.item() - rhs.item())) for tag, lhs, rhs in loss_pairs]
 
-        if cont_zero3 is not None:
-            cont_zero3.materialize_model()
-        if rest_zero3 is not None:
-            rest_zero3.materialize_model()
+        if isinstance(cont_zero, Zero3Plugin):
+            cont_zero.materialize_model()
+        if isinstance(rest_zero, Zero3Plugin):
+            rest_zero.materialize_model()
         shard_rules = _rule_by_param_name(cont_model)
         tp_group = cont_core.get_group(MeshAxis.TP)
         param_name, param_diff = _max_diff(
-            _logical_named_tensors(cont_core.model, shard_rules, tp_group),
-            _logical_named_tensors(rest_core.model, shard_rules, tp_group),
+            _named_tensors(cont_core.model, shard_rules, tp_group, normalize_name=_normalize_param_name),
+            _named_tensors(rest_core.model, shard_rules, tp_group, normalize_name=_normalize_param_name),
         )
 
         if rank == 0:

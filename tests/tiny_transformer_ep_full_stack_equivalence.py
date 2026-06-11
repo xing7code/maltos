@@ -9,16 +9,22 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from distributed_test_utils import (
+    max_diff as _max_diff,
+    moe_named_tensors as _moe_named_tensors,
+    moe_zero_named_grads as _moe_zero_named_grads,
+    reduce_loss as _reduce_loss,
+    rule_by_param_name as _rule_by_param_name,
+)
 from helpers import causal_lm_batch
 from models import TinyMoETransformer, TinyMoETransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ContextParallelAttentionCoreType, ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
-from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.core import RuntimePhase
 from runtime.plugins.cp import ContextParallelPlugin
-from runtime.plugins.ep import ExpertParallelPlugin, _ExpertParallelMoE
+from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
@@ -85,201 +91,6 @@ def _build_reference(seed: int, batch_size: int, seq_len: int) -> tuple[TinyMoET
     tokens = torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len))
     model = TinyMoETransformer(**_MODEL_KWARGS)
     return model, tokens
-
-
-def _rule_by_param_name(model: TinyMoETransformerTpSp) -> dict[str, str]:
-    rules = {}
-    for rule in model.tpsp_parallelize_spec().rules:
-        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
-            rules[f"{rule.module_path}.weight"] = rule.shard_axis
-            rules[f"{rule.module_path}.bias"] = rule.shard_axis
-    return rules
-
-
-def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup | None) -> list[torch.Tensor]:
-    if group is None:
-        return [tensor.detach().clone()]
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, tensor.contiguous(), group=group)
-    return gathered
-
-
-def _logical_tensor(
-    name: str,
-    tensor: torch.Tensor,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-) -> torch.Tensor:
-    shard_axis = shard_rules.get(name)
-    if shard_axis == TpSpShardAxis.PARAM_OUT:
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=0)
-    if shard_axis == TpSpShardAxis.PARAM_IN:
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=1)
-    return tensor.detach().clone()
-
-
-def _runtime_local_expert_tensors(model: torch.nn.Module, *, grads: bool) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    for module_name, module in model.named_modules():
-        if not isinstance(module, _ExpertParallelMoE):
-            continue
-        for local_idx, global_idx in enumerate(module.local_expert_ids):
-            expert = module.local_experts[local_idx]
-            for param_name, param in expert.named_parameters():
-                full_name = f"{module_name}.experts.{global_idx}.{param_name}"
-                source = param.grad if grads else param.detach()
-                if source is None:
-                    source = torch.zeros_like(param)
-                tensors[full_name] = source.detach().clone().cpu()
-    return tensors
-
-
-def _gather_object_dict(local: dict[str, torch.Tensor], group: dist.ProcessGroup | None) -> dict[str, torch.Tensor]:
-    if group is None:
-        return local
-    gathered: list[dict[str, torch.Tensor]] = [None for _ in range(dist.get_world_size(group))]  # type: ignore[list-item]
-    dist.all_gather_object(gathered, local, group=group)
-    merged: dict[str, torch.Tensor] = {}
-    for shard in gathered:
-        merged.update(shard)
-    return merged
-
-
-def _bucket_grad_by_param_id(
-    zero_plugin: Zero2Plugin | Zero3Plugin,
-) -> dict[int, torch.Tensor]:
-    """Build {id(param): full_grad_cpu} from ZeRO2/3 bucket data after PRE_STEP.
-
-    param.grad after PRE_STEP only reflects the last micro-batch's grad_buffer
-    (per-exec_state design). local_param.grad is the accumulated shard across
-    all micro-batches. All-gather over the shard group to recover the full grad.
-    """
-    result: dict[int, torch.Tensor] = {}
-    for bucket in zero_plugin.buckets:
-        if bucket.local_param.grad is None:
-            continue
-        shard_group = bucket.group_context.group
-        if shard_group is not None:
-            full_grad = torch.cat(_all_gather_tensor(bucket.local_param.grad.detach(), shard_group), dim=0)
-        else:
-            full_grad = bucket.local_param.grad.detach().clone()
-        if hasattr(bucket, "param_numels"):  # ZeRO3
-            offset = 0
-            for param, numel, shape in zip(bucket.params, bucket.param_numels, bucket.param_shapes):
-                result[id(param)] = full_grad[offset : offset + numel].view(shape).cpu()
-                offset += numel
-        else:  # ZeRO2
-            offset = 0
-            for param in bucket.params:
-                numel = param.numel()
-                result[id(param)] = full_grad[offset : offset + numel].view(param.shape).cpu()
-                offset += numel
-    return result
-
-
-def _logical_named_grads_ep_zero23(
-    core: "RuntimeCore",
-    zero_plugin: Zero2Plugin | Zero3Plugin,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-    pp_group: dist.ProcessGroup | None,
-    ep_group: dist.ProcessGroup | None,
-    *,
-    pp_partitioned: bool,
-) -> dict[str, torch.Tensor]:
-    """Gradient comparison helper for ZeRO2/3: reads from local_param.grad, not param.grad."""
-    device = next(core.model.parameters()).device
-    grad_by_pid = _bucket_grad_by_param_id(zero_plugin)
-
-    shared_tensors: dict[str, torch.Tensor] = {}
-    for name, param in core.model.named_parameters():
-        if ".local_experts." in name:
-            continue
-        grad = grad_by_pid.get(id(param), torch.zeros_like(param).cpu())
-        shared_tensors[name] = _logical_tensor(name, grad.to(device), shard_rules, tp_group).cpu()
-    if pp_partitioned:
-        shared_tensors = _gather_object_dict(shared_tensors, pp_group)
-    tensors = {name: tensor.to(device) for name, tensor in shared_tensors.items()}
-
-    expert_tensors: dict[str, torch.Tensor] = {}
-    for module_name, module in core.model.named_modules():
-        if not isinstance(module, _ExpertParallelMoE):
-            continue
-        for local_idx, global_idx in enumerate(module.local_expert_ids):
-            expert = module.local_experts[local_idx]
-            for param_name, param in expert.named_parameters():
-                full_name = f"{module_name}.experts.{global_idx}.{param_name}"
-                expert_tensors[full_name] = grad_by_pid.get(id(param), torch.zeros_like(param).cpu())
-    expert_tensors = _gather_object_dict(expert_tensors, ep_group)
-    if pp_partitioned:
-        expert_tensors = _gather_object_dict(expert_tensors, pp_group)
-    for name, tensor in expert_tensors.items():
-        tensors[name] = tensor.to(device)
-    return tensors
-
-
-def _logical_named_tensors(
-    model: torch.nn.Module,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-    pp_group: dist.ProcessGroup | None,
-    ep_group: dist.ProcessGroup | None,
-    *,
-    grads: bool,
-    pp_partitioned: bool,
-) -> dict[str, torch.Tensor]:
-    device = next(model.parameters()).device
-    shared_tensors: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if ".local_experts." in name:
-            continue
-        source = param.grad if grads else param.detach()
-        if source is None:
-            source = torch.zeros_like(param)
-        shared_tensors[name] = _logical_tensor(name, source.detach(), shard_rules, tp_group).cpu()
-    if pp_partitioned:
-        shared_tensors = _gather_object_dict(shared_tensors, pp_group)
-    tensors = {name: tensor.to(device) for name, tensor in shared_tensors.items()}
-
-    expert_tensors = _gather_object_dict(_runtime_local_expert_tensors(model, grads=grads), ep_group)
-    if pp_partitioned:
-        expert_tensors = _gather_object_dict(expert_tensors, pp_group)
-    for name, tensor in expert_tensors.items():
-        tensors[name] = tensor.to(device)
-    return tensors
-
-
-def _baseline_named_tensors(model: torch.nn.Module, *, grads: bool) -> dict[str, torch.Tensor]:
-    tensors = {}
-    for name, param in model.named_parameters():
-        source = param.grad if grads else param.detach()
-        if source is None:
-            source = torch.zeros_like(param)
-        tensors[name] = source.detach().clone()
-    return tensors
-
-
-def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tuple[str, float]:
-    worst_name = ""
-    worst_diff = 0.0
-    for name, lhs_tensor in lhs.items():
-        rhs_tensor = rhs[name].to(lhs_tensor.device, lhs_tensor.dtype)
-        diff = (lhs_tensor - rhs_tensor).abs().max().item()
-        if diff > worst_diff:
-            worst_name = name
-            worst_diff = diff
-    return worst_name, worst_diff
-
-
-def _reduce_loss(loss: torch.Tensor, core: RuntimeCore) -> torch.Tensor:
-    reduced = loss.detach().clone()
-    cp_group = core.get_group(MeshAxis.CP)
-    dp_group = core.get_group(MeshAxis.DP)
-    if cp_group is not None:
-        dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=cp_group)
-    if dp_group is not None:
-        dist.all_reduce(reduced, op=dist.ReduceOp.AVG, group=dp_group)
-    return reduced
 
 
 def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
@@ -393,22 +204,42 @@ def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = 
         runtime_pp_partitioned = any(isinstance(plugin, PipelineParallelPlugin) for plugin in runtime_core.plugins)
 
         if baseline_zero23 is not None:
-            baseline_grads = _logical_named_grads_ep_zero23(
-                baseline_core, baseline_zero23, shard_rules, baseline_tp_group,
-                baseline_pp_group, baseline_ep_group, pp_partitioned=baseline_pp_partitioned,
+            baseline_grads = _moe_zero_named_grads(
+                baseline_core.model,
+                baseline_zero23,
+                shard_rules,
+                baseline_tp_group,
+                baseline_ep_group,
+                pp_group=baseline_pp_group,
+                pp_partitioned=baseline_pp_partitioned,
             )
-            runtime_grads = _logical_named_grads_ep_zero23(
-                runtime_core, runtime_zero23, shard_rules, runtime_tp_group,
-                runtime_pp_group, runtime_ep_group, pp_partitioned=runtime_pp_partitioned,
+            runtime_grads = _moe_zero_named_grads(
+                runtime_core.model,
+                runtime_zero23,
+                shard_rules,
+                runtime_tp_group,
+                runtime_ep_group,
+                pp_group=runtime_pp_group,
+                pp_partitioned=runtime_pp_partitioned,
             )
         else:
-            baseline_grads = _logical_named_tensors(
-                baseline_core.model, shard_rules, baseline_tp_group,
-                baseline_pp_group, baseline_ep_group, grads=True, pp_partitioned=baseline_pp_partitioned,
+            baseline_grads = _moe_named_tensors(
+                baseline_core.model,
+                shard_rules,
+                baseline_tp_group,
+                baseline_ep_group,
+                pp_group=baseline_pp_group,
+                grads=True,
+                pp_partitioned=baseline_pp_partitioned,
             )
-            runtime_grads = _logical_named_tensors(
-                runtime_core.model, shard_rules, runtime_tp_group,
-                runtime_pp_group, runtime_ep_group, grads=True, pp_partitioned=runtime_pp_partitioned,
+            runtime_grads = _moe_named_tensors(
+                runtime_core.model,
+                shard_rules,
+                runtime_tp_group,
+                runtime_ep_group,
+                pp_group=runtime_pp_group,
+                grads=True,
+                pp_partitioned=runtime_pp_partitioned,
             )
         grad_name, grad_diff = _max_diff(baseline_grads, runtime_grads)
 
@@ -419,22 +250,20 @@ def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = 
             baseline_zero3.materialize_model()
         if runtime_zero3 is not None:
             runtime_zero3.materialize_model()
-        baseline_params = _logical_named_tensors(
+        baseline_params = _moe_named_tensors(
             baseline_core.model,
             shard_rules,
             baseline_tp_group,
-            baseline_pp_group,
             baseline_ep_group,
-            grads=False,
+            pp_group=baseline_pp_group,
             pp_partitioned=baseline_pp_partitioned,
         )
-        runtime_params = _logical_named_tensors(
+        runtime_params = _moe_named_tensors(
             runtime_core.model,
             shard_rules,
             runtime_tp_group,
-            runtime_pp_group,
             runtime_ep_group,
-            grads=False,
+            pp_group=runtime_pp_group,
             pp_partitioned=runtime_pp_partitioned,
         )
         step_name, step_diff = _max_diff(baseline_params, runtime_params)

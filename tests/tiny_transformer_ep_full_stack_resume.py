@@ -14,15 +14,21 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from distributed_test_utils import (
+    max_diff as _max_diff,
+    moe_named_tensors as _moe_named_tensors,
+    reduce_loss as _reduce_loss,
+    rule_by_param_name as _rule_by_param_name,
+    supports_bf16_autocast as _supports_bf16_autocast,
+)
 from helpers import causal_lm_batch
 from models import TinyMoETransformer, TinyMoETransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ContextParallelAttentionCoreType, ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
-from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.cp import ContextParallelPlugin
-from runtime.plugins.ep import ExpertParallelPlugin, _ExpertParallelMoE
+from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.precision import PrecisionPlugin
@@ -71,16 +77,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-grad-clip", action="store_true")
     return parser.parse_args()
 
-
-def _supports_bf16_autocast() -> bool:
-    try:
-        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-            _ = torch.randn(8, 8) @ torch.randn(8, 8)
-        return True
-    except Exception:
-        return False
-
-
 def _build_reference(
     seed: int, batch_size: int, seq_len: int,
 ) -> tuple[TinyMoETransformer, torch.Tensor, torch.Tensor]:
@@ -90,104 +86,6 @@ def _build_reference(
         torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len)),
         torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len)),
     )
-
-
-def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[torch.Tensor]:
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, tensor.contiguous(), group=group)
-    return gathered
-
-
-def _rule_by_param_name(model: TinyMoETransformerTpSp) -> dict[str, str]:
-    rules = {}
-    for rule in model.tpsp_parallelize_spec().rules:
-        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
-            rules[f"{rule.module_path}.weight"] = rule.shard_axis
-            rules[f"{rule.module_path}.bias"] = rule.shard_axis
-    return rules
-
-
-def _logical_tensor(
-    name: str, tensor: torch.Tensor, shard_rules: dict[str, str], tp_group: dist.ProcessGroup | None,
-) -> torch.Tensor:
-    axis = shard_rules.get(name)
-    if axis == TpSpShardAxis.PARAM_OUT:
-        if tp_group is None:
-            return tensor.detach().clone()
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=0)
-    if axis == TpSpShardAxis.PARAM_IN:
-        if tp_group is None:
-            return tensor.detach().clone()
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=1)
-    return tensor.detach().clone()
-
-
-def _runtime_local_expert_tensors(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    for module_name, module in model.named_modules():
-        if not isinstance(module, _ExpertParallelMoE):
-            continue
-        for local_idx, global_idx in enumerate(module.local_expert_ids):
-            expert = module.local_experts[local_idx]
-            for param_name, param in expert.named_parameters():
-                tensors[f"{module_name}.experts.{global_idx}.{param_name}"] = param.detach().clone().cpu()
-    return tensors
-
-
-def _gather_object_dict(
-    local: dict[str, torch.Tensor], group: dist.ProcessGroup | None,
-) -> dict[str, torch.Tensor]:
-    if group is None:
-        return local
-    gathered: list[dict[str, torch.Tensor]] = [None for _ in range(dist.get_world_size(group))]  # type: ignore[list-item]
-    dist.all_gather_object(gathered, local, group=group)
-    merged: dict[str, torch.Tensor] = {}
-    for shard in gathered:
-        merged.update(shard)
-    return merged
-
-
-def _logical_named_tensors(
-    model: torch.nn.Module,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-    pp_group: dist.ProcessGroup | None,
-    ep_group: dist.ProcessGroup | None,
-    device: torch.device | None,
-) -> dict[str, torch.Tensor]:
-    shared: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if ".local_experts." in name:
-            continue
-        shared[name] = _logical_tensor(name, param.detach(), shard_rules, tp_group).cpu()
-    tensors = {
-        n: t.to(device) if device is not None else t
-        for n, t in _gather_object_dict(shared, pp_group).items()
-    }
-    expert_tensors = _gather_object_dict(_runtime_local_expert_tensors(model), ep_group)
-    expert_tensors = _gather_object_dict(expert_tensors, pp_group)
-    for name, tensor in expert_tensors.items():
-        tensors[name] = tensor.to(device) if device is not None else tensor
-    return tensors
-
-
-def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tuple[str, float]:
-    worst_name, worst_diff = next(iter(lhs), ""), 0.0
-    for name, t in lhs.items():
-        d = (t - rhs[name]).abs().max().item()
-        if d > worst_diff:
-            worst_name, worst_diff = name, d
-    return worst_name, worst_diff
-
-
-def _reduce_loss(loss: torch.Tensor, core: RuntimeCore) -> torch.Tensor:
-    reduced = loss.detach().clone()
-    if (cp_group := core.get_group(MeshAxis.CP)) is not None:
-        dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=cp_group)
-    if (dp_group := core.get_group(MeshAxis.DP)) is not None:
-        dist.all_reduce(reduced, op=dist.ReduceOp.AVG, group=dp_group)
-    return reduced
-
 
 def _check_bf16_metadata(cont: RuntimeCore, rest: RuntimeCore) -> None:
     if cont.state.metadata.get("loss_scale") is not None:
@@ -253,8 +151,24 @@ def _compare_params(
     tp_group = cont_core.get_group(MeshAxis.TP)
     pp_group = cont_core.get_group(MeshAxis.PP)
     ep_group = cont_core.get_group(MeshAxis.EP)
-    cont_params = _logical_named_tensors(cont_core.model, shard_rules, tp_group, pp_group, ep_group, device)
-    rest_params = _logical_named_tensors(rest_core.model, shard_rules, tp_group, pp_group, ep_group, device)
+    cont_params = _moe_named_tensors(
+        cont_core.model,
+        shard_rules,
+        tp_group,
+        ep_group,
+        pp_group=pp_group,
+        pp_partitioned=pp_group is not None,
+        device=device,
+    )
+    rest_params = _moe_named_tensors(
+        rest_core.model,
+        shard_rules,
+        tp_group,
+        ep_group,
+        pp_group=pp_group,
+        pp_partitioned=pp_group is not None,
+        device=device,
+    )
     return _max_diff(cont_params, rest_params)
 
 

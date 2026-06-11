@@ -130,11 +130,11 @@ class RuntimeCore:
     optimizer_factory: OptimizerFactory | None = None
     scheduler_factory: SchedulerFactory | None = None
     plugins: list[RuntimePlugin] = field(default_factory=list)
-    group_manager: ProcessGroupManager | None = None
     state_manager: StateManager = field(default_factory=StateManager)
     state: RuntimeState = field(default_factory=RuntimeState)
     optimizer: torch.optim.Optimizer | None = field(default=None, init=False)
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False)
+    _group_manager: ProcessGroupManager | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
     _post_grad_reduction_callbacks: list[
         tuple[Callable[[torch.Tensor], "dist.Work | None"], "ParamRole | None"]
@@ -187,8 +187,7 @@ class RuntimeCore:
             grad_accum_steps=self.grad_accum_steps,
         )
         self._validate_mesh_and_plan()
-        if self.group_manager is None:
-            self.group_manager = ProcessGroupManager.from_plan(self.plan, self.mesh)
+        self._group_manager = ProcessGroupManager.from_plan(self.plan, self.mesh)
         self.plugins = self._resolve_plugin_order(self.plugins)
 
     def setup(self) -> None:
@@ -206,14 +205,26 @@ class RuntimeCore:
         self._populate_static_model_metrics()
         self._maybe_build_runtime_optimizer()
         self._validate_optimizer_owner()
+
     def close(self) -> None:
         if self._closed:
             return
-        for plugin in reversed(self.plugins):
-            plugin.close()
-        if self.group_manager is not None:
-            self.group_manager.close()
-        self._closed = True
+        errors: list[BaseException] = []
+        try:
+            for plugin in reversed(self.plugins):
+                try:
+                    plugin.close()
+                except BaseException as exc:
+                    errors.append(exc)
+        finally:
+            if self._group_manager is not None:
+                try:
+                    self._group_manager.close()
+                except BaseException as exc:
+                    errors.append(exc)
+            self._closed = True
+        if errors:
+            raise ExceptionGroup("RuntimeCore.close() failed", errors)
 
     def run_step(self, batch: Any) -> tuple[torch.Tensor, bool]:
         if self.device is not None:
@@ -263,8 +274,8 @@ class RuntimeCore:
         self._run_phase(RuntimePhase.POST_BACKWARD)
 
     def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:
-        assert self.group_manager is not None
-        return self.group_manager.get_group(axis)
+        assert self._group_manager is not None
+        return self._group_manager.get_group(axis)
 
     def mark_module_path_omitted(self, path: str) -> None:
         self.state.omitted_module_paths.add(path)

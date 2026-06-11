@@ -3,7 +3,6 @@
 #
 # CPU (default):  ./tests/run_matrix.sh
 # GPU (nccl):     BACKEND=nccl ./tests/run_matrix.sh
-# GPU merged:     BACKEND=nccl MERGE=true ./tests/run_matrix.sh
 #
 # Full-stack matrix: 4-choose-3 from {dp, pp, cp, tp}, each=2, world=8.
 # ep=dp*cp*tp (max expert sharding, no extra ranks).
@@ -16,7 +15,6 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 BACKEND="${BACKEND:-gloo}"
-MERGE="${MERGE:-false}"
 export PYTHONPATH="${PYTHONPATH:-.}"
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-180}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-180}"
@@ -157,177 +155,8 @@ echo "=== pretraining loader + tp+sp+zero3+bf16+clip+accum2 checkpoint resume ==
 fi  # BACKEND=gloo
 
 # ── Full-stack matrix (backend: ${BACKEND}) ─────────────────────────────────────
-
-if [ "${BACKEND}" = "nccl" ] && [ "${MERGE}" = "true" ]; then
-  echo "=== full-stack nccl matrix (single init) ==="
-  "${PYTHON_BIN}" tests/tiny_transformer_nccl_full_stack_matrix.py \
-    --backend "${BACKEND}" \
-    --world-size 8
-  echo "=== matrix PASS ==="
-  exit 0
-fi
-
-# ── A: dp=2 pp=2 cp=2 tp=1, world=8 ───────────────────────────────────────────
-echo "=== [A] dp=2 pp=2 cp=2 tp=1 (world=8) ==="
-for z in 0 1 2 3; do
-  "${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py \
-    --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 \
-    --zero-stage "${z}" --cp-attn-core ring
-done
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 \
-  --pp-schedule 1f1b --zero-stage 3 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 \
-  --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 \
-  --pp-schedule 1f1b --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 \
-  --grad-accum-steps 2 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 \
-  --pp-schedule 1f1b --grad-accum-steps 2 --cp-attn-core ring
-# EP (ep=4)
-for z in 0 1 2 3; do
-  "${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
-    --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-    --zero-stage "${z}" --cp-attn-core ring
-done
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --pp-schedule 1f1b --zero-stage 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --pp-schedule 1f1b --zero-stage 2 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --pp-schedule 1f1b --zero-stage 3 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --zero-stage 1 --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --zero-stage 2 --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --zero-stage 1 --pp-schedule 1f1b --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --zero-stage 2 --pp-schedule 1f1b --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --pp-schedule 1f1b --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --zero-stage 1 --grad-accum-steps 2 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --zero-stage 2 --grad-accum-steps 2 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 2 --tp-size 1 --ep-size 4 \
-  --grad-accum-steps 2 --cp-attn-core ring
-
-# ── B: dp=2 pp=2 cp=1 tp=2, world=8 ───────────────────────────────────────────
-echo "=== [B] dp=2 pp=2 cp=1 tp=2 (world=8) ==="
-for z in 0 1 2 3; do
-  "${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py \
-    --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 --zero-stage "${z}"
-done
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 \
-  --pp-schedule 1f1b --zero-stage 3
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 --grad-accum-steps 1
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 \
-  --pp-schedule 1f1b --grad-accum-steps 1
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 --grad-accum-steps 2
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 \
-  --pp-schedule 1f1b --grad-accum-steps 2
-# EP (ep=4)
-for z in 0 1 2 3; do
-  "${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
-    --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 --ep-size 4 \
-    --zero-stage "${z}"
-done
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 --ep-size 4 \
-  --pp-schedule 1f1b --zero-stage 3
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 --ep-size 4 \
-  --grad-accum-steps 1
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 --ep-size 4 \
-  --pp-schedule 1f1b --grad-accum-steps 1
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 2 --cp-size 1 --tp-size 2 --ep-size 4 \
-  --grad-accum-steps 2
-
-# ── C: dp=2 pp=1 cp=2 tp=2, world=8 ───────────────────────────────────────────
-echo "=== [C] dp=2 pp=1 cp=2 tp=2 (world=8) ==="
-for z in 0 1 2 3; do
-  "${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py \
-    --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 1 --cp-size 2 --tp-size 2 \
-    --zero-stage "${z}" --cp-attn-core ring
-done
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 1 --cp-size 2 --tp-size 2 \
-  --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 1 --cp-size 2 --tp-size 2 \
-  --grad-accum-steps 2 --cp-attn-core ring
-# EP (ep=8)
-for z in 0 1 2 3; do
-  "${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
-    --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 1 --cp-size 2 --tp-size 2 --ep-size 8 \
-    --zero-stage "${z}" --cp-attn-core ring
-done
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 1 --cp-size 2 --tp-size 2 --ep-size 8 \
-  --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 2 --pp-size 1 --cp-size 2 --tp-size 2 --ep-size 8 \
-  --grad-accum-steps 2 --cp-attn-core ring
-
-# ── D: dp=1 pp=2 cp=2 tp=2, world=8 (dp=1 → zero0 only) ───────────────────────
-echo "=== [D] dp=1 pp=2 cp=2 tp=2 (world=8, dp=1) ==="
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 1 --pp-size 2 --cp-size 2 --tp-size 2 \
-  --zero-stage 0 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_equivalence.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 1 --pp-size 2 --cp-size 2 --tp-size 2 \
-  --pp-schedule 1f1b --zero-stage 0 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 1 --pp-size 2 --cp-size 2 --tp-size 2 \
-  --zero-stage 0 --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 1 --pp-size 2 --cp-size 2 --tp-size 2 \
-  --zero-stage 0 --pp-schedule 1f1b --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 1 --pp-size 2 --cp-size 2 --tp-size 2 \
-  --zero-stage 0 --grad-accum-steps 2 --global-batch-size 4 --cp-attn-core ring
-# EP (ep=4, dp=1)
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 1 --pp-size 2 --cp-size 2 --tp-size 2 --ep-size 4 \
-  --zero-stage 0 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_equivalence.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 1 --pp-size 2 --cp-size 2 --tp-size 2 --ep-size 4 \
-  --pp-schedule 1f1b --zero-stage 0 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 1 --pp-size 2 --cp-size 2 --tp-size 2 --ep-size 4 \
-  --zero-stage 0 --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 1 --pp-size 2 --cp-size 2 --tp-size 2 --ep-size 4 \
-  --zero-stage 0 --pp-schedule 1f1b --grad-accum-steps 1 --cp-attn-core ring
-"${PYTHON_BIN}" tests/tiny_transformer_ep_full_stack_resume.py \
-  --backend "${BACKEND}" --world-size 8 --dp-size 1 --pp-size 2 --cp-size 2 --tp-size 2 --ep-size 4 \
-  --zero-stage 0 --grad-accum-steps 2 --global-batch-size 4 --cp-attn-core ring
-
+echo "=== full-stack matrix (backend=${BACKEND}) ==="
+"${PYTHON_BIN}" tests/tiny_transformer_full_stack_matrix_runner.py \
+  --backend "${BACKEND}" \
+  --world-size 8
 echo "=== matrix PASS ==="

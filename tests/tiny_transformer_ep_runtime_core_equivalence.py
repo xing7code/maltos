@@ -9,15 +9,22 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from distributed_test_utils import (
+    max_diff as _max_diff,
+    moe_named_tensors as _moe_named_tensors,
+    moe_zero_named_grads as _moe_zero_named_grads,
+    named_tensors as _named_tensors,
+    reduce_loss as _reduce_loss,
+    rule_by_param_name as _rule_by_param_name,
+)
 from helpers import causal_lm_batch
 from models import TinyMoETransformer, TinyMoETransformerTp, TinyMoETransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
-from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.core import RuntimePhase
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
-from runtime.plugins.ep import ExpertParallelPlugin, _ExpertParallelMoE
+from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
@@ -91,170 +98,6 @@ def _build_reference(seed: int, dp_size: int, batch_size: int, seq_len: int) -> 
     model = TinyMoETransformer(**_MODEL_KWARGS)
     tokens = torch.cat([_tokens_for_dp(seed, dp_idx, batch_size, seq_len) for dp_idx in range(dp_size)], dim=0)
     return model, tokens
-
-
-def _rule_by_param_name(model: TinyMoETransformer) -> dict[str, str]:
-    if not hasattr(model, "tpsp_parallelize_spec"):
-        return {}
-    rules = {}
-    for rule in model.tpsp_parallelize_spec().rules:
-        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
-            rules[f"{rule.module_path}.weight"] = rule.shard_axis
-            rules[f"{rule.module_path}.bias"] = rule.shard_axis
-    return rules
-
-
-def _all_gather_tensor(tensor: torch.Tensor, group: dist.ProcessGroup | None) -> list[torch.Tensor]:
-    if group is None:
-        return [tensor.detach().clone()]
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, tensor.contiguous(), group=group)
-    return gathered
-
-
-def _logical_tensor(
-    name: str,
-    tensor: torch.Tensor,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-) -> torch.Tensor:
-    shard_axis = shard_rules.get(name)
-    if shard_axis == TpSpShardAxis.PARAM_OUT:
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=0)
-    if shard_axis == TpSpShardAxis.PARAM_IN:
-        return torch.cat(_all_gather_tensor(tensor, tp_group), dim=1)
-    return tensor.detach().clone()
-
-
-def _runtime_local_expert_tensors(model: torch.nn.Module, *, grads: bool) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    for module_name, module in model.named_modules():
-        if not isinstance(module, _ExpertParallelMoE):
-            continue
-        for local_idx, global_idx in enumerate(module.local_expert_ids):
-            expert = module.local_experts[local_idx]
-            for param_name, param in expert.named_parameters():
-                full_name = f"{module_name}.experts.{global_idx}.{param_name}"
-                if grads:
-                    tensor = param.grad.detach().clone() if param.grad is not None else torch.zeros_like(param)
-                else:
-                    tensor = param.detach().clone()
-                tensors[full_name] = tensor.cpu()
-    return tensors
-
-
-def _bucket_grad_by_param_id(
-    zero_plugin: Zero1Plugin | Zero2Plugin | Zero3Plugin,
-) -> dict[int, torch.Tensor]:
-    result: dict[int, torch.Tensor] = {}
-    for bucket in zero_plugin.buckets:
-        if bucket.local_param.grad is None:
-            continue
-        shard_group = bucket.group_context.group
-        if shard_group is not None:
-            full_grad = torch.cat(_all_gather_tensor(bucket.local_param.grad.detach(), shard_group), dim=0)
-        else:
-            full_grad = bucket.local_param.grad.detach().clone()
-        if hasattr(bucket, "param_numels"):
-            offset = 0
-            for param, numel, shape in zip(bucket.params, bucket.param_numels, bucket.param_shapes):
-                result[id(param)] = full_grad[offset : offset + numel].view(shape).cpu()
-                offset += numel
-            continue
-        offset = 0
-        for param in bucket.params:
-            numel = param.numel()
-            result[id(param)] = full_grad[offset : offset + numel].view(param.shape).cpu()
-            offset += numel
-    return result
-
-
-def _runtime_local_expert_zero_grads(
-    model: torch.nn.Module,
-    grad_by_pid: dict[int, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    for module_name, module in model.named_modules():
-        if not isinstance(module, _ExpertParallelMoE):
-            continue
-        for local_idx, global_idx in enumerate(module.local_expert_ids):
-            expert = module.local_experts[local_idx]
-            for param_name, param in expert.named_parameters():
-                full_name = f"{module_name}.experts.{global_idx}.{param_name}"
-                tensors[full_name] = grad_by_pid.get(id(param), torch.zeros_like(param).cpu())
-    return tensors
-
-
-def _runtime_logical_named_tensors(
-    model: torch.nn.Module,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-    ep_group: dist.ProcessGroup | None,
-    *,
-    grads: bool,
-) -> dict[str, torch.Tensor]:
-    tensors = {}
-    for name, param in model.named_parameters():
-        if ".local_experts." in name:
-            continue
-        source = param.grad if grads else param.detach()
-        if source is None:
-            source = torch.zeros_like(param)
-        tensors[name] = _logical_tensor(name, source.detach(), shard_rules, tp_group)
-    if ep_group is not None:
-        gathered: list[dict[str, torch.Tensor]] = [None for _ in range(dist.get_world_size(ep_group))]  # type: ignore[list-item]
-        dist.all_gather_object(gathered, _runtime_local_expert_tensors(model, grads=grads), group=ep_group)
-        for shard in gathered:
-            for name, tensor in shard.items():
-                tensors[name] = tensor.to(next(model.parameters()).device)
-    return tensors
-
-
-def _runtime_logical_named_zero_grads(
-    model: torch.nn.Module,
-    zero_plugin: Zero1Plugin | Zero2Plugin | Zero3Plugin,
-    shard_rules: dict[str, str],
-    tp_group: dist.ProcessGroup | None,
-    ep_group: dist.ProcessGroup | None,
-) -> dict[str, torch.Tensor]:
-    device = next(model.parameters()).device
-    grad_by_pid = _bucket_grad_by_param_id(zero_plugin)
-    tensors: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if ".local_experts." in name:
-            continue
-        grad = grad_by_pid.get(id(param), torch.zeros_like(param).cpu())
-        tensors[name] = _logical_tensor(name, grad.to(device), shard_rules, tp_group)
-    if ep_group is not None:
-        gathered: list[dict[str, torch.Tensor]] = [None for _ in range(dist.get_world_size(ep_group))]  # type: ignore[list-item]
-        dist.all_gather_object(gathered, _runtime_local_expert_zero_grads(model, grad_by_pid), group=ep_group)
-        for shard in gathered:
-            for name, tensor in shard.items():
-                tensors[name] = tensor.to(device)
-    return tensors
-
-
-def _baseline_named_tensors(model: torch.nn.Module, *, grads: bool) -> dict[str, torch.Tensor]:
-    tensors = {}
-    for name, param in model.named_parameters():
-        source = param.grad if grads else param.detach()
-        if source is None:
-            source = torch.zeros_like(param)
-        tensors[name] = source.detach().clone()
-    return tensors
-
-
-def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tuple[str, float]:
-    worst_name = ""
-    worst_diff = 0.0
-    for name, lhs_tensor in lhs.items():
-        rhs_tensor = rhs[name].to(lhs_tensor.device, lhs_tensor.dtype)
-        diff = (lhs_tensor - rhs_tensor).abs().max().item()
-        if diff > worst_diff:
-            worst_name = name
-            worst_diff = diff
-    return worst_name, worst_diff
-
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
     dist.init_process_group(
@@ -337,10 +180,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     loss, should_step = core.run_step(causal_lm_batch(local_tokens))
     if not should_step:
         raise AssertionError("EP equivalence test expected should_step=True")
-    runtime_loss = loss.detach().clone()
-    dp_group = core.get_group(MeshAxis.DP)
-    if dp_group is not None:
-        dist.all_reduce(runtime_loss, op=dist.ReduceOp.AVG, group=dp_group)
+    runtime_loss = _reduce_loss(loss, core)
 
     # Some plugin paths intentionally launch async grad sync in POST_BACKWARD and
     # only guarantee completion by PRE_STEP. Flush that boundary before comparing
@@ -350,11 +190,11 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     shard_rules = _rule_by_param_name(sharded_model)
     tp_group = core.get_group(MeshAxis.TP)
     ep_group = core.get_group(MeshAxis.EP)
-    baseline_grads = _baseline_named_tensors(baseline_model, grads=True)
+    baseline_grads = _named_tensors(baseline_model, {}, None, grads=True)
     runtime_grads = (
-        _runtime_logical_named_zero_grads(core.model, zero_plugin, shard_rules, tp_group, ep_group)
+        _moe_zero_named_grads(core.model, zero_plugin, shard_rules, tp_group, ep_group)
         if zero_plugin is not None
-        else _runtime_logical_named_tensors(core.model, shard_rules, tp_group, ep_group, grads=True)
+        else _moe_named_tensors(core.model, shard_rules, tp_group, ep_group, grads=True)
     )
     grad_name, grad_diff = _max_diff(baseline_grads, runtime_grads)
 
@@ -363,8 +203,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
 
     if zero_plugin is not None and isinstance(zero_plugin, Zero3Plugin):
         zero_plugin.materialize_model()
-    baseline_params = _baseline_named_tensors(baseline_model, grads=False)
-    runtime_params = _runtime_logical_named_tensors(core.model, shard_rules, tp_group, ep_group, grads=False)
+    baseline_params = _named_tensors(baseline_model, {}, None)
+    runtime_params = _moe_named_tensors(core.model, shard_rules, tp_group, ep_group)
     step_name, step_diff = _max_diff(baseline_params, runtime_params)
     if zero_plugin is not None and isinstance(zero_plugin, Zero3Plugin):
         zero_plugin.reshard_model()

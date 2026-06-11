@@ -22,9 +22,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from distributed_test_utils import (
+    max_diff as _max_diff,
+    named_tensors as _named_tensors,
+    rule_by_param_name as _rule_by_param_name,
+)
 from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
 from helpers import causal_lm_batch
-from parallel.specs import TpSpShardAxis
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
 from runtime.plugins.sp import SequenceParallelPlugin
@@ -84,61 +88,6 @@ def _baseline_loss(model: TinyTransformer, tokens: torch.Tensor) -> float:
         loss = model(causal_lm_batch(tokens))
     return loss.item()
 
-
-def _rule_by_param_name(model: TinyTransformer) -> dict[str, str]:
-    if not hasattr(model, "tpsp_parallelize_spec"):
-        return {}
-    rules = {}
-    for rule in model.tpsp_parallelize_spec().rules:
-        if rule.shard_axis in (TpSpShardAxis.PARAM_OUT, TpSpShardAxis.PARAM_IN):
-            rules[f"{rule.module_path}.weight"] = rule.shard_axis
-            rules[f"{rule.module_path}.bias"] = rule.shard_axis
-    return rules
-
-
-def _all_gather_tensor(tensor: torch.Tensor) -> list[torch.Tensor]:
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, tensor.contiguous())
-    return gathered
-
-
-def _logical_tensor(name: str, tensor: torch.Tensor, shard_rules: dict[str, str]) -> torch.Tensor:
-    shard_axis = shard_rules.get(name)
-    if shard_axis == TpSpShardAxis.PARAM_OUT:
-        return torch.cat(_all_gather_tensor(tensor), dim=0)
-    if shard_axis == TpSpShardAxis.PARAM_IN:
-        return torch.cat(_all_gather_tensor(tensor), dim=1)
-    return tensor.detach().clone()
-
-
-def _logical_named_tensors(model: torch.nn.Module, shard_rules: dict[str, str]) -> dict[str, torch.Tensor]:
-    return {
-        name: _logical_tensor(name, param.detach(), shard_rules)
-        for name, param in model.named_parameters()
-    }
-
-
-def _logical_named_grads(model: torch.nn.Module, shard_rules: dict[str, str]) -> dict[str, torch.Tensor]:
-    grads = {}
-    for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
-        grads[name] = _logical_tensor(name, param.grad.detach(), shard_rules)
-    return grads
-
-
-def _max_diff(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> tuple[str, float]:
-    worst_name = ""
-    worst_diff = 0.0
-    for name, lhs_tensor in lhs.items():
-        rhs_tensor = rhs[name]
-        diff = (lhs_tensor - rhs_tensor).abs().max().item()
-        if diff > worst_diff:
-            worst_name = name
-            worst_diff = diff
-    return worst_name, worst_diff
-
-
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
     dist.init_process_group(
         backend=args.backend,
@@ -181,15 +130,15 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     sharded_train_loss.backward()
 
     shard_rules = _rule_by_param_name(sharded_model)
-    baseline_grads = _logical_named_grads(baseline_model, {})
-    sharded_grads = _logical_named_grads(core.model, shard_rules)
+    baseline_grads = _named_tensors(baseline_model, {}, None, grads=True)
+    sharded_grads = _named_tensors(core.model, shard_rules, dist.group.WORLD, grads=True)
     grad_name, grad_diff = _max_diff(baseline_grads, sharded_grads)
 
     baseline_optimizer.step()
     sharded_optimizer.step()
 
-    baseline_params = _logical_named_tensors(baseline_model, {})
-    sharded_params = _logical_named_tensors(core.model, shard_rules)
+    baseline_params = _named_tensors(baseline_model, {}, None)
+    sharded_params = _named_tensors(core.model, shard_rules, dist.group.WORLD)
     step_name, step_diff = _max_diff(baseline_params, sharded_params)
 
     if rank == 0:
