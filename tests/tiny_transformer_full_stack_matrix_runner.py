@@ -42,7 +42,7 @@ RUN_CASE_BY_MODULE = {
 class CaseResult:
     case: MatrixCase
     ok: bool
-    duration_sec: float
+    duration_sec: float | None
     returncode: int
 
 
@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-file", type=str, default=_DEFAULT_REPORT_FILE)
     parser.add_argument("--failures-file", type=str, default=_DEFAULT_FAILURES_FILE)
     parser.add_argument("--passes-file", type=str, default=_DEFAULT_PASSES_FILE)
+    parser.add_argument("--completed-cases-file", type=str, default=None)
     return parser.parse_args()
 
 
@@ -117,10 +118,44 @@ def _append_line(path: Path | None, line: str) -> None:
 
 def _format_case_status(index: int, total: int, result: CaseResult) -> str:
     status = "PASS" if result.ok else "FAIL"
-    return (
-        f"[{status} {index}/{total}] {result.case.name} "
-        f"(module={result.case.module_key}, rc={result.returncode}, {result.duration_sec:.1f}s)"
-    )
+    suffix = f"(module={result.case.module_key}, rc={result.returncode}"
+    if result.duration_sec is not None:
+        suffix += f", {result.duration_sec:.1f}s"
+    suffix += ")"
+    return f"[{status} {index}/{total}] {result.case.name} {suffix}"
+
+
+def _group_key(case: MatrixCase) -> str:
+    parts = case.name.split("/")
+    if len(parts) < 2:
+        return case.name
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _group_cases(cases: list[MatrixCase]) -> list[tuple[str, list[MatrixCase]]]:
+    groups: list[tuple[str, list[MatrixCase]]] = []
+    for case in cases:
+        key = _group_key(case)
+        if groups and groups[-1][0] == key:
+            groups[-1][1].append(case)
+        else:
+            groups.append((key, [case]))
+    return groups
+
+
+def _append_completed_case(path_str: str | None, case_name: str) -> None:
+    if path_str is None or dist.get_rank() != 0:
+        return
+    with Path(path_str).open("a") as handle:
+        handle.write(case_name)
+        handle.write("\n")
+
+
+def _read_completed_cases(path_str: str) -> list[str]:
+    path = Path(path_str)
+    if not path.exists():
+        return []
+    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
 
 
 def _make_checkpoint_dir(case_name: str) -> str:
@@ -146,7 +181,10 @@ def _run_merged_worker(rank: int, args: argparse.Namespace) -> None:
     case_names, blacklist_names = _resolve_case_names(args)
     device: torch.device | None = None
     if args.backend == "nccl":
-        local_rank = rank % torch.cuda.device_count()
+        cuda_device_count = torch.cuda.device_count()
+        if cuda_device_count <= 0:
+            raise RuntimeError("NCCL matrix runner requires at least one visible CUDA device")
+        local_rank = rank % cuda_device_count
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
     dist.init_process_group(
@@ -178,6 +216,7 @@ def _run_merged_worker(rank: int, args: argparse.Namespace) -> None:
             dist.barrier()
             try:
                 RUN_CASE_BY_MODULE[case.module_key](rank, case_args, device)
+                _append_completed_case(args.completed_cases_file, case.name)
             finally:
                 _cleanup_checkpoint_dir(checkpoint_dir)
                 if device is not None:
@@ -256,12 +295,6 @@ def run_subprocess_matrix(args: argparse.Namespace) -> None:
         max_cases=args.max_cases,
     )
     print(f"Selected {len(cases)} subprocess full-stack cases")
-    if not args.keep_going:
-        for case in cases:
-            _run_subprocess_case(case)
-        print("Subprocess full-stack matrix PASS")
-        return
-
     report_path = _init_output_file(args.report_file)
     failures_path = _init_output_file(args.failures_file)
     passes_path = _init_output_file(args.passes_file)
@@ -289,6 +322,95 @@ def run_subprocess_matrix(args: argparse.Namespace) -> None:
     print("Subprocess full-stack matrix PASS")
 
 
+def _run_merged_group_once(args: argparse.Namespace, cases: list[MatrixCase], completed_file: str) -> None:
+    group_args = argparse.Namespace(**vars(args))
+    group_args.case_names = [case.name for case in cases]
+    group_args.blacklist_names = None
+    group_args.whitelist = None
+    group_args.blacklist = None
+    group_args.case_filter = None
+    group_args.max_cases = None
+    group_args.completed_cases_file = completed_file
+    Path(completed_file).write_text("")
+    mp.spawn(_run_merged_worker, args=(group_args,), nprocs=args.world_size, join=True)
+
+
+def run_grouped_merged_matrix(args: argparse.Namespace) -> None:
+    case_names, blacklist_names = _resolve_case_names(args)
+    cases = build_full_stack_matrix_cases(
+        backend=args.backend,
+        world_size=args.world_size,
+        case_names=case_names,
+        blacklist_names=blacklist_names,
+        case_filter=args.case_filter,
+        max_cases=args.max_cases,
+    )
+    print(f"Selected {len(cases)} merged full-stack cases")
+    report_path = _init_output_file(args.report_file)
+    failures_path = _init_output_file(args.failures_file)
+    passes_path = _init_output_file(args.passes_file)
+    results: list[CaseResult] = []
+    total = len(cases)
+    next_index = 1
+
+    for group_key, group_cases in _group_cases(cases):
+        print(f"=== group {group_key} ({len(group_cases)} cases) ===")
+        remaining = list(group_cases)
+        while remaining:
+            with tempfile.NamedTemporaryFile(prefix="maltos_completed_", suffix=".txt", delete=False) as handle:
+                completed_file = handle.name
+            start = time.perf_counter()
+            try:
+                _run_merged_group_once(args, remaining, completed_file)
+                duration_sec = time.perf_counter() - start
+                for case in remaining:
+                    result = CaseResult(case=case, ok=True, duration_sec=duration_sec, returncode=0)
+                    results.append(result)
+                    status_line = _format_case_status(next_index, total, result)
+                    print(status_line)
+                    _append_line(report_path, status_line)
+                    _append_line(passes_path, case.name)
+                    next_index += 1
+                remaining = []
+            except BaseException:
+                duration_sec = time.perf_counter() - start
+                completed_names = _read_completed_cases(completed_file)
+                completed_count = len(completed_names)
+                for case in remaining[:completed_count]:
+                    result = CaseResult(case=case, ok=True, duration_sec=duration_sec, returncode=0)
+                    results.append(result)
+                    status_line = _format_case_status(next_index, total, result)
+                    print(status_line)
+                    _append_line(report_path, status_line)
+                    _append_line(passes_path, case.name)
+                    next_index += 1
+                if completed_count >= len(remaining):
+                    raise
+                failed_case = remaining[completed_count]
+                result = CaseResult(case=failed_case, ok=False, duration_sec=duration_sec, returncode=1)
+                results.append(result)
+                status_line = _format_case_status(next_index, total, result)
+                print(status_line)
+                _append_line(report_path, status_line)
+                _append_line(failures_path, failed_case.name)
+                next_index += 1
+                remaining = remaining[completed_count + 1 :]
+            finally:
+                Path(completed_file).unlink(missing_ok=True)
+
+    failed = [result for result in results if not result.ok]
+    passed = len(results) - len(failed)
+    summary = f"Full-stack matrix done: pass={passed} fail={len(failed)} total={len(results)}"
+    print(summary)
+    _append_line(report_path, summary)
+    if failed:
+        failed_names = ", ".join(result.case.name for result in failed)
+        print(f"Failed cases: {failed_names}")
+        _append_line(report_path, f"Failed cases: {failed_names}")
+        raise SystemExit(1)
+    print("Merged full-stack matrix PASS")
+
+
 def _print_case_names(args: argparse.Namespace) -> None:
     case_names, blacklist_names = _resolve_case_names(args)
     cases = build_full_stack_matrix_cases(
@@ -309,11 +431,9 @@ def main() -> None:
     if args.list_cases:
         _print_case_names(args)
         return
-    if args.backend == "nccl" and not args.keep_going:
-        mp.spawn(_run_merged_worker, args=(args,), nprocs=args.world_size, join=True)
+    if args.backend == "nccl":
+        run_grouped_merged_matrix(args)
     else:
-        if args.backend == "nccl" and args.keep_going:
-            print("NCCL keep-going enabled: using subprocess isolation instead of merged process-group mode")
         run_subprocess_matrix(args)
 
 

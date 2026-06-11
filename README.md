@@ -46,7 +46,8 @@ research workflows.
 
 ## Validation Snapshot
 
-- `bash tests/run_matrix.sh` passes on the maintained matrix.
+- `bash tests/run_single_feature.sh` passes on the maintained single-feature regression suite.
+- `bash tests/run_matrix.sh` passes on the maintained full-stack matrix.
 - Core smokes pass:
   - `tests/smoke_runtime_core.py`
   - `tests/smoke_trainer_loop.py`
@@ -268,7 +269,13 @@ PretrainingDataLoader + TP + SP + ZeRO-3 + bf16 + grad clip
 + gradient accumulation + checkpoint save/load + dataloader resume
 ```
 
-Run the broader maintained matrix:
+Run the maintained single-feature regression suite:
+
+```bash
+PYTHONPATH=. PYTHON_BIN=.venv/bin/python bash tests/run_single_feature.sh
+```
+
+Run the maintained full-stack matrix:
 
 ```bash
 PYTHONPATH=. PYTHON_BIN=.venv/bin/python bash tests/run_matrix.sh

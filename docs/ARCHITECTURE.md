@@ -166,6 +166,7 @@ The maintained verification story is:
 - smoke tests for runtime core, trainer loop, and pretrain CLI
 - targeted equivalence tests for TP / PP / CP / EP / ZeRO combinations
 - checkpoint/resume tests, including mid-step resume under gradient accumulation
+- a maintained `tests/run_single_feature.sh`
 - a maintained `tests/run_matrix.sh`
 - GitHub Actions smoke plus distributed regression subset
 
