@@ -135,6 +135,7 @@ class RuntimeCore:
     state: RuntimeState = field(default_factory=RuntimeState)
     optimizer: torch.optim.Optimizer | None = field(default=None, init=False)
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False)
+    _closed: bool = field(default=False, init=False, repr=False)
     _post_grad_reduction_callbacks: list[
         tuple[Callable[[torch.Tensor], "dist.Work | None"], "ParamRole | None"]
     ] = field(default_factory=list, init=False)
@@ -206,8 +207,13 @@ class RuntimeCore:
         self._maybe_build_runtime_optimizer()
         self._validate_optimizer_owner()
     def close(self) -> None:
+        if self._closed:
+            return
         for plugin in reversed(self.plugins):
             plugin.close()
+        if self.group_manager is not None:
+            self.group_manager.close()
+        self._closed = True
 
     def run_step(self, batch: Any) -> tuple[torch.Tensor, bool]:
         if self.device is not None:

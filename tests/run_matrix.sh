@@ -3,6 +3,7 @@
 #
 # CPU (default):  ./tests/run_matrix.sh
 # GPU (nccl):     BACKEND=nccl ./tests/run_matrix.sh
+# GPU merged:     BACKEND=nccl MERGE=true ./tests/run_matrix.sh
 #
 # Full-stack matrix: 4-choose-3 from {dp, pp, cp, tp}, each=2, world=8.
 # ep=dp*cp*tp (max expert sharding, no extra ranks).
@@ -15,6 +16,7 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 BACKEND="${BACKEND:-gloo}"
+MERGE="${MERGE:-false}"
 export PYTHONPATH="${PYTHONPATH:-.}"
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-180}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-180}"
@@ -155,6 +157,15 @@ echo "=== pretraining loader + tp+sp+zero3+bf16+clip+accum2 checkpoint resume ==
 fi  # BACKEND=gloo
 
 # ── Full-stack matrix (backend: ${BACKEND}) ─────────────────────────────────────
+
+if [ "${BACKEND}" = "nccl" ] && [ "${MERGE}" = "true" ]; then
+  echo "=== full-stack nccl matrix (single init) ==="
+  "${PYTHON_BIN}" tests/tiny_transformer_nccl_full_stack_matrix.py \
+    --backend "${BACKEND}" \
+    --world-size 8
+  echo "=== matrix PASS ==="
+  exit 0
+fi
 
 # ── A: dp=2 pp=2 cp=2 tp=1, world=8 ───────────────────────────────────────────
 echo "=== [A] dp=2 pp=2 cp=2 tp=1 (world=8) ==="

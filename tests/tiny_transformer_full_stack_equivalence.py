@@ -274,6 +274,102 @@ def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespac
     )
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
+        raise ValueError("full stack equivalence expects world_size == dp_size * pp_size * cp_size * tp_size")
+    if args.batch_size % args.dp_size != 0:
+        raise ValueError("batch size must be divisible by dp size")
+    if args.seq_len % args.cp_size != 0:
+        raise ValueError("seq_len must be divisible by cp size")
+
+
+def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = None) -> None:
+    _validate_args(args)
+    reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
+
+    baseline_core = _make_baseline_core(reference_model, args, device)
+    baseline_core.setup()
+    runtime_core = _make_runtime_core(reference_model, args, device)
+    runtime_core.setup()
+
+    try:
+        dp_idx = rank // (args.pp_size * args.cp_size * args.tp_size)
+        local_batch_size = args.batch_size // args.dp_size
+        local_tokens = tokens.narrow(0, dp_idx * local_batch_size, local_batch_size).contiguous()
+        batch = causal_lm_batch(local_tokens)
+
+        baseline_loss, baseline_should_step = baseline_core.run_step(batch)
+        runtime_loss, runtime_should_step = runtime_core.run_step(batch)
+        if not baseline_should_step or not runtime_should_step:
+            raise AssertionError("full stack test expects grad_accum_steps=1, should_step must be True")
+
+        baseline_zero = _find_zero_plugin(baseline_core)
+        runtime_zero = _find_zero_plugin(runtime_core)
+
+        baseline_tp_group = baseline_core.get_group(MeshAxis.TP)
+        runtime_tp_group = runtime_core.get_group(MeshAxis.TP)
+        baseline_shard_rules = _rule_by_param_name(baseline_core.model)
+        runtime_shard_rules = _rule_by_param_name(runtime_core.model)
+
+        baseline_core._run_phase(RuntimePhase.PRE_STEP)
+        runtime_core._run_phase(RuntimePhase.PRE_STEP)
+        baseline_grads = _logical_named_grads(baseline_core, baseline_zero, baseline_shard_rules, baseline_tp_group)
+        runtime_grads = _logical_named_grads(runtime_core, runtime_zero, runtime_shard_rules, runtime_tp_group)
+        grad_name, grad_diff = _max_diff(runtime_grads, baseline_grads)
+
+        baseline_core.step_optimizer()
+        runtime_core.step_optimizer()
+
+        if isinstance(baseline_zero, Zero3Plugin):
+            baseline_zero.materialize_model()
+        if isinstance(runtime_zero, Zero3Plugin):
+            runtime_zero.materialize_model()
+        baseline_params = _logical_named_tensors(baseline_core.model, baseline_shard_rules, baseline_tp_group)
+        runtime_params = _logical_named_tensors(runtime_core.model, runtime_shard_rules, runtime_tp_group)
+        step_name, step_diff = _max_diff(runtime_params, baseline_params)
+
+        dp_group = runtime_core.get_group(MeshAxis.DP)
+        cp_group = runtime_core.get_group(MeshAxis.CP)
+        avg_baseline_loss = baseline_loss.detach().clone()
+        avg_runtime_loss = runtime_loss.detach().clone()
+        if cp_group is not None:
+            dist.all_reduce(avg_baseline_loss, op=dist.ReduceOp.SUM, group=cp_group)
+            dist.all_reduce(avg_runtime_loss, op=dist.ReduceOp.SUM, group=cp_group)
+        if dp_group is not None:
+            dist.all_reduce(avg_baseline_loss, op=dist.ReduceOp.AVG, group=dp_group)
+            dist.all_reduce(avg_runtime_loss, op=dist.ReduceOp.AVG, group=dp_group)
+
+        loss_diff_tensor = torch.tensor(abs(avg_baseline_loss.item() - avg_runtime_loss.item()), dtype=torch.float64, device=device)
+        grad_diff_tensor = torch.tensor(grad_diff, dtype=torch.float64, device=device)
+        step_diff_tensor = torch.tensor(step_diff, dtype=torch.float64, device=device)
+        dist.all_reduce(loss_diff_tensor, op=dist.ReduceOp.MAX)
+        dist.all_reduce(grad_diff_tensor, op=dist.ReduceOp.MAX)
+        dist.all_reduce(step_diff_tensor, op=dist.ReduceOp.MAX)
+
+        if rank == 0:
+            print(f"Case             : full_stack_pp_cp_tp_sp_zero{args.zero_stage}")
+            print(f"PP schedule      : {args.pp_schedule}")
+            print(f"Baseline loss    : {avg_baseline_loss.item():.6f}")
+            print(f"RuntimeCore loss : {avg_runtime_loss.item():.6f}")
+            print(f"Loss diff        : {loss_diff_tensor.item():.2e}  (atol={_LOSS_ATOL:.2e})")
+            print(f"Grad diff        : {grad_diff_tensor.item():.2e}  ({grad_name}, atol={_GRAD_ATOL:.2e})")
+            print(f"Post-step diff   : {step_diff_tensor.item():.2e}  ({step_name}, atol={_STEP_ATOL:.2e})")
+            if loss_diff_tensor.item() > _LOSS_ATOL:
+                raise AssertionError(f"full stack loss equivalence failed: diff={loss_diff_tensor.item():.2e}")
+            if grad_diff_tensor.item() > _GRAD_ATOL:
+                raise AssertionError(
+                    f"full stack gradient equivalence failed: param={grad_name}, diff={grad_diff_tensor.item():.2e}"
+                )
+            if step_diff_tensor.item() > _STEP_ATOL:
+                raise AssertionError(
+                    f"full stack one-step equivalence failed: param={step_name}, diff={step_diff_tensor.item():.2e}"
+                )
+            print("PASS")
+    finally:
+        baseline_core.close()
+        runtime_core.close()
+
+
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
     device: torch.device | None = None
     if args.backend == "nccl":
@@ -287,98 +383,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         world_size=args.world_size,
         device_id=device,
     )
-    if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
-        raise ValueError("full stack equivalence expects world_size == dp_size * pp_size * cp_size * tp_size")
-    if args.batch_size % args.dp_size != 0:
-        raise ValueError("batch size must be divisible by dp size")
-    if args.seq_len % args.cp_size != 0:
-        raise ValueError("seq_len must be divisible by cp size")
-
-    reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
-
-    baseline_core = _make_baseline_core(reference_model, args, device)
-    baseline_core.setup()
-    runtime_core = _make_runtime_core(reference_model, args, device)
-    runtime_core.setup()
-
-    dp_idx = rank // (args.pp_size * args.cp_size * args.tp_size)
-    local_batch_size = args.batch_size // args.dp_size
-    local_tokens = tokens.narrow(0, dp_idx * local_batch_size, local_batch_size).contiguous()
-    batch = causal_lm_batch(local_tokens)
-
-    baseline_loss, baseline_should_step = baseline_core.run_step(batch)
-    runtime_loss, runtime_should_step = runtime_core.run_step(batch)
-    if not baseline_should_step or not runtime_should_step:
-        raise AssertionError("full stack test expects grad_accum_steps=1, should_step must be True")
-
-    baseline_zero = _find_zero_plugin(baseline_core)
-    runtime_zero = _find_zero_plugin(runtime_core)
-
-    baseline_tp_group = baseline_core.get_group(MeshAxis.TP)
-    runtime_tp_group = runtime_core.get_group(MeshAxis.TP)
-    baseline_shard_rules = _rule_by_param_name(baseline_core.model)
-    runtime_shard_rules = _rule_by_param_name(runtime_core.model)
-
-    baseline_core._run_phase(RuntimePhase.PRE_STEP)
-    runtime_core._run_phase(RuntimePhase.PRE_STEP)
-    baseline_grads = _logical_named_grads(baseline_core, baseline_zero, baseline_shard_rules, baseline_tp_group)
-    runtime_grads = _logical_named_grads(runtime_core, runtime_zero, runtime_shard_rules, runtime_tp_group)
-    grad_name, grad_diff = _max_diff(runtime_grads, baseline_grads)
-
-    baseline_core.step_optimizer()
-    runtime_core.step_optimizer()
-
-    if isinstance(baseline_zero, Zero3Plugin):
-        baseline_zero.materialize_model()
-    if isinstance(runtime_zero, Zero3Plugin):
-        runtime_zero.materialize_model()
-    baseline_params = _logical_named_tensors(baseline_core.model, baseline_shard_rules, baseline_tp_group)
-    runtime_params = _logical_named_tensors(runtime_core.model, runtime_shard_rules, runtime_tp_group)
-    step_name, step_diff = _max_diff(runtime_params, baseline_params)
-
-    dp_group = runtime_core.get_group(MeshAxis.DP)
-    cp_group = runtime_core.get_group(MeshAxis.CP)
-    avg_baseline_loss = baseline_loss.detach().clone()
-    avg_runtime_loss = runtime_loss.detach().clone()
-    if cp_group is not None:
-        dist.all_reduce(avg_baseline_loss, op=dist.ReduceOp.SUM, group=cp_group)
-        dist.all_reduce(avg_runtime_loss, op=dist.ReduceOp.SUM, group=cp_group)
-    if dp_group is not None:
-        dist.all_reduce(avg_baseline_loss, op=dist.ReduceOp.AVG, group=dp_group)
-        dist.all_reduce(avg_runtime_loss, op=dist.ReduceOp.AVG, group=dp_group)
-
-    loss_diff_tensor = torch.tensor(abs(avg_baseline_loss.item() - avg_runtime_loss.item()), dtype=torch.float64, device=device)
-    grad_diff_tensor = torch.tensor(grad_diff, dtype=torch.float64, device=device)
-    step_diff_tensor = torch.tensor(step_diff, dtype=torch.float64, device=device)
-    dist.all_reduce(loss_diff_tensor, op=dist.ReduceOp.MAX)
-    dist.all_reduce(grad_diff_tensor, op=dist.ReduceOp.MAX)
-    dist.all_reduce(step_diff_tensor, op=dist.ReduceOp.MAX)
-
-    if rank == 0:
-        print(f"Case             : full_stack_pp_cp_tp_sp_zero{args.zero_stage}")
-        print(f"PP schedule      : {args.pp_schedule}")
-        print(f"Baseline loss    : {avg_baseline_loss.item():.6f}")
-        print(f"RuntimeCore loss : {avg_runtime_loss.item():.6f}")
-        print(f"Loss diff        : {loss_diff_tensor.item():.2e}  (atol={_LOSS_ATOL:.2e})")
-        print(f"Grad diff        : {grad_diff_tensor.item():.2e}  ({grad_name}, atol={_GRAD_ATOL:.2e})")
-        print(f"Post-step diff   : {step_diff_tensor.item():.2e}  ({step_name}, atol={_STEP_ATOL:.2e})")
-        if loss_diff_tensor.item() > _LOSS_ATOL:
-            raise AssertionError(f"full stack loss equivalence failed: diff={loss_diff_tensor.item():.2e}")
-        if grad_diff_tensor.item() > _GRAD_ATOL:
-            raise AssertionError(
-                f"full stack gradient equivalence failed: param={grad_name}, diff={grad_diff_tensor.item():.2e}"
-            )
-        if step_diff_tensor.item() > _STEP_ATOL:
-            raise AssertionError(
-                f"full stack one-step equivalence failed: param={step_name}, diff={step_diff_tensor.item():.2e}"
-            )
-        print("PASS")
-
-    if isinstance(baseline_zero, Zero3Plugin):
-        baseline_zero.reshard_model()
-    if isinstance(runtime_zero, Zero3Plugin):
-        runtime_zero.reshard_model()
-    dist.destroy_process_group()
+    try:
+        run_case(rank, args, device)
+    finally:
+        dist.destroy_process_group()
 
 
 def main() -> None:

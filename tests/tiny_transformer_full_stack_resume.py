@@ -190,66 +190,67 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
     cont_model = TinyTransformerTpSp(**_MODEL_KWARGS)
     cont_model.load_state_dict(reference_model.state_dict())
     cont_core, cont_zero3 = _build_runtime(cont_model, args, device)
-    dist.barrier()
+    rest_core: RuntimeCore | None = None
+    try:
+        dist.barrier()
 
-    dp_idx = rank // (args.pp_size * args.cp_size * args.tp_size)
-    local_bs = args.global_batch_size // args.dp_size
-    local_a = tokens_a.narrow(0, dp_idx * local_bs, local_bs).contiguous()
-    local_b = tokens_b.narrow(0, dp_idx * local_bs, local_bs).contiguous()
+        dp_idx = rank // (args.pp_size * args.cp_size * args.tp_size)
+        local_bs = args.global_batch_size // args.dp_size
+        local_a = tokens_a.narrow(0, dp_idx * local_bs, local_bs).contiguous()
+        local_b = tokens_b.narrow(0, dp_idx * local_bs, local_bs).contiguous()
 
-    _, should_step = cont_core.run_step(causal_lm_batch(local_a))
-    if not should_step:
-        raise AssertionError("step-resume: expected should_step=True for grad_accum_steps=1")
-    cont_core.step_optimizer()
-    dist.barrier()
-    save_sharded_checkpoint(cont_core.state_manager, args.checkpoint_dir)
-    dist.barrier()
-    cont_loss, should_step = cont_core.run_step(causal_lm_batch(local_b))
-    if not should_step:
-        raise AssertionError("step-resume: second step should step optimizer")
-    cont_core.step_optimizer()
-    dist.barrier()
+        _, should_step = cont_core.run_step(causal_lm_batch(local_a))
+        if not should_step:
+            raise AssertionError("step-resume: expected should_step=True for grad_accum_steps=1")
+        cont_core.step_optimizer()
+        dist.barrier()
+        save_sharded_checkpoint(cont_core.state_manager, args.checkpoint_dir)
+        dist.barrier()
+        cont_loss, should_step = cont_core.run_step(causal_lm_batch(local_b))
+        if not should_step:
+            raise AssertionError("step-resume: second step should step optimizer")
+        cont_core.step_optimizer()
+        dist.barrier()
 
-    rest_model = TinyTransformerTpSp(**_MODEL_KWARGS)
-    rest_model.load_state_dict(reference_model.state_dict())
-    rest_core, rest_zero3 = _build_runtime(rest_model, args, device)
-    load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
-    dist.barrier()
-    rest_loss, should_step = rest_core.run_step(causal_lm_batch(local_b))
-    if not should_step:
-        raise AssertionError("step-resume: restored second step should step optimizer")
-    rest_core.step_optimizer()
-    dist.barrier()
+        rest_model = TinyTransformerTpSp(**_MODEL_KWARGS)
+        rest_model.load_state_dict(reference_model.state_dict())
+        rest_core, rest_zero3 = _build_runtime(rest_model, args, device)
+        load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
+        dist.barrier()
+        rest_loss, should_step = rest_core.run_step(causal_lm_batch(local_b))
+        if not should_step:
+            raise AssertionError("step-resume: restored second step should step optimizer")
+        rest_core.step_optimizer()
+        dist.barrier()
 
-    cont_loss_r = _reduce_loss(cont_loss, cont_core)
-    rest_loss_r = _reduce_loss(rest_loss, rest_core)
-    if cont_zero3 is not None:
-        cont_zero3.materialize_model()
-    if rest_zero3 is not None:
-        rest_zero3.materialize_model()
-    shard_rules = _rule_by_param_name(cont_model)
-    tp_group = cont_core.get_group(MeshAxis.TP)
-    param_name, param_diff = _max_diff(
-        _logical_named_tensors(cont_core.model, shard_rules, tp_group),
-        _logical_named_tensors(rest_core.model, shard_rules, tp_group),
-    )
+        cont_loss_r = _reduce_loss(cont_loss, cont_core)
+        rest_loss_r = _reduce_loss(rest_loss, rest_core)
+        if cont_zero3 is not None:
+            cont_zero3.materialize_model()
+        if rest_zero3 is not None:
+            rest_zero3.materialize_model()
+        shard_rules = _rule_by_param_name(cont_model)
+        tp_group = cont_core.get_group(MeshAxis.TP)
+        param_name, param_diff = _max_diff(
+            _logical_named_tensors(cont_core.model, shard_rules, tp_group),
+            _logical_named_tensors(rest_core.model, shard_rules, tp_group),
+        )
 
-    if rank == 0:
-        loss_diff = abs(cont_loss_r.item() - rest_loss_r.item())
-        print(f"Checkpoint dir    : {args.checkpoint_dir}")
-        print(f"Resume loss diff  : {loss_diff:.2e}  (atol={_LOSS_ATOL:.2e})")
-        print(f"Resume param diff : {param_diff:.2e}  ({param_name}, atol={_STEP_ATOL:.2e})")
-        if loss_diff > _LOSS_ATOL:
-            raise AssertionError(f"step-resume loss mismatch: diff={loss_diff:.2e}")
-        if param_diff > _STEP_ATOL:
-            raise AssertionError(f"step-resume param mismatch: {param_name} diff={param_diff:.2e}")
-        _check_bf16_metadata(cont_core, rest_core)
-        print("PASS")
-
-    if cont_zero3 is not None:
-        cont_zero3.reshard_model()
-    if rest_zero3 is not None:
-        rest_zero3.reshard_model()
+        if rank == 0:
+            loss_diff = abs(cont_loss_r.item() - rest_loss_r.item())
+            print(f"Checkpoint dir    : {args.checkpoint_dir}")
+            print(f"Resume loss diff  : {loss_diff:.2e}  (atol={_LOSS_ATOL:.2e})")
+            print(f"Resume param diff : {param_diff:.2e}  ({param_name}, atol={_STEP_ATOL:.2e})")
+            if loss_diff > _LOSS_ATOL:
+                raise AssertionError(f"step-resume loss mismatch: diff={loss_diff:.2e}")
+            if param_diff > _STEP_ATOL:
+                raise AssertionError(f"step-resume param mismatch: {param_name} diff={param_diff:.2e}")
+            _check_bf16_metadata(cont_core, rest_core)
+            print("PASS")
+    finally:
+        cont_core.close()
+        if rest_core is not None:
+            rest_core.close()
 
 
 def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.device | None) -> None:
@@ -258,82 +259,103 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
     cont_model = TinyTransformerTpSp(**_MODEL_KWARGS)
     cont_model.load_state_dict(reference_model.state_dict())
     cont_core, cont_zero3 = _build_runtime(cont_model, args, device)
+    rest_core: RuntimeCore | None = None
+    try:
+        dp_idx = rank // (args.pp_size * args.cp_size * args.tp_size)
+        local_bs = args.global_batch_size // args.dp_size
+        local_a = tokens_a.narrow(0, dp_idx * local_bs, local_bs).contiguous()
+        local_b = tokens_b.narrow(0, dp_idx * local_bs, local_bs).contiguous()
+        if local_a.size(0) != 4 or local_b.size(0) != 4:
+            raise ValueError("mid-step resume expects local_batch_size == grad_accum_steps * pp_microbatches == 4")
 
-    dp_idx = rank // (args.pp_size * args.cp_size * args.tp_size)
-    local_bs = args.global_batch_size // args.dp_size
-    local_a = tokens_a.narrow(0, dp_idx * local_bs, local_bs).contiguous()
-    local_b = tokens_b.narrow(0, dp_idx * local_bs, local_bs).contiguous()
-    if local_a.size(0) != 4 or local_b.size(0) != 4:
-        raise ValueError("mid-step resume expects local_batch_size == grad_accum_steps * pp_microbatches == 4")
+        _, should_step = cont_core.run_step(causal_lm_batch(local_a[0:2]))
+        if cont_core.state.step != 0 or cont_core.state.step_context.microbatch_idx != 1:
+            raise AssertionError("continuous core must be at mid-step state before checkpoint")
+        if should_step is not False:
+            raise AssertionError("midstep: first microbatch should not step optimizer")
+        save_sharded_checkpoint(cont_core.state_manager, args.checkpoint_dir)
+        la1_cont, should_step = cont_core.run_step(causal_lm_batch(local_a[2:4]))
+        if should_step is not True:
+            raise AssertionError("midstep: second microbatch should step optimizer")
+        cont_core.step_optimizer()
+        lb0_cont, _ = cont_core.run_step(causal_lm_batch(local_b[0:2]))
+        lb1_cont, should_step = cont_core.run_step(causal_lm_batch(local_b[2:4]))
+        if should_step is not True:
+            raise AssertionError("midstep: step B boundary should step optimizer")
+        cont_core.step_optimizer()
 
-    _, should_step = cont_core.run_step(causal_lm_batch(local_a[0:2]))
-    if cont_core.state.step != 0 or cont_core.state.step_context.microbatch_idx != 1:
-        raise AssertionError("continuous core must be at mid-step state before checkpoint")
-    if should_step is not False:
-        raise AssertionError("midstep: first microbatch should not step optimizer")
-    save_sharded_checkpoint(cont_core.state_manager, args.checkpoint_dir)
-    la1_cont, should_step = cont_core.run_step(causal_lm_batch(local_a[2:4]))
-    if should_step is not True:
-        raise AssertionError("midstep: second microbatch should step optimizer")
-    cont_core.step_optimizer()
-    lb0_cont, _ = cont_core.run_step(causal_lm_batch(local_b[0:2]))
-    lb1_cont, should_step = cont_core.run_step(causal_lm_batch(local_b[2:4]))
-    if should_step is not True:
-        raise AssertionError("midstep: step B boundary should step optimizer")
-    cont_core.step_optimizer()
+        rest_model = TinyTransformerTpSp(**_MODEL_KWARGS)
+        rest_model.load_state_dict(reference_model.state_dict())
+        rest_core, rest_zero3 = _build_runtime(rest_model, args, device)
+        load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
+        if rest_core.state.step != 0 or rest_core.state.step_context.microbatch_idx != 1:
+            raise AssertionError("restored core must recover mid-step state")
+        la1_rest, should_step = rest_core.run_step(causal_lm_batch(local_a[2:4]))
+        if should_step is not True:
+            raise AssertionError("midstep: restored step A boundary should step optimizer")
+        rest_core.step_optimizer()
+        lb0_rest, should_step = rest_core.run_step(causal_lm_batch(local_b[0:2]))
+        if should_step is not False:
+            raise AssertionError("midstep: restored step B first microbatch should not step optimizer")
+        lb1_rest, should_step = rest_core.run_step(causal_lm_batch(local_b[2:4]))
+        if should_step is not True:
+            raise AssertionError("midstep: restored step B boundary should step optimizer")
+        rest_core.step_optimizer()
 
-    rest_model = TinyTransformerTpSp(**_MODEL_KWARGS)
-    rest_model.load_state_dict(reference_model.state_dict())
-    rest_core, rest_zero3 = _build_runtime(rest_model, args, device)
-    load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
-    if rest_core.state.step != 0 or rest_core.state.step_context.microbatch_idx != 1:
-        raise AssertionError("restored core must recover mid-step state")
-    la1_rest, should_step = rest_core.run_step(causal_lm_batch(local_a[2:4]))
-    if should_step is not True:
-        raise AssertionError("midstep: restored step A boundary should step optimizer")
-    rest_core.step_optimizer()
-    lb0_rest, should_step = rest_core.run_step(causal_lm_batch(local_b[0:2]))
-    if should_step is not False:
-        raise AssertionError("midstep: restored step B first microbatch should not step optimizer")
-    lb1_rest, should_step = rest_core.run_step(causal_lm_batch(local_b[2:4]))
-    if should_step is not True:
-        raise AssertionError("midstep: restored step B boundary should step optimizer")
-    rest_core.step_optimizer()
+        loss_pairs = [
+            ("A1", _reduce_loss(la1_cont, cont_core), _reduce_loss(la1_rest, rest_core)),
+            ("B0", _reduce_loss(lb0_cont, cont_core), _reduce_loss(lb0_rest, rest_core)),
+            ("B1", _reduce_loss(lb1_cont, cont_core), _reduce_loss(lb1_rest, rest_core)),
+        ]
+        loss_diffs = [(tag, abs(lhs.item() - rhs.item())) for tag, lhs, rhs in loss_pairs]
 
-    loss_pairs = [
-        ("A1", _reduce_loss(la1_cont, cont_core), _reduce_loss(la1_rest, rest_core)),
-        ("B0", _reduce_loss(lb0_cont, cont_core), _reduce_loss(lb0_rest, rest_core)),
-        ("B1", _reduce_loss(lb1_cont, cont_core), _reduce_loss(lb1_rest, rest_core)),
-    ]
-    loss_diffs = [(tag, abs(lhs.item() - rhs.item())) for tag, lhs, rhs in loss_pairs]
+        if cont_zero3 is not None:
+            cont_zero3.materialize_model()
+        if rest_zero3 is not None:
+            rest_zero3.materialize_model()
+        shard_rules = _rule_by_param_name(cont_model)
+        tp_group = cont_core.get_group(MeshAxis.TP)
+        param_name, param_diff = _max_diff(
+            _logical_named_tensors(cont_core.model, shard_rules, tp_group),
+            _logical_named_tensors(rest_core.model, shard_rules, tp_group),
+        )
 
-    if cont_zero3 is not None:
-        cont_zero3.materialize_model()
-    if rest_zero3 is not None:
-        rest_zero3.materialize_model()
-    shard_rules = _rule_by_param_name(cont_model)
-    tp_group = cont_core.get_group(MeshAxis.TP)
-    param_name, param_diff = _max_diff(
-        _logical_named_tensors(cont_core.model, shard_rules, tp_group),
-        _logical_named_tensors(rest_core.model, shard_rules, tp_group),
-    )
+        if rank == 0:
+            worst_tag, worst_loss = max(loss_diffs, key=lambda x: x[1])
+            print(f"Checkpoint dir      : {args.checkpoint_dir}")
+            print(f"Mid-step loss diff  : {worst_loss:.2e}  ({worst_tag}, atol={_LOSS_ATOL:.2e})")
+            print(f"Mid-step param diff : {param_diff:.2e}  ({param_name}, atol={_STEP_ATOL:.2e})")
+            if worst_loss > _LOSS_ATOL:
+                raise AssertionError(f"mid-step resume loss mismatch: tag={worst_tag}, diff={worst_loss:.2e}")
+            if param_diff > _STEP_ATOL:
+                raise AssertionError(f"mid-step resume param mismatch: {param_name} diff={param_diff:.2e}")
+            _check_bf16_metadata(cont_core, rest_core)
+            print("PASS")
+    finally:
+        cont_core.close()
+        if rest_core is not None:
+            rest_core.close()
 
-    if rank == 0:
-        worst_tag, worst_loss = max(loss_diffs, key=lambda x: x[1])
-        print(f"Checkpoint dir      : {args.checkpoint_dir}")
-        print(f"Mid-step loss diff  : {worst_loss:.2e}  ({worst_tag}, atol={_LOSS_ATOL:.2e})")
-        print(f"Mid-step param diff : {param_diff:.2e}  ({param_name}, atol={_STEP_ATOL:.2e})")
-        if worst_loss > _LOSS_ATOL:
-            raise AssertionError(f"mid-step resume loss mismatch: tag={worst_tag}, diff={worst_loss:.2e}")
-        if param_diff > _STEP_ATOL:
-            raise AssertionError(f"mid-step resume param mismatch: {param_name} diff={param_diff:.2e}")
-        _check_bf16_metadata(cont_core, rest_core)
-        print("PASS")
 
-    if cont_zero3 is not None:
-        cont_zero3.reshard_model()
-    if rest_zero3 is not None:
-        rest_zero3.reshard_model()
+def _validate_args(args: argparse.Namespace) -> None:
+    if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
+        raise ValueError("world size must equal dp_size * pp_size * cp_size * tp_size")
+    if args.global_batch_size % args.dp_size != 0:
+        raise ValueError("global batch size must be divisible by dp size")
+    if args.seq_len % args.cp_size != 0:
+        raise ValueError("seq_len must be divisible by cp size")
+
+
+def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = None) -> None:
+    _validate_args(args)
+    if not _supports_bf16_autocast():
+        if rank == 0:
+            print("SKIP: bf16 autocast is not supported on this runtime")
+        return
+    if args.grad_accum_steps == 1:
+        _run_step_resume(rank, args, device)
+    else:
+        _run_midstep_resume(rank, args, device)
 
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
@@ -349,25 +371,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         world_size=args.world_size,
         device_id=device,
     )
-    if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
-        raise ValueError("world size must equal dp_size * pp_size * cp_size * tp_size")
-    if args.global_batch_size % args.dp_size != 0:
-        raise ValueError("global batch size must be divisible by dp size")
-    if args.seq_len % args.cp_size != 0:
-        raise ValueError("seq_len must be divisible by cp size")
-
-    if not _supports_bf16_autocast():
-        if rank == 0:
-            print("SKIP: bf16 autocast is not supported on this runtime")
+    try:
+        run_case(rank, args, device)
+    finally:
         dist.destroy_process_group()
-        return
-
-    if args.grad_accum_steps == 1:
-        _run_step_resume(rank, args, device)
-    else:
-        _run_midstep_resume(rank, args, device)
-
-    dist.destroy_process_group()
 
 
 def main() -> None:

@@ -340,6 +340,128 @@ def _make_runtime_core(reference_model: TinyMoETransformer, args: argparse.Names
     )
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
+        raise ValueError("EP full stack expects world_size == dp_size * pp_size * cp_size * tp_size")
+    if args.batch_size % args.dp_size != 0:
+        raise ValueError("batch size must be divisible by dp size")
+    if args.seq_len % args.cp_size != 0:
+        raise ValueError("seq_len must be divisible by cp size")
+
+
+def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = None) -> None:
+    _validate_args(args)
+    reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
+
+    baseline_core = _make_baseline_core(reference_model, args, device)
+    runtime_core = _make_runtime_core(reference_model, args, device)
+    baseline_core.setup()
+    runtime_core.setup()
+    baseline_core.model.train()
+    runtime_core.model.train()
+
+    try:
+        dp_idx, _, _, _ = runtime_core.mesh.rank_coordinates(rank)
+        local_batch_size = args.batch_size // args.dp_size
+        local_tokens = tokens.narrow(0, dp_idx * local_batch_size, local_batch_size).contiguous()
+
+        baseline_loss, should_step = baseline_core.run_step(causal_lm_batch(local_tokens))
+        if not should_step:
+            raise AssertionError("baseline EP full stack expected should_step=True")
+        runtime_loss, should_step = runtime_core.run_step(causal_lm_batch(local_tokens))
+        if not should_step:
+            raise AssertionError("runtime EP full stack expected should_step=True")
+
+        reduced_baseline_loss = _reduce_loss(baseline_loss, baseline_core)
+        reduced_runtime_loss = _reduce_loss(runtime_loss, runtime_core)
+
+        baseline_core._run_phase(RuntimePhase.PRE_STEP)
+        runtime_core._run_phase(RuntimePhase.PRE_STEP)
+
+        baseline_zero3 = next((plugin for plugin in baseline_core.plugins if isinstance(plugin, Zero3Plugin)), None)
+        runtime_zero3 = next((plugin for plugin in runtime_core.plugins if isinstance(plugin, Zero3Plugin)), None)
+        baseline_zero23 = next((p for p in baseline_core.plugins if isinstance(p, (Zero2Plugin, Zero3Plugin))), None)
+        runtime_zero23 = next((p for p in runtime_core.plugins if isinstance(p, (Zero2Plugin, Zero3Plugin))), None)
+        shard_rules = _rule_by_param_name(TinyMoETransformerTpSp(**_MODEL_KWARGS))
+        baseline_tp_group = baseline_core.get_group(MeshAxis.TP)
+        runtime_tp_group = runtime_core.get_group(MeshAxis.TP)
+        baseline_pp_group = baseline_core.get_group(MeshAxis.PP)
+        runtime_pp_group = runtime_core.get_group(MeshAxis.PP)
+        baseline_ep_group = baseline_core.get_group(MeshAxis.EP)
+        runtime_ep_group = runtime_core.get_group(MeshAxis.EP)
+        baseline_pp_partitioned = any(isinstance(plugin, PipelineParallelPlugin) for plugin in baseline_core.plugins)
+        runtime_pp_partitioned = any(isinstance(plugin, PipelineParallelPlugin) for plugin in runtime_core.plugins)
+
+        if baseline_zero23 is not None:
+            baseline_grads = _logical_named_grads_ep_zero23(
+                baseline_core, baseline_zero23, shard_rules, baseline_tp_group,
+                baseline_pp_group, baseline_ep_group, pp_partitioned=baseline_pp_partitioned,
+            )
+            runtime_grads = _logical_named_grads_ep_zero23(
+                runtime_core, runtime_zero23, shard_rules, runtime_tp_group,
+                runtime_pp_group, runtime_ep_group, pp_partitioned=runtime_pp_partitioned,
+            )
+        else:
+            baseline_grads = _logical_named_tensors(
+                baseline_core.model, shard_rules, baseline_tp_group,
+                baseline_pp_group, baseline_ep_group, grads=True, pp_partitioned=baseline_pp_partitioned,
+            )
+            runtime_grads = _logical_named_tensors(
+                runtime_core.model, shard_rules, runtime_tp_group,
+                runtime_pp_group, runtime_ep_group, grads=True, pp_partitioned=runtime_pp_partitioned,
+            )
+        grad_name, grad_diff = _max_diff(baseline_grads, runtime_grads)
+
+        baseline_core.step_optimizer()
+        runtime_core.step_optimizer()
+
+        if baseline_zero3 is not None:
+            baseline_zero3.materialize_model()
+        if runtime_zero3 is not None:
+            runtime_zero3.materialize_model()
+        baseline_params = _logical_named_tensors(
+            baseline_core.model,
+            shard_rules,
+            baseline_tp_group,
+            baseline_pp_group,
+            baseline_ep_group,
+            grads=False,
+            pp_partitioned=baseline_pp_partitioned,
+        )
+        runtime_params = _logical_named_tensors(
+            runtime_core.model,
+            shard_rules,
+            runtime_tp_group,
+            runtime_pp_group,
+            runtime_ep_group,
+            grads=False,
+            pp_partitioned=runtime_pp_partitioned,
+        )
+        step_name, step_diff = _max_diff(baseline_params, runtime_params)
+        if baseline_zero3 is not None:
+            baseline_zero3.reshard_model()
+        if runtime_zero3 is not None:
+            runtime_zero3.reshard_model()
+
+        if rank == 0:
+            loss_diff = abs(reduced_baseline_loss.item() - reduced_runtime_loss.item())
+            print(f"Baseline loss                 : {reduced_baseline_loss.item():.6f}")
+            print(f"RuntimeCore EP full stack     : {reduced_runtime_loss.item():.6f}")
+            print(f"Diff                          : {loss_diff:.2e}  (atol={_LOSS_ATOL:.2e})")
+            print(f"Grad diff                     : {grad_diff:.2e}  ({grad_name}, atol={_GRAD_ATOL:.2e})")
+            print(f"Step diff                     : {step_diff:.2e}  ({step_name}, atol={_STEP_ATOL:.2e})")
+            if loss_diff > _LOSS_ATOL:
+                raise AssertionError(f"EP full stack loss mismatch: diff={loss_diff:.2e}")
+            if grad_diff > _GRAD_ATOL:
+                raise AssertionError(f"EP full stack grad mismatch: {grad_name} diff={grad_diff:.2e}")
+            if step_diff > _STEP_ATOL:
+                raise AssertionError(f"EP full stack step mismatch: {step_name} diff={step_diff:.2e}")
+            print("PASS")
+    finally:
+        baseline_core.close()
+        runtime_core.close()
+
+
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
     device: torch.device | None = None
     if args.backend == "nccl":
@@ -353,120 +475,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         world_size=args.world_size,
         device_id=device,
     )
-    if args.world_size != args.dp_size * args.pp_size * args.cp_size * args.tp_size:
-        raise ValueError("EP full stack expects world_size == dp_size * pp_size * cp_size * tp_size")
-    if args.batch_size % args.dp_size != 0:
-        raise ValueError("batch size must be divisible by dp size")
-    if args.seq_len % args.cp_size != 0:
-        raise ValueError("seq_len must be divisible by cp size")
-
-    reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
-
-    baseline_core = _make_baseline_core(reference_model, args, device)
-    runtime_core = _make_runtime_core(reference_model, args, device)
-    baseline_core.setup()
-    runtime_core.setup()
-    baseline_core.model.train()
-    runtime_core.model.train()
-
-    dp_idx, _, _, _ = runtime_core.mesh.rank_coordinates(rank)
-    local_batch_size = args.batch_size // args.dp_size
-    local_tokens = tokens.narrow(0, dp_idx * local_batch_size, local_batch_size).contiguous()
-
-    baseline_loss, should_step = baseline_core.run_step(causal_lm_batch(local_tokens))
-    if not should_step:
-        raise AssertionError("baseline EP full stack expected should_step=True")
-    runtime_loss, should_step = runtime_core.run_step(causal_lm_batch(local_tokens))
-    if not should_step:
-        raise AssertionError("runtime EP full stack expected should_step=True")
-
-    reduced_baseline_loss = _reduce_loss(baseline_loss, baseline_core)
-    reduced_runtime_loss = _reduce_loss(runtime_loss, runtime_core)
-
-    baseline_core._run_phase(RuntimePhase.PRE_STEP)
-    runtime_core._run_phase(RuntimePhase.PRE_STEP)
-
-    baseline_zero3 = next((plugin for plugin in baseline_core.plugins if isinstance(plugin, Zero3Plugin)), None)
-    runtime_zero3 = next((plugin for plugin in runtime_core.plugins if isinstance(plugin, Zero3Plugin)), None)
-    baseline_zero23 = next((p for p in baseline_core.plugins if isinstance(p, (Zero2Plugin, Zero3Plugin))), None)
-    runtime_zero23 = next((p for p in runtime_core.plugins if isinstance(p, (Zero2Plugin, Zero3Plugin))), None)
-    shard_rules = _rule_by_param_name(TinyMoETransformerTpSp(**_MODEL_KWARGS))
-    baseline_tp_group = baseline_core.get_group(MeshAxis.TP)
-    runtime_tp_group = runtime_core.get_group(MeshAxis.TP)
-    baseline_pp_group = baseline_core.get_group(MeshAxis.PP)
-    runtime_pp_group = runtime_core.get_group(MeshAxis.PP)
-    baseline_ep_group = baseline_core.get_group(MeshAxis.EP)
-    runtime_ep_group = runtime_core.get_group(MeshAxis.EP)
-    baseline_pp_partitioned = any(isinstance(plugin, PipelineParallelPlugin) for plugin in baseline_core.plugins)
-    runtime_pp_partitioned = any(isinstance(plugin, PipelineParallelPlugin) for plugin in runtime_core.plugins)
-
-    if baseline_zero23 is not None:
-        baseline_grads = _logical_named_grads_ep_zero23(
-            baseline_core, baseline_zero23, shard_rules, baseline_tp_group,
-            baseline_pp_group, baseline_ep_group, pp_partitioned=baseline_pp_partitioned,
-        )
-        runtime_grads = _logical_named_grads_ep_zero23(
-            runtime_core, runtime_zero23, shard_rules, runtime_tp_group,
-            runtime_pp_group, runtime_ep_group, pp_partitioned=runtime_pp_partitioned,
-        )
-    else:
-        baseline_grads = _logical_named_tensors(
-            baseline_core.model, shard_rules, baseline_tp_group,
-            baseline_pp_group, baseline_ep_group, grads=True, pp_partitioned=baseline_pp_partitioned,
-        )
-        runtime_grads = _logical_named_tensors(
-            runtime_core.model, shard_rules, runtime_tp_group,
-            runtime_pp_group, runtime_ep_group, grads=True, pp_partitioned=runtime_pp_partitioned,
-        )
-    grad_name, grad_diff = _max_diff(baseline_grads, runtime_grads)
-
-    baseline_core.step_optimizer()
-    runtime_core.step_optimizer()
-
-    if baseline_zero3 is not None:
-        baseline_zero3.materialize_model()
-    if runtime_zero3 is not None:
-        runtime_zero3.materialize_model()
-    baseline_params = _logical_named_tensors(
-        baseline_core.model,
-        shard_rules,
-        baseline_tp_group,
-        baseline_pp_group,
-        baseline_ep_group,
-        grads=False,
-        pp_partitioned=baseline_pp_partitioned,
-    )
-    runtime_params = _logical_named_tensors(
-        runtime_core.model,
-        shard_rules,
-        runtime_tp_group,
-        runtime_pp_group,
-        runtime_ep_group,
-        grads=False,
-        pp_partitioned=runtime_pp_partitioned,
-    )
-    step_name, step_diff = _max_diff(baseline_params, runtime_params)
-    if baseline_zero3 is not None:
-        baseline_zero3.reshard_model()
-    if runtime_zero3 is not None:
-        runtime_zero3.reshard_model()
-
-    if rank == 0:
-        loss_diff = abs(reduced_baseline_loss.item() - reduced_runtime_loss.item())
-        print(f"Baseline loss                 : {reduced_baseline_loss.item():.6f}")
-        print(f"RuntimeCore EP full stack     : {reduced_runtime_loss.item():.6f}")
-        print(f"Diff                          : {loss_diff:.2e}  (atol={_LOSS_ATOL:.2e})")
-        print(f"Grad diff                     : {grad_diff:.2e}  ({grad_name}, atol={_GRAD_ATOL:.2e})")
-        print(f"Step diff                     : {step_diff:.2e}  ({step_name}, atol={_STEP_ATOL:.2e})")
-        if loss_diff > _LOSS_ATOL:
-            raise AssertionError(f"EP full stack loss mismatch: diff={loss_diff:.2e}")
-        if grad_diff > _GRAD_ATOL:
-            raise AssertionError(f"EP full stack grad mismatch: {grad_name} diff={grad_diff:.2e}")
-        if step_diff > _STEP_ATOL:
-            raise AssertionError(f"EP full stack step mismatch: {step_name} diff={step_diff:.2e}")
-        print("PASS")
-
-    dist.destroy_process_group()
+    try:
+        run_case(rank, args, device)
+    finally:
+        dist.destroy_process_group()
 
 
 def main() -> None:

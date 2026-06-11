@@ -339,3 +339,18 @@ class ProcessGroupManager:
 
     def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:
         return self.groups.get(axis)
+
+    def close(self) -> None:
+        if not dist.is_initialized():
+            self.groups = {axis: None for axis in MeshAxis}
+            return
+        seen: set[int] = set()
+        for group in self.groups.values():
+            if group is None:
+                continue
+            group_id = id(group)
+            if group_id in seen:
+                continue
+            seen.add(group_id)
+            dist.destroy_process_group(group)
+        self.groups = {axis: None for axis in MeshAxis}
