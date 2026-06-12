@@ -10,3 +10,10 @@ __pycache__/
 *.pt
 *.pth
 .DS_Store
+
+# raw profiler artifacts
+profiles/**/trace_case_*/
+profiles/**/profile_case_*/
+profiles/**/*.pt.trace.json
+profiles/**/*.nsys-rep
+profiles/**/*.qdrep
