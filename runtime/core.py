@@ -70,6 +70,20 @@ class StepContext:
         )
 
     @property
+    def backward_start(self) -> bool:
+        """True at the first backward of each grad-accum micro-step.
+
+        Unlike ``accum_start`` (gated on ``microbatch_idx == 0``, so False for
+        every accum step after the first), this fires once per micro-step's
+        backward phase. Per-micro-step reduction counters must be re-armed here,
+        not at ``accum_start``: on the step-boundary micro-step (microbatch_idx
+        != 0 when grad_accum > 1) the counter would otherwise never be reset and
+        the async grad-reduce worker reads a stale zero, firing before backward
+        has produced its handles.
+        """
+        return self.pp_status in {PpStatus.IDLE, PpStatus.BACKWARD_START}
+
+    @property
     def loss_divisor(self) -> float:
         return float(self.grad_accum_steps)
 

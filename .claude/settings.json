@@ -1,21 +1,32 @@
 {
   "permissions": {
     "allow": [
-      "Bash(PYTHONPATH=. .venv/bin/python tests/*)",
-      "Bash(PYTHONPATH=. python tests/*)",
+      "Bash(PYTHONPATH=* .venv/bin/python tests/*)",
+      "Bash(PYTHONPATH=* .venv/bin/python tools/*)",
+      "Bash(PYTHONPATH=* .venv/bin/python -m py_compile *)",
+      "Bash(PYTHONPATH=* .venv/bin/python -m compileall *)",
+      "Bash(PYTHONPATH=* .venv/bin/python -c *)",
+      "Bash(PYTHONPATH=* .venv/bin/python3 -c *)",
+      "Bash(PYTHONPATH=* python tests/*)",
       "Bash(.venv/bin/python tests/*)",
+      "Bash(.venv/bin/python tools/*)",
+      "Bash(.venv/bin/python -m py_compile *)",
+      "Bash(.venv/bin/python -m compileall *)",
+      "Bash(.venv/bin/python -c *)",
       "Bash(python tests/*)",
       "Bash(python3 -c *)",
-      "Bash(./tests/run_matrix.sh*)",
+      "Bash(PYTHONPATH=* bash tests/*)",
+      "Bash(PYTHON_BIN=* bash tests/*)",
+      "Bash(BACKEND=* PYTHONPATH=* ./tests/run_matrix.sh*)",
       "Bash(BACKEND=* ./tests/run_matrix.sh*)",
-      "Bash(BACKEND=* PYTHONPATH=. ./tests/run_matrix.sh*)",
+      "Bash(./tests/run_matrix.sh*)",
       "Bash(grep *)",
       "Bash(sed -n *)",
       "Bash(awk *)",
       "Bash(xargs *)",
       "Bash(bash -n *)",
-      "Bash(PYTHONPATH=. .venv/bin/python3 -c ' *)",
-      "Bash(PYTHONPATH=. bash tests/run_single_feature.sh)"
+      "Bash(pkill -f *)",
+      "Bash(git pull *)"
     ]
   }
 }

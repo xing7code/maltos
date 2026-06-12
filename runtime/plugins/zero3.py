@@ -109,7 +109,10 @@ class Zero3Plugin(_ZeroPluginBase):
         elif phase == RuntimePhase.PRE_BACKWARD:
             assert self.runtime is not None
             context = self.runtime.state.step_context
-            self._reset_buckets(grad_accum_start=context.accum_start)
+            self._reset_buckets(
+                grad_accum_start=context.accum_start,
+                backward_start=context.backward_start,
+            )
             if context.is_step_boundary and self._use_async_worker():
                 self._start_post_reduction_worker()
             if (
@@ -581,7 +584,7 @@ class Zero3Plugin(_ZeroPluginBase):
                     state.fwd_handle = None
             self._free_full_params(bucket)
 
-    def _reset_buckets(self, *, grad_accum_start: bool) -> None:
+    def _reset_buckets(self, *, grad_accum_start: bool, backward_start: bool = True) -> None:
         self._materialized_buffers.clear()
         for bucket in self.buckets:
             if grad_accum_start:
@@ -590,6 +593,10 @@ class Zero3Plugin(_ZeroPluginBase):
                 else:
                     bucket.local_param.grad.zero_()
                 bucket.post_reduction_handles.clear()
+            # Per-micro-step reduction counter: re-armed at every backward phase
+            # start, including the step-boundary micro-step (grad_accum > 1) where
+            # grad_accum_start is False. See StepContext.backward_start.
+            if backward_start:
                 bucket.pending_exec_reductions = len(bucket.exec_states)
             for state in bucket.exec_states:
                 if grad_accum_start:

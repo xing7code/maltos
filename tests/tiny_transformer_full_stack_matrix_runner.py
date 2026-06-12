@@ -28,6 +28,8 @@ _DEFAULT_BLACKLIST = str(_LOCAL_NOTES_DIR / "matrix_blacklist.txt")
 _DEFAULT_REPORT_FILE = str(_LOCAL_NOTES_DIR / "matrix_report.log")
 _DEFAULT_FAILURES_FILE = str(_LOCAL_NOTES_DIR / "matrix_failures.txt")
 _DEFAULT_PASSES_FILE = str(_LOCAL_NOTES_DIR / "matrix_passes.txt")
+_PORT_RETRY_LIMIT = 5
+_MERGED_CASE_TIMEOUT_SEC = 40.0
 
 
 RUN_CASE_BY_MODULE = {
@@ -46,6 +48,13 @@ class CaseResult:
     returncode: int
 
 
+class MergedCaseTimeoutError(RuntimeError):
+    def __init__(self, case_name: str, timeout_sec: float) -> None:
+        super().__init__(f"merged case timed out after {timeout_sec:.1f}s: {case_name}")
+        self.case_name = case_name
+        self.timeout_sec = timeout_sec
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--world-size", type=int, default=8)
@@ -59,7 +68,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case-filter", type=str, default=None)
     parser.add_argument("--max-cases", type=int, default=None)
     parser.add_argument("--list-cases", action="store_true")
+    parser.add_argument("--merge", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--keep-going", action="store_true")
+    parser.add_argument("--case-timeout-sec", type=float, default=_MERGED_CASE_TIMEOUT_SEC)
     parser.add_argument("--report-file", type=str, default=_DEFAULT_REPORT_FILE)
     parser.add_argument("--failures-file", type=str, default=_DEFAULT_FAILURES_FILE)
     parser.add_argument("--passes-file", type=str, default=_DEFAULT_PASSES_FILE)
@@ -97,6 +108,28 @@ def _find_free_port() -> int:
         sock.bind(("127.0.0.1", 0))
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         return int(sock.getsockname()[1])
+
+
+def _is_port_in_use_failure(output: str) -> bool:
+    lowered = output.lower()
+    return "eaddrinuse" in lowered or "address already in use" in lowered
+
+
+def _run_subprocess_command(cmd: list[str]) -> tuple[int, str]:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    captured_lines: list[str] = []
+    for line in proc.stdout:
+        print(line, end="")
+        captured_lines.append(line)
+    returncode = proc.wait()
+    return returncode, "".join(captured_lines)
 
 
 def _init_output_file(path_str: str | None) -> Path | None:
@@ -156,6 +189,20 @@ def _read_completed_cases(path_str: str) -> list[str]:
     if not path.exists():
         return []
     return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+
+
+def _terminate_process_context(context, *, grace_period_sec: float = 5.0) -> None:
+    for process in getattr(context, "processes", []):
+        if process.is_alive():
+            process.terminate()
+    deadline = time.perf_counter() + grace_period_sec
+    for process in getattr(context, "processes", []):
+        remaining = max(0.0, deadline - time.perf_counter())
+        process.join(timeout=remaining)
+    for process in getattr(context, "processes", []):
+        if process.is_alive():
+            process.kill()
+        process.join()
 
 
 def _make_checkpoint_dir(case_name: str) -> str:
@@ -231,21 +278,34 @@ def _run_merged_worker(rank: int, args: argparse.Namespace) -> None:
 def _run_subprocess_case(case: MatrixCase) -> None:
     checkpoint_dir: str | None = None
     try:
-        case_args = dict(case.args)
-        case_args["master_port"] = _find_free_port()
-        cli_args = MatrixCase(
-            name=case.name,
-            module_key=case.module_key,
-            args=case_args,
-            needs_checkpoint_dir=case.needs_checkpoint_dir,
-        ).to_cli_args()
         if case.needs_checkpoint_dir:
             safe_name = case.name.replace("/", "_")
             checkpoint_dir = tempfile.mkdtemp(prefix=f"{safe_name}_")
-            cli_args.extend(["--checkpoint-dir", checkpoint_dir])
-        cmd = [sys.executable, MODULE_SCRIPTS[case.module_key], *cli_args]
         print(f"=== {case.name} ===")
-        subprocess.run(cmd, check=True)
+        last_output = ""
+        for attempt in range(1, _PORT_RETRY_LIMIT + 1):
+            case_args = dict(case.args)
+            case_args["master_port"] = _find_free_port()
+            cli_args = MatrixCase(
+                name=case.name,
+                module_key=case.module_key,
+                args=case_args,
+                needs_checkpoint_dir=case.needs_checkpoint_dir,
+            ).to_cli_args()
+            if checkpoint_dir is not None:
+                cli_args.extend(["--checkpoint-dir", checkpoint_dir])
+            cmd = [sys.executable, MODULE_SCRIPTS[case.module_key], *cli_args]
+            returncode, output = _run_subprocess_command(cmd)
+            if returncode == 0:
+                return
+            last_output = output
+            if attempt < _PORT_RETRY_LIMIT and _is_port_in_use_failure(output):
+                print(
+                    f"[retry {attempt}/{_PORT_RETRY_LIMIT - 1}] {case.name}: "
+                    "TCPStore port busy, retrying with a new port"
+                )
+                continue
+            raise subprocess.CalledProcessError(returncode=returncode, cmd=cmd, output=last_output)
     finally:
         if checkpoint_dir is not None:
             shutil.rmtree(checkpoint_dir, ignore_errors=True)
@@ -256,22 +316,32 @@ def _run_subprocess_case_keep_going(case: MatrixCase) -> CaseResult:
     start = time.perf_counter()
     returncode = 0
     try:
-        case_args = dict(case.args)
-        case_args["master_port"] = _find_free_port()
-        cli_args = MatrixCase(
-            name=case.name,
-            module_key=case.module_key,
-            args=case_args,
-            needs_checkpoint_dir=case.needs_checkpoint_dir,
-        ).to_cli_args()
         if case.needs_checkpoint_dir:
             safe_name = case.name.replace("/", "_")
             checkpoint_dir = tempfile.mkdtemp(prefix=f"{safe_name}_")
-            cli_args.extend(["--checkpoint-dir", checkpoint_dir])
-        cmd = [sys.executable, MODULE_SCRIPTS[case.module_key], *cli_args]
         print(f"=== {case.name} ===")
-        completed = subprocess.run(cmd, check=False)
-        returncode = int(completed.returncode)
+        for attempt in range(1, _PORT_RETRY_LIMIT + 1):
+            case_args = dict(case.args)
+            case_args["master_port"] = _find_free_port()
+            cli_args = MatrixCase(
+                name=case.name,
+                module_key=case.module_key,
+                args=case_args,
+                needs_checkpoint_dir=case.needs_checkpoint_dir,
+            ).to_cli_args()
+            if checkpoint_dir is not None:
+                cli_args.extend(["--checkpoint-dir", checkpoint_dir])
+            cmd = [sys.executable, MODULE_SCRIPTS[case.module_key], *cli_args]
+            returncode, output = _run_subprocess_command(cmd)
+            if returncode == 0:
+                break
+            if attempt < _PORT_RETRY_LIMIT and _is_port_in_use_failure(output):
+                print(
+                    f"[retry {attempt}/{_PORT_RETRY_LIMIT - 1}] {case.name}: "
+                    "TCPStore port busy, retrying with a new port"
+                )
+                continue
+            break
         ok = returncode == 0
         return CaseResult(
             case=case,
@@ -332,7 +402,37 @@ def _run_merged_group_once(args: argparse.Namespace, cases: list[MatrixCase], co
     group_args.max_cases = None
     group_args.completed_cases_file = completed_file
     Path(completed_file).write_text("")
-    mp.spawn(_run_merged_worker, args=(group_args,), nprocs=args.world_size, join=True)
+    context = mp.start_processes(
+        _run_merged_worker,
+        args=(group_args,),
+        nprocs=args.world_size,
+        join=False,
+        start_method="spawn",
+    )
+    last_completed_count = 0
+    last_progress_at = time.perf_counter()
+    timeout_sec = args.case_timeout_sec
+    try:
+        while True:
+            completed_names = _read_completed_cases(completed_file)
+            completed_count = len(completed_names)
+            if completed_count != last_completed_count:
+                last_completed_count = completed_count
+                last_progress_at = time.perf_counter()
+            try:
+                if context.join(timeout=1.0, grace_period=5.0):
+                    return
+            except BaseException:
+                _terminate_process_context(context)
+                raise
+            if timeout_sec is not None and timeout_sec > 0:
+                stalled_sec = time.perf_counter() - last_progress_at
+                if stalled_sec > timeout_sec and completed_count < len(cases):
+                    case_name = cases[completed_count].name
+                    _terminate_process_context(context)
+                    raise MergedCaseTimeoutError(case_name, timeout_sec)
+    finally:
+        _terminate_process_context(context)
 
 
 def run_grouped_merged_matrix(args: argparse.Namespace) -> None:
@@ -372,7 +472,7 @@ def run_grouped_merged_matrix(args: argparse.Namespace) -> None:
                     _append_line(passes_path, case.name)
                     next_index += 1
                 remaining = []
-            except BaseException:
+            except BaseException as exc:
                 duration_sec = time.perf_counter() - start
                 completed_names = _read_completed_cases(completed_file)
                 completed_count = len(completed_names)
@@ -387,7 +487,12 @@ def run_grouped_merged_matrix(args: argparse.Namespace) -> None:
                 if completed_count >= len(remaining):
                     raise
                 failed_case = remaining[completed_count]
-                result = CaseResult(case=failed_case, ok=False, duration_sec=duration_sec, returncode=1)
+                returncode = 124 if isinstance(exc, MergedCaseTimeoutError) else 1
+                if isinstance(exc, MergedCaseTimeoutError):
+                    hang_line = f"[HANG] {failed_case.name} exceeded {exc.timeout_sec:.0f}s without completion"
+                    print(hang_line)
+                    _append_line(report_path, hang_line)
+                result = CaseResult(case=failed_case, ok=False, duration_sec=duration_sec, returncode=returncode)
                 results.append(result)
                 status_line = _format_case_status(next_index, total, result)
                 print(status_line)
@@ -431,7 +536,7 @@ def main() -> None:
     if args.list_cases:
         _print_case_names(args)
         return
-    if args.backend == "nccl":
+    if args.merge is True or (args.merge is None and args.backend == "nccl"):
         run_grouped_merged_matrix(args)
     else:
         run_subprocess_matrix(args)

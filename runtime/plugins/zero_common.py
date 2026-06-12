@@ -132,7 +132,20 @@ class _ZeroPluginBase(RuntimePlugin):
         return (numel + world_size - 1) // world_size * world_size
 
     def _use_async_worker(self) -> bool:
-        return self.dp_group is not None and dist.get_backend(self.dp_group) != "gloo"
+        if self.dp_group is None or dist.get_backend(self.dp_group) == "gloo":
+            return False
+        # The async post-reduction worker advances by counting grad hooks and
+        # enqueues each bucket's collective from a background thread. Under EP the
+        # MoE layers are PP-sharded, so on stages without those layers the expert
+        # bucket gets no grad, its hook never fires, and the worker blocks forever
+        # in wait_for(pending_exec_reductions == 0) while peer ranks have already
+        # enqueued the EREP/TP collective -> NCCL deadlock. EP must use the
+        # deterministic synchronous path (which enqueues every bucket
+        # unconditionally), matching the gloo path that passes the full matrix.
+        assert self.runtime is not None
+        if any(plugin.id == PluginId.EP for plugin in self.runtime.plugins):
+            return False
+        return True
 
     def _start_post_reduction_worker(self) -> None:
         assert self.runtime is not None

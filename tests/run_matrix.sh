@@ -3,13 +3,14 @@
 #
 # gloo:           BACKEND=gloo ./tests/run_matrix.sh
 # nccl:           BACKEND=nccl ./tests/run_matrix.sh
+# nccl no-merge:  BACKEND=nccl MERGE=0 ./tests/run_matrix.sh
 # Continue on Vast with files:
 #   edit local_notes/matrix_blacklist.txt, then run: BACKEND=nccl ./tests/run_matrix.sh
 # Run only a subset:
 #   edit local_notes/matrix_whitelist.txt, then run: BACKEND=gloo ./tests/run_matrix.sh
 # Matrix default behavior is keep-going.
-# gloo: per-case subprocess keep-going.
-# nccl: grouped merged keep-going (amortizes NCCL init until a group hits a failure).
+# gloo default: per-case subprocess keep-going.
+# nccl default: grouped merged keep-going, with per-case hang watchdog.
 # Reports are always emitted to local_notes/ by default.
 #
 # Full-stack matrix: 4-choose-3 from {dp, pp, cp, tp}, each=2, world=8.
@@ -23,10 +24,12 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 BACKEND="${BACKEND:-gloo}"
+MERGE="${MERGE:-}"
 WHITELIST="${WHITELIST:-local_notes/matrix_whitelist.txt}"
 BLACKLIST="${BLACKLIST:-local_notes/matrix_blacklist.txt}"
 CASE_FILTER="${CASE_FILTER:-}"
 MAX_CASES="${MAX_CASES:-}"
+CASE_TIMEOUT_SEC="${CASE_TIMEOUT_SEC:-40}"
 REPORT_FILE="${REPORT_FILE:-local_notes/matrix_report.log}"
 FAILURES_FILE="${FAILURES_FILE:-local_notes/matrix_failures.txt}"
 PASSES_FILE="${PASSES_FILE:-local_notes/matrix_passes.txt}"
@@ -42,6 +45,13 @@ MATRIX_ARGS=(
   --backend "${BACKEND}"
   --world-size 8
 )
+if [ "${MERGE}" = "1" ] || [ "${MERGE}" = "true" ] || [ "${MERGE}" = "TRUE" ]; then
+  MATRIX_ARGS+=(--merge)
+elif [ "${MERGE}" = "0" ] || [ "${MERGE}" = "false" ] || [ "${MERGE}" = "FALSE" ]; then
+  MATRIX_ARGS+=(--no-merge)
+elif [ "${BACKEND}" = "nccl" ]; then
+  MATRIX_ARGS+=(--merge)
+fi
 if [ -n "${WHITELIST}" ]; then
   MATRIX_ARGS+=(--whitelist "${WHITELIST}")
 fi
@@ -53,6 +63,9 @@ if [ -n "${CASE_FILTER}" ]; then
 fi
 if [ -n "${MAX_CASES}" ]; then
   MATRIX_ARGS+=(--max-cases "${MAX_CASES}")
+fi
+if [ -n "${CASE_TIMEOUT_SEC}" ]; then
+  MATRIX_ARGS+=(--case-timeout-sec "${CASE_TIMEOUT_SEC}")
 fi
 if [ -n "${REPORT_FILE}" ]; then
   MATRIX_ARGS+=(--report-file "${REPORT_FILE}")
