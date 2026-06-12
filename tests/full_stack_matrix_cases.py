@@ -282,19 +282,39 @@ def build_full_stack_matrix_cases(
     )
 
     # C
-    add_full_eq("C", zero_stages=(0, 1, 2, 3), dp_size=2, pp_size=1, cp_size=2, tp_size=2, cp_attn_core="ring")
+    add_full_eq(
+        "C",
+        zero_stages=(0, 1, 2, 3),
+        dp_size=2,
+        pp_size=1,
+        cp_size=2,
+        tp_size=2,
+        pp_microbatches=1,
+        cp_attn_core="ring",
+    )
     add_full_resume_suite(
         "C",
         zero_stages=(0, 1, 2, 3),
         schedule_accums=(("afab", 1), ("afab", 2)),
-        dp_size=2, pp_size=1, cp_size=2, tp_size=2, cp_attn_core="ring",
+        dp_size=2, pp_size=1, cp_size=2, tp_size=2, pp_microbatches=1, cp_attn_core="ring",
     )
-    add_ep_full_eq("C", zero_stages=(0, 1, 2, 3), onef1b_zero_stages=(), dp_size=2, pp_size=1, cp_size=2, tp_size=2, ep_size=8, cp_attn_core="ring")
+    add_ep_full_eq(
+        "C",
+        zero_stages=(0, 1, 2, 3),
+        onef1b_zero_stages=(),
+        dp_size=2,
+        pp_size=1,
+        cp_size=2,
+        tp_size=2,
+        ep_size=8,
+        pp_microbatches=1,
+        cp_attn_core="ring",
+    )
     add_ep_full_resume_suite(
         "C",
         zero_stages=(0, 1, 2, 3),
         schedule_accums=(("afab", 1), ("afab", 2)),
-        dp_size=2, pp_size=1, cp_size=2, tp_size=2, ep_size=8, cp_attn_core="ring",
+        dp_size=2, pp_size=1, cp_size=2, tp_size=2, ep_size=8, pp_microbatches=1, cp_attn_core="ring",
     )
 
     # D

@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import os
 import sys
 import time
@@ -32,13 +33,17 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from helpers import causal_lm_batch
-from models import TinyTransformerTpSp
+from models import LlamaConfig, LlamaForCausalLMTpSp, TinyMoETransformerTpSp
+from models.activation_checkpointing import ActivationCheckpointConfig
+from models.llama import LlamaRMSNorm
 from models.tiny_transformer import RmsNorm
 from parallel import ContextParallelAttentionCoreType, ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.cp import ContextParallelPlugin
+from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
+from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
@@ -47,26 +52,51 @@ from runtime.plugins.zero3 import Zero3Plugin
 
 # ── model presets ────────────────────────────────────────────────────────────
 
-# ~1.3B params (LLaMA-1.3B-ish)
-_1B = dict(dim=2048, n_heads=16, n_kv_heads=4, hidden_size=8192,
-           eps=1e-5, n_layers=24, vocab_size=32000, max_seq_len=8192)
+# ~1B class profile target using SDPA flash + activation checkpointing.
+_LLAMA_1B = LlamaConfig(
+    vocab_size=32000,
+    hidden_size=2048,
+    intermediate_size=8192,
+    num_hidden_layers=24,
+    num_attention_heads=16,
+    num_key_value_heads=4,
+    max_position_embeddings=8192,
+    attention_backend="sdpa_flash",
+    activation_checkpointing=ActivationCheckpointConfig(enabled=True, every_n_layers=1),
+)
 
-# ~350M params — lighter for TP cases where param memory is 2× replicated
-_350M = dict(dim=1024, n_heads=16, n_kv_heads=4, hidden_size=4096,
-             eps=1e-5, n_layers=24, vocab_size=32000, max_seq_len=8192)
+# Lighter TP target for PCIe tensor-parallel profile.
+_LLAMA_350M = LlamaConfig(
+    vocab_size=32000,
+    hidden_size=1024,
+    intermediate_size=4096,
+    num_hidden_layers=24,
+    num_attention_heads=16,
+    num_key_value_heads=4,
+    max_position_embeddings=8192,
+    attention_backend="sdpa_flash",
+    activation_checkpointing=ActivationCheckpointConfig(enabled=True, every_n_layers=1),
+)
 
-_ZERO3_WRAP = {torch.nn.Linear, torch.nn.Embedding, RmsNorm}
+# Moderate MoE profile target. Top-1 routing keeps per-token compute near dense,
+# while expert params are sharded by EP to surface expert-parallel communication.
+_MOE_MED = dict(dim=768, n_heads=12, n_kv_heads=4, hidden_size=3072,
+                eps=1e-5, n_layers=16, vocab_size=32000, max_seq_len=4096, num_experts=8)
+
+_ZERO3_WRAP = {torch.nn.Linear, torch.nn.Embedding, RmsNorm, LlamaRMSNorm}
 
 
 @dataclass(frozen=True)
 class PerfCase:
     desc: str
     dp: int; pp: int; tp: int; cp: int
+    ep: int
     zero_stage: int
     seq_len: int; batch_per_dp: int
     pp_microbatches: int; pp_schedule: str
     use_sp: bool; cp_attn_core: str
-    model: dict
+    model: object
+    use_ep: bool = False
     grad_clip: float | None = 1.0
 
     @property
@@ -74,54 +104,91 @@ class PerfCase:
         return self.dp * self.batch_per_dp * self.seq_len
 
 
+def _compute_dtype_for_name(name: str) -> torch.dtype | None:
+    if name == "fp32":
+        return None
+    if name == "bf16":
+        return torch.bfloat16
+    if name == "fp16":
+        return torch.float16
+    raise ValueError(f"unsupported precision={name}")
+
+
+def _model_vocab_size(model_cfg: object) -> int:
+    if isinstance(model_cfg, LlamaConfig):
+        return int(model_cfg.vocab_size)
+    return int(model_cfg["vocab_size"])
+
+
+def _model_summary(model_cfg: object) -> str:
+    if isinstance(model_cfg, LlamaConfig):
+        return (
+            f"{model_cfg.num_hidden_layers}L × hidden={model_cfg.hidden_size}, "
+            f"intermediate={model_cfg.intermediate_size}, heads={model_cfg.num_attention_heads}"
+        )
+    return (
+        f"{model_cfg['n_layers']}L × dim={model_cfg['dim']}, "
+        f"hidden={model_cfg['hidden_size']}"
+    )
+
+
 _CASES: dict[str, PerfCase] = {
     "A": PerfCase(
         desc="dp=8  pp=1  tp=1  cp=1  zero=3  (pure ZeRO-3 baseline)",
-        dp=8, pp=1, tp=1, cp=1, zero_stage=3,
+        dp=8, pp=1, tp=1, cp=1, ep=1, zero_stage=3,
         seq_len=2048, batch_per_dp=4,
         pp_microbatches=1, pp_schedule="afab",
         use_sp=False, cp_attn_core="all_gather_kv",
-        model=_1B,
+        model=_LLAMA_1B,
     ),
     "B": PerfCase(
         desc="dp=4  pp=2  tp=1  cp=1  zero=3",
-        dp=4, pp=2, tp=1, cp=1, zero_stage=3,
-        seq_len=2048, batch_per_dp=8,
+        dp=4, pp=2, tp=1, cp=1, ep=1, zero_stage=3,
+        seq_len=2048, batch_per_dp=6,
         pp_microbatches=4, pp_schedule="afab",
         use_sp=False, cp_attn_core="all_gather_kv",
-        model=_1B,
+        model=_LLAMA_1B,
     ),
     "C": PerfCase(
         desc="dp=2  pp=4  tp=1  cp=1  zero=3  (1f1b)",
-        dp=2, pp=4, tp=1, cp=1, zero_stage=3,
-        seq_len=2048, batch_per_dp=8,
+        dp=2, pp=4, tp=1, cp=1, ep=1, zero_stage=3,
+        seq_len=2048, batch_per_dp=6,
         pp_microbatches=8, pp_schedule="1f1b",
         use_sp=False, cp_attn_core="all_gather_kv",
-        model=_1B,
+        model=_LLAMA_1B,
     ),
     "D": PerfCase(
         desc="dp=4  pp=1  tp=2  cp=1  zero=1  (TP cost on PCIe)",
-        dp=4, pp=1, tp=2, cp=1, zero_stage=1,
+        dp=4, pp=1, tp=2, cp=1, ep=1, zero_stage=1,
         seq_len=2048, batch_per_dp=4,
         pp_microbatches=1, pp_schedule="afab",
         use_sp=True, cp_attn_core="all_gather_kv",
-        model=_350M,
+        model=_LLAMA_350M,
     ),
     "E": PerfCase(
         desc="dp=2  pp=2  tp=2  cp=1  zero=3  (3D: PP+TP+ZeRO-3)",
-        dp=2, pp=2, tp=2, cp=1, zero_stage=3,
-        seq_len=2048, batch_per_dp=8,
+        dp=2, pp=2, tp=2, cp=1, ep=1, zero_stage=3,
+        seq_len=2048, batch_per_dp=4,
         pp_microbatches=4, pp_schedule="afab",
         use_sp=True, cp_attn_core="all_gather_kv",
-        model=_1B,
+        model=_LLAMA_1B,
     ),
     "F": PerfCase(
-        desc="dp=4  pp=1  tp=1  cp=2  zero=3  (CP2 ring-attn  seq=8192)",
-        dp=4, pp=1, tp=1, cp=2, zero_stage=3,
-        seq_len=8192, batch_per_dp=2,
+        desc="dp=4  pp=1  tp=1  cp=2  zero=3  (CP2 ring-attn  seq=4096)",
+        dp=4, pp=1, tp=1, cp=2, ep=1, zero_stage=3,
+        seq_len=4096, batch_per_dp=1,
         pp_microbatches=1, pp_schedule="afab",
         use_sp=False, cp_attn_core="ring",
-        model=_1B,
+        model=_LLAMA_1B,
+    ),
+    "G": PerfCase(
+        desc="dp=8  pp=1  tp=1  cp=1  ep=4  zero=3  (MoE EP baseline)",
+        dp=8, pp=1, tp=1, cp=1, ep=4, zero_stage=3,
+        seq_len=1024, batch_per_dp=2,
+        pp_microbatches=1, pp_schedule="afab",
+        use_sp=False, cp_attn_core="all_gather_kv",
+        model=_MOE_MED,
+        use_ep=True,
     ),
 }
 
@@ -129,7 +196,7 @@ _CASES: dict[str, PerfCase] = {
 # ── build runtime ─────────────────────────────────────────────────────────────
 
 def _build_core(cfg: PerfCase, device: torch.device) -> RuntimeCore:
-    model = TinyTransformerTpSp(**cfg.model)
+    model = TinyMoETransformerTpSp(**cfg.model) if cfg.use_ep else LlamaForCausalLMTpSp(cfg.model)
 
     plugins = []
     if cfg.tp > 1:
@@ -140,13 +207,16 @@ def _build_core(cfg: PerfCase, device: torch.device) -> RuntimeCore:
         plugins += [ContextParallelPlugin()]
     if cfg.pp > 1:
         plugins += [PipelineParallelPlugin(schedule=cfg.pp_schedule)]
+    if cfg.use_ep:
+        plugins += [ExpertParallelPlugin()]
     if cfg.zero_stage == 1:
         plugins += [Zero1Plugin(bucket_mb_size=32)]
     elif cfg.zero_stage == 3:
         plugins += [Zero3Plugin(wrap_cls=_ZERO3_WRAP)]
+    plugins += [PrecisionPlugin(compute_dtype=_compute_dtype_for_name(_ACTIVE_PRECISION))]
 
     return RuntimeCore(
-        mesh=MeshConfig(dp=cfg.dp, tp=cfg.tp, pp=cfg.pp, cp=cfg.cp, ep=1),
+        mesh=MeshConfig(dp=cfg.dp, tp=cfg.tp, pp=cfg.pp, cp=cfg.cp, ep=cfg.ep),
         plan=ParallelPlan(
             zero_stage=cfg.zero_stage,
             pp_schedule=PipelineScheduleConfig(microbatches=cfg.pp_microbatches),
@@ -160,10 +230,43 @@ def _build_core(cfg: PerfCase, device: torch.device) -> RuntimeCore:
     )
 
 
+_ACTIVE_PRECISION = "bf16"
+
+
+def _resolve_case(base: PerfCase, args: argparse.Namespace) -> PerfCase:
+    updates: dict[str, object] = {}
+    if args.batch_per_dp_override is not None:
+        updates["batch_per_dp"] = args.batch_per_dp_override
+    if args.seq_len_override is not None:
+        updates["seq_len"] = args.seq_len_override
+    if args.pp_microbatches_override is not None:
+        updates["pp_microbatches"] = args.pp_microbatches_override
+    if args.disable_activation_checkpointing and isinstance(base.model, LlamaConfig):
+        updates["model"] = LlamaConfig(
+            vocab_size=base.model.vocab_size,
+            hidden_size=base.model.hidden_size,
+            intermediate_size=base.model.intermediate_size,
+            num_hidden_layers=base.model.num_hidden_layers,
+            num_attention_heads=base.model.num_attention_heads,
+            num_key_value_heads=base.model.num_key_value_heads,
+            max_position_embeddings=base.model.max_position_embeddings,
+            rms_norm_eps=base.model.rms_norm_eps,
+            rope_theta=base.model.rope_theta,
+            tie_word_embeddings=base.model.tie_word_embeddings,
+            attention_backend=base.model.attention_backend,
+            activation_checkpointing=ActivationCheckpointConfig(enabled=False),
+        )
+    if not updates:
+        return base
+    return replace(base, **updates)
+
+
 # ── worker ────────────────────────────────────────────────────────────────────
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
-    cfg = _CASES[args.case]
+    global _ACTIVE_PRECISION
+    _ACTIVE_PRECISION = args.precision
+    cfg = _resolve_case(_CASES[args.case], args)
 
     local_rank = rank % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
@@ -176,7 +279,14 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         world_size=args.world_size,
         device_id=device,
     )
+    core: RuntimeCore | None = None
     try:
+        if rank == 0:
+            print(
+                f"[case {args.case}] starting: {cfg.desc} | precision={args.precision} | "
+                f"seq={cfg.seq_len} batch_per_dp={cfg.batch_per_dp}",
+                flush=True,
+            )
         core = _build_core(cfg, device)
         core.setup()
         core.model.train()
@@ -185,7 +295,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         local_bs = cfg.batch_per_dp
         torch.manual_seed(42 + dp_rank)
         fake_tokens = torch.randint(
-            0, cfg.model["vocab_size"], (local_bs, cfg.seq_len), device=device
+            0, _model_vocab_size(cfg.model), (local_bs, cfg.seq_len), device=device
         )
         batch = causal_lm_batch(fake_tokens)
 
@@ -229,23 +339,40 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
                 if prof_ctx is not None:
                     prof_ctx.step()
 
-        peak_mem_gb = torch.cuda.max_memory_allocated(device) / 1e9
-        avg_ms = sum(step_times) / len(step_times) * 1e3
+        local_peak_mem_gb = torch.cuda.max_memory_allocated(device) / 1e9
+        local_avg_ms = sum(step_times) / len(step_times) * 1e3
+        local_min_ms = min(step_times) * 1e3
+        local_max_ms = max(step_times) * 1e3
+
+        metrics = torch.tensor(
+            [local_avg_ms, local_min_ms, local_max_ms, local_peak_mem_gb],
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(metrics[0:1], op=dist.ReduceOp.MAX)
+        dist.all_reduce(metrics[1:2], op=dist.ReduceOp.MIN)
+        dist.all_reduce(metrics[2:3], op=dist.ReduceOp.MAX)
+        dist.all_reduce(metrics[3:4], op=dist.ReduceOp.MAX)
+        avg_ms = float(metrics[0].item())
+        min_ms = float(metrics[1].item())
+        max_ms = float(metrics[2].item())
+        peak_mem_gb = float(metrics[3].item())
         toks_per_sec = cfg.total_toks_per_step / (avg_ms / 1e3)
 
         if rank == 0:
             lines = [
                 f"{'─'*60}",
                 f"Case {args.case}: {cfg.desc}",
-                f"Model       : {cfg.model['n_layers']}L × dim={cfg.model['dim']}, hidden={cfg.model['hidden_size']}",
+                f"Precision   : {args.precision}",
+                f"Model       : {_model_summary(cfg.model)}",
                 f"Tokens/step : {cfg.total_toks_per_step:,}  (dp={cfg.dp} × batch={cfg.batch_per_dp} × seq={cfg.seq_len})",
-                f"Step time   : {avg_ms:.1f} ms  (min={min(step_times)*1e3:.1f}, max={max(step_times)*1e3:.1f})",
+                f"Step time   : {avg_ms:.1f} ms  (global max-rank avg; min={min_ms:.1f}, max={max_ms:.1f})",
                 f"Throughput  : {toks_per_sec:,.0f} tok/s",
-                f"Peak VRAM   : {peak_mem_gb:.2f} GB  (rank 0)",
+                f"Peak VRAM   : {peak_mem_gb:.2f} GB  (global max rank)",
             ]
             if args.profile:
-                trace_dir = Path(args.output_dir) / f"trace_case_{args.case}"
-                lines.append(f"Trace       : {trace_dir}/")
+                trace_root = Path(args.output_dir)
+                lines.append(f"Trace       : {trace_root}/trace_case_{args.case}_rank*/")
             lines.append(f"{'─'*60}")
 
             output = "\n".join(lines) + "\n"
@@ -259,13 +386,18 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
                 f"case_{args.case}  step={avg_ms:.1f}ms"
                 f"  toks/s={toks_per_sec:,.0f}"
                 f"  vram={peak_mem_gb:.2f}GB"
+                f"  precision={args.precision}"
                 f"  [{cfg.desc}]\n"
             )
             with (out_dir / "summary.txt").open("a") as fh:
                 fh.write(summary_line)
 
+    except BaseException as exc:
+        print(f"[rank {rank}] case {args.case} failed: {type(exc).__name__}: {exc}", flush=True)
+        raise
     finally:
-        core.close()
+        if core is not None:
+            core.close()
         dist.destroy_process_group()
 
 
@@ -285,6 +417,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="bf16")
+    parser.add_argument("--batch-per-dp-override", type=int, default=None)
+    parser.add_argument("--seq-len-override", type=int, default=None)
+    parser.add_argument("--pp-microbatches-override", type=int, default=None)
+    parser.add_argument("--disable-activation-checkpointing", action="store_true")
     parser.add_argument("--output-dir", type=str, default="profiles")
     parser.add_argument("--list-cases", action="store_true")
     return parser.parse_args()
@@ -295,7 +432,7 @@ def main() -> None:
     if args.list_cases:
         for k, v in _CASES.items():
             print(f"  {k}  {v.desc}")
-            print(f"     tokens/step={v.total_toks_per_step:,}  model={v.model['n_layers']}L×{v.model['dim']}")
+            print(f"     tokens/step={v.total_toks_per_step:,}  model={_model_summary(v.model)}")
         return
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     mp.spawn(_run_worker, args=(args,), nprocs=args.world_size, join=True)
