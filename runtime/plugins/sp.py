@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from parallel.specs import TpSpComm, TpSpShardAxis, TpSpShardRule
-from runtime.core import ParamRole, RuntimePhase
+from runtime.core import ParamRole
 from runtime.layers.functional import all_gather
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
@@ -72,10 +72,6 @@ class SequenceParallelPlugin(RuntimePlugin):
             module = model.get_submodule(rule.module_path)
             self._register_sequence_hook(module, rule)
         return model
-
-    def on_phase(self, phase: RuntimePhase) -> None:
-        if phase != RuntimePhase.TRANSFORM_MODEL:
-            return
 
     def _register_sequence_hook(self, module: nn.Module, rule: TpSpShardRule) -> None:
         if rule.pre_comm == TpSpComm.ALL_GATHER:

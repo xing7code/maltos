@@ -23,7 +23,6 @@ from models import TinyTransformer, TinyTransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
 from runtime import MeshAxis, MeshConfig, RuntimeCore
-from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
@@ -100,13 +99,13 @@ def _build_runtime(model: TinyTransformerTpSp, dp_size: int, tp_size: int) -> tu
         plan=ParallelPlan(zero_stage=3),
         model=model,
         grad_accum_steps=2,
+        grad_clip_max_norm=1.0,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=[
             TensorParallelPlugin(),
             SequenceParallelPlugin(),
             zero3,
             PrecisionPlugin(compute_dtype=torch.bfloat16),
-            GradClipPlugin(max_norm=1.0),
         ],
     )
     core.setup()

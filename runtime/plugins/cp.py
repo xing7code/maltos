@@ -89,6 +89,18 @@ class ContextParallelPlugin(RuntimePlugin):
             )
         return model
 
+    def annotate_param_layout(self) -> None:
+        if self.world_size <= 1:
+            return
+        assert self.runtime is not None
+        if PluginId.ZERO1 in self._active_plugin_ids or PluginId.ZERO2 in self._active_plugin_ids or PluginId.ZERO3 in self._active_plugin_ids:
+            return
+        for fq_name, _ in self.runtime.state_manager.iter_param_states():
+            param = self.runtime.state_manager.get_param_tensor(fq_name)
+            if self.runtime.get_param_role(param) == ParamRole.EXPERT:
+                continue
+            self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.CP)
+
     def on_phase(self, phase: RuntimePhase) -> None:
         if self.world_size <= 1:
             return

@@ -307,6 +307,7 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
 
 def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: torch.device) -> RuntimeCore:
     plugins = []
+    grad_clip_max_norm = None
     optimizer_factory = _build_optimizer_factory(args)
     scheduler_factory = _build_scheduler_factory(args)
     if args.tp_size > 1:
@@ -336,7 +337,10 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
     if compute_dtype is not None:
         plugins.append(PrecisionPlugin(compute_dtype=compute_dtype))
     if args.grad_clip is not None:
-        plugins.append(GradClipPlugin(max_norm=args.grad_clip))
+        if args.zero_stage == 0:
+            plugins.append(GradClipPlugin(max_norm=args.grad_clip))
+        else:
+            grad_clip_max_norm = args.grad_clip
     if not args.disable_perf_metrics:
         plugins.append(PerfMetricsPlugin())
     if args.torch_profiler:
@@ -364,6 +368,7 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
         ),
         device=device,
         model=model,
+        grad_clip_max_norm=grad_clip_max_norm,
         optimizer_factory=optimizer_factory,
         scheduler_factory=scheduler_factory,
         plugins=plugins,

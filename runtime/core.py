@@ -22,7 +22,6 @@ StepRunnerFn = Callable[[Any], torch.Tensor]
 
 class RuntimePhase(str, Enum):
     SETUP = "setup"
-    TRANSFORM_MODEL = "transform_model"
     PRE_MICROBATCH = "pre_microbatch"
     PRE_FORWARD = "pre_forward"
     POST_FORWARD = "post_forward"
@@ -127,6 +126,7 @@ class RuntimeCore:
     plan: ParallelPlan = field(default_factory=ParallelPlan)
     device: torch.device | str | None = None
     grad_accum_steps: int = 1
+    grad_clip_max_norm: float | None = None
     optimizer_factory: OptimizerFactory | None = None
     scheduler_factory: SchedulerFactory | None = None
     plugins: list[RuntimePlugin] = field(default_factory=list)
@@ -183,6 +183,8 @@ class RuntimeCore:
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
             raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
+        if self.grad_clip_max_norm is not None and self.grad_clip_max_norm <= 0:
+            raise ValueError(f"grad_clip_max_norm must be > 0, got {self.grad_clip_max_norm}")
         self.state.step_context = StepContext(
             grad_accum_steps=self.grad_accum_steps,
         )
@@ -201,7 +203,8 @@ class RuntimeCore:
         for plugin in self.plugins:
             self.model = plugin.transform_model(self.model)
         self.state_manager.register_module(self.model)
-        self._run_phase(RuntimePhase.TRANSFORM_MODEL)
+        for plugin in self.plugins:
+            plugin.annotate_param_layout()
         self._populate_static_model_metrics()
         self._maybe_build_runtime_optimizer()
         self._validate_optimizer_owner()
@@ -291,6 +294,27 @@ class RuntimeCore:
 
     def get_param_role(self, param: nn.Parameter) -> ParamRole:
         return self.state.param_roles.get(id(param), ParamRole.SHARED)
+
+    def grad_norm_replica_factor(self, param: nn.Parameter) -> int:
+        fq_name = self.state_manager.get_param_name(param)
+        layout = self.state_manager.get_param_layout(fq_name)
+        factor = 1
+        for axis in layout.replicated_axes:
+            if axis == MeshAxis.DP:
+                factor *= self.mesh.dp
+            elif axis == MeshAxis.TP:
+                factor *= self.mesh.tp
+            elif axis == MeshAxis.PP:
+                factor *= self.mesh.pp
+            elif axis == MeshAxis.CP:
+                factor *= self.mesh.cp
+            else:
+                group = self.get_group(axis)
+                if group is not None:
+                    factor *= int(dist.get_world_size(group))
+        if factor < 1:
+            raise ValueError(f"invalid grad_norm_replica_factor={factor} for param={fq_name}")
+        return factor
 
     def get_optimizer_and_scheduler(
         self,

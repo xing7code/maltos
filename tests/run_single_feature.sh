@@ -51,6 +51,12 @@ echo "=== tiny model zero1/2/3 equivalence ==="
 "${PYTHON_BIN}" tests/tiny_model_zero3_runtime_core_equivalence.py
 "${PYTHON_BIN}" tests/tiny_model_zero3_runtime_core_equivalence.py --grad-accum-steps 2
 
+echo "=== grad clip global norm equivalence ==="
+"${PYTHON_BIN}" tests/tiny_model_zero1_grad_clip_equivalence.py
+"${PYTHON_BIN}" tests/tiny_model_zero2_grad_clip_equivalence.py
+"${PYTHON_BIN}" tests/tiny_model_zero3_grad_clip_equivalence.py
+"${PYTHON_BIN}" tests/tiny_transformer_tp_grad_clip_equivalence.py
+
 echo "=== tiny transformer tp equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_tp_runtime_core_equivalence.py
 "${PYTHON_BIN}" tests/tiny_transformer_tp_runtime_core_equivalence.py --use-sp true

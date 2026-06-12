@@ -102,6 +102,7 @@ def _build_runtime(
     model: TinyMoETransformerTpSp, args: argparse.Namespace, device: torch.device | None = None,
 ) -> tuple[RuntimeCore, Zero1Plugin | Zero2Plugin | Zero3Plugin | None]:
     zero_plugin: Zero1Plugin | Zero2Plugin | Zero3Plugin | None = None
+    grad_clip_max_norm = None if args.disable_grad_clip or args.zero_stage == 0 else 1.0
     if args.zero_stage == 1:
         zero_plugin = Zero1Plugin(bucket_mb_size=0)
     elif args.zero_stage == 2:
@@ -121,7 +122,8 @@ def _build_runtime(
     if not args.disable_precision:
         plugins.append(PrecisionPlugin(compute_dtype=torch.bfloat16))
     if not args.disable_grad_clip:
-        plugins.append(GradClipPlugin(max_norm=1.0))
+        if args.zero_stage == 0:
+            plugins.append(GradClipPlugin(max_norm=1.0))
     core = RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=args.ep_size),
         plan=ParallelPlan(
@@ -133,6 +135,7 @@ def _build_runtime(
         ),
         model=model,
         grad_accum_steps=args.grad_accum_steps,
+        grad_clip_max_norm=grad_clip_max_norm,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=plugins,
         device=device,

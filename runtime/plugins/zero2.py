@@ -24,6 +24,7 @@ class _LocalAddWork:
 @dataclass
 class _Bucket:
     params: list[nn.Parameter]
+    logical_names: list[str]
     group_context: GroupContext
     role: "ParamRole"
     start: int
@@ -90,6 +91,7 @@ class Zero2Plugin(_ZeroPluginBase):
                 self._fire_post_reductions_sync()
         elif phase == RuntimePhase.PRE_STEP:
             self._wait_grad_sync()
+            self._maybe_clip_local_shards()
         elif phase == RuntimePhase.POST_STEP:
             self._gather_updated_params()
         elif phase == RuntimePhase.POST_LOAD:
@@ -108,6 +110,7 @@ class Zero2Plugin(_ZeroPluginBase):
 
         dtype = (shared_params or expert_params)[0].dtype
         device = (shared_params or expert_params)[0].device
+        param_to_name = {id(param): name for name, param in model.named_parameters()}
         flat_specs: list[tuple[GroupContext, list[nn.Parameter], int, ParamRole]] = []
         for group_context, param_buckets, role in bucket_specs:
             for bucket_params in param_buckets:
@@ -130,6 +133,7 @@ class Zero2Plugin(_ZeroPluginBase):
             self.buckets.append(
                 _Bucket(
                     params=bucket_params,
+                    logical_names=[param_to_name[id(param)] for param in bucket_params],
                     group_context=group_context,
                     role=role,
                     start=offset,
@@ -229,8 +233,30 @@ class Zero2Plugin(_ZeroPluginBase):
                         async_op=True,
                     )
                 )
-            for handle in handles:
-                handle.wait()
+        for handle in handles:
+            handle.wait()
+
+    def _bucket_local_sq(self, bucket: _Bucket) -> torch.Tensor:
+        assert self.runtime is not None
+        if bucket.local_param.grad is None:
+            return torch.zeros((), dtype=torch.float32, device=bucket.local_param.device)
+        shard_sq = torch.zeros((), dtype=torch.float32, device=bucket.local_param.grad.device)
+        local_shard_start = bucket.shard_start - bucket.start
+        local_shard_end = bucket.shard_end - bucket.start
+        offset = 0
+        for logical_name, param in zip(bucket.logical_names, bucket.params, strict=True):
+            seg_start = offset
+            seg_end = offset + param.numel()
+            overlap_start = max(seg_start, local_shard_start)
+            overlap_end = min(seg_end, local_shard_end)
+            if overlap_start < overlap_end:
+                local_start = overlap_start - local_shard_start
+                local_end = overlap_end - local_shard_start
+                logical_param = self.runtime.state_manager.get_param_tensor(logical_name)
+                factor = self.runtime.grad_norm_replica_factor(logical_param)
+                shard_sq.add_(bucket.local_param.grad[local_start:local_end].detach().float().pow(2).sum() / float(factor))
+            offset = seg_end
+        return shard_sq
 
     def _post_reduction_worker(self) -> None:
         assert self.runtime is not None

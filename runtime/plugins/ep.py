@@ -229,6 +229,18 @@ class ExpertParallelPlugin(RuntimePlugin):
         assert self.runtime is not None
         return self.runtime.get_param_role(param) == ParamRole.EXPERT
 
+    def annotate_param_layout(self) -> None:
+        assert self.runtime is not None
+        erep_group = self.edp_group
+        erep_size = dist.get_world_size(erep_group) if erep_group is not None else 1
+        if erep_size <= 1:
+            return
+        for fq_name, _ in self.runtime.state_manager.iter_param_states():
+            param = self.runtime.state_manager.get_param_tensor(fq_name)
+            if self.runtime.get_param_role(param) != ParamRole.EXPERT:
+                continue
+            self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.EREP)
+
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None

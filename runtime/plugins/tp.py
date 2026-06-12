@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch.nn as nn
 
 from parallel.specs import TpSpShardAxis
-from runtime.core import RuntimePhase
+from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
 from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
@@ -33,25 +33,21 @@ class TensorParallelPlugin(RuntimePlugin):
                 continue
             if rule.shard_axis == TpSpShardAxis.PARAM_OUT:
                 self._record_linear_rule(rule.module_path, module, rule.shard_axis)
-                model.set_submodule(
-                    rule.module_path,
-                    ColumnParallelLinear.from_linear(
-                        module,
-                        self.tp_group,
-                        gather_output=(rule.post_comm == "all_gather"),
-                    ),
+                new_col = ColumnParallelLinear.from_linear(
+                    module,
+                    self.tp_group,
+                    gather_output=(rule.post_comm == "all_gather"),
                 )
+                model.set_submodule(rule.module_path, new_col)
             elif rule.shard_axis == TpSpShardAxis.PARAM_IN:
                 self._record_linear_rule(rule.module_path, module, rule.shard_axis)
-                model.set_submodule(
-                    rule.module_path,
-                    RowParallelLinear.from_linear(
-                        module,
-                        self.tp_group,
-                        rule.post_comm,
-                        rule.comm_dim,
-                    ),
+                new_row = RowParallelLinear.from_linear(
+                    module,
+                    self.tp_group,
+                    rule.post_comm,
+                    rule.comm_dim,
                 )
+                model.set_submodule(rule.module_path, new_row)
         assert self.runtime is not None
         self.runtime.register_module_replacement(nn.Linear, ColumnParallelLinear)
         self.runtime.register_module_replacement(nn.Linear, RowParallelLinear)
@@ -101,9 +97,7 @@ class TensorParallelPlugin(RuntimePlugin):
             self._param_shard_axis[bias_name] = shard_axis
             self._logical_shapes[bias_name] = tuple(module.bias.shape)
 
-    def on_phase(self, phase: RuntimePhase) -> None:
-        if phase != RuntimePhase.TRANSFORM_MODEL:
-            return
+    def annotate_param_layout(self) -> None:
         assert self.runtime is not None
         for fq_name, param_state in self.runtime.state_manager.iter_param_states():
             param = self.runtime.state_manager.get_param_tensor(fq_name)
@@ -116,3 +110,10 @@ class TensorParallelPlugin(RuntimePlugin):
                 physical_shape=local_shape,
                 dtype=str(param.dtype),
             )
+            if self.runtime.mesh.tp <= 1:
+                continue
+            if fq_name in self._param_shard_axis:
+                self.runtime.state_manager.add_param_sharded_axis(fq_name, MeshAxis.TP)
+                continue
+            if self.runtime.get_param_role(param) == ParamRole.SHARED:
+                self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.TP)

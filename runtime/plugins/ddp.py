@@ -24,6 +24,16 @@ class DataParallelPlugin(RuntimePlugin):
         super().__init__(id=PluginId.DP, name=name)
         self.async_op = async_op
 
+    def annotate_param_layout(self) -> None:
+        assert self.runtime is not None
+        if self.runtime.mesh.dp <= 1:
+            return
+        for fq_name, _ in self.runtime.state_manager.iter_param_states():
+            param = self.runtime.state_manager.get_param_tensor(fq_name)
+            if self.runtime.get_param_role(param) == ParamRole.EXPERT:
+                continue
+            self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.DP)
+
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase != RuntimePhase.POST_BACKWARD:
             return
@@ -152,6 +162,16 @@ class BucketDataParallelPlugin(RuntimePlugin):
 
     def runtime_optimizer_replicated_axes(self) -> set[MeshAxis]:
         return {MeshAxis.DP} if self.runtime is not None and self.runtime.mesh.dp > 1 else set()
+
+    def annotate_param_layout(self) -> None:
+        assert self.runtime is not None
+        if self.runtime.mesh.dp <= 1:
+            return
+        for fq_name, _ in self.runtime.state_manager.iter_param_states():
+            param = self.runtime.state_manager.get_param_tensor(fq_name)
+            if self.runtime.get_param_role(param) == ParamRole.EXPERT:
+                continue
+            self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.DP)
 
     def _build_buckets(self, model: nn.Module, dp_group: dist.ProcessGroup) -> None:
         self.buckets = []

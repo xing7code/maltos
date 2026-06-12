@@ -167,3 +167,42 @@ class _ZeroPluginBase(RuntimePlugin):
         if curr_bucket:
             buckets.append(curr_bucket)
         return buckets
+
+    def _maybe_clip_local_shards(self) -> None:
+        assert self.runtime is not None
+        max_norm = self.runtime.grad_clip_max_norm
+        if max_norm is None or not self.buckets:
+            return
+        grad_device = None
+        for bucket in self.buckets:
+            grad = getattr(bucket.local_param, "grad", None)
+            if grad is not None:
+                grad_device = grad.device
+                break
+        if grad_device is None:
+            return
+
+        local_sq = torch.zeros((), dtype=torch.float32, device=grad_device)
+        for bucket in self.buckets:
+            local_sq.add_(self._bucket_local_sq(bucket))
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
+        global_norm = float(local_sq.sqrt().item())
+        clip_coef = float(max_norm) / (global_norm + 1e-6)
+        if clip_coef < 1.0:
+            for bucket in self.buckets:
+                grad = getattr(bucket.local_param, "grad", None)
+                if grad is not None:
+                    grad.mul_(clip_coef)
+        self.runtime.state.metadata["grad_norm"] = global_norm
+
+    def _bucket_local_sq(self, bucket) -> torch.Tensor:
+        raise NotImplementedError
+
+    def collect_metrics(self) -> dict[str, float]:
+        assert self.runtime is not None
+        grad_norm = self.runtime.state.metadata.get("grad_norm")
+        max_norm = self.runtime.grad_clip_max_norm
+        if grad_norm is None or max_norm is None:
+            return {}
+        return {"grad_norm": float(grad_norm), "max_norm": float(max_norm)}

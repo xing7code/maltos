@@ -205,7 +205,6 @@ def test_train_step_phases_and_state_manager() -> None:
     assert events == [
         "recorder:setup",
         "recorder:transform",
-        "recorder:transform_model",
         "recorder:pre_microbatch",
         "recorder:pre_forward",
         "recorder:post_forward",

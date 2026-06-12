@@ -13,7 +13,9 @@
       "Bash(sed -n *)",
       "Bash(awk *)",
       "Bash(xargs *)",
-      "Bash(bash -n *)"
+      "Bash(bash -n *)",
+      "Bash(PYTHONPATH=. .venv/bin/python3 -c ' *)",
+      "Bash(PYTHONPATH=. bash tests/run_single_feature.sh)"
     ]
   }
 }
