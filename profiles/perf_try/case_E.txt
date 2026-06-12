@@ -1,0 +1,10 @@
+────────────────────────────────────────────────────────────
+Case E: dp=2  pp=2  tp=2  cp=1  zero=3  (3D: PP+TP+ZeRO-3)
+Precision   : bf16
+Model       : 24L × hidden=2048, intermediate=8192, heads=16
+Tokens/step : 8,192  (dp=2 × batch=2 × seq=2048)
+Step time   : 10263.3 ms  (global max-rank avg; min=10180.6, max=10313.1)
+Throughput  : 798 tok/s
+Peak VRAM   : 19.10 GB  (global max rank)
+Trace       : profiles/perf_try/trace_case_E_rank*/
+────────────────────────────────────────────────────────────

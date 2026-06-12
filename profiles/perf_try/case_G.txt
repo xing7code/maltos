@@ -1,0 +1,9 @@
+────────────────────────────────────────────────────────────
+Case G: dp=8  pp=1  tp=1  cp=1  ep=4  zero=3  (MoE EP baseline)
+Precision   : bf16
+Model       : 16L × dim=768, hidden=3072
+Tokens/step : 8,192  (dp=8 × batch=1 × seq=1024)
+Step time   : 2449.6 ms  (global max-rank avg; min=2439.2, max=2461.4)
+Throughput  : 3,344 tok/s
+Peak VRAM   : 7.93 GB  (global max rank)
+────────────────────────────────────────────────────────────

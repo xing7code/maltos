@@ -1,0 +1,10 @@
+────────────────────────────────────────────────────────────
+Case A: dp=8  pp=1  tp=1  cp=1  zero=3  (pure ZeRO-3 baseline)
+Precision   : bf16
+Model       : 24L × hidden=2048, intermediate=8192, heads=16
+Tokens/step : 32,768  (dp=8 × batch=2 × seq=2048)
+Step time   : 21957.7 ms  (global max-rank avg; min=21907.1, max=21992.2)
+Throughput  : 1,492 tok/s
+Peak VRAM   : 21.01 GB  (global max rank)
+Trace       : profiles/perf_try/trace_case_A_rank*/
+────────────────────────────────────────────────────────────

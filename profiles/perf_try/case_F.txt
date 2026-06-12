@@ -1,0 +1,9 @@
+────────────────────────────────────────────────────────────
+Case F: dp=4  pp=1  tp=1  cp=2  zero=3  (CP2 ring-attn  seq=4096)
+Precision   : bf16
+Model       : 24L × hidden=2048, intermediate=8192, heads=16
+Tokens/step : 8,192  (dp=4 × batch=1 × seq=2048)
+Step time   : 20690.7 ms  (global max-rank avg; min=20509.5, max=20909.2)
+Throughput  : 396 tok/s
+Peak VRAM   : 20.37 GB  (global max rank)
+────────────────────────────────────────────────────────────

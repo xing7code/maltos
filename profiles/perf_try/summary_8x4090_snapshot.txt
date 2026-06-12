@@ -1,0 +1,6 @@
+case_A  step=21942.5ms  toks/s=1,493  vram=21.01GB  precision=bf16  [dp=8  pp=1  tp=1  cp=1  zero=3  (pure ZeRO-3 baseline)]
+case_D  step=3266.7ms  toks/s=10,031  vram=8.89GB  precision=bf16  [dp=4  pp=1  tp=2  cp=1  zero=1  (TP cost on PCIe)]
+case_G  step=2449.6ms  toks/s=3,344  vram=7.93GB  precision=bf16  [dp=8  pp=1  tp=1  cp=1  ep=4  zero=3  (MoE EP baseline)]
+case_E  step=7189.7ms  toks/s=570  vram=11.92GB  precision=bf16  [dp=2  pp=2  tp=2  cp=1  zero=3  (3D: PP+TP+ZeRO-3)]
+case_F  step=20690.7ms  toks/s=396  vram=20.37GB  precision=bf16  [dp=4  pp=1  tp=1  cp=2  zero=3  (CP2 ring-attn  seq=4096)]
+case_E  step=10131.1ms  toks/s=809  vram=19.10GB  precision=bf16  [dp=2  pp=2  tp=2  cp=1  zero=3  (3D: PP+TP+ZeRO-3)]

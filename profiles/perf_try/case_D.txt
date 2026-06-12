@@ -1,0 +1,9 @@
+────────────────────────────────────────────────────────────
+Case D: dp=4  pp=1  tp=2  cp=1  zero=1  (TP cost on PCIe)
+Precision   : bf16
+Model       : 24L × hidden=1024, intermediate=4096, heads=16
+Tokens/step : 32,768  (dp=4 × batch=4 × seq=2048)
+Step time   : 3266.7 ms  (global max-rank avg; min=3216.5, max=3290.5)
+Throughput  : 10,031 tok/s
+Peak VRAM   : 8.89 GB  (global max rank)
+────────────────────────────────────────────────────────────
