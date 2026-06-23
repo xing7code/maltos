@@ -4,7 +4,7 @@
 # gloo:           BACKEND=gloo ./tests/run_matrix.sh
 # nccl:           BACKEND=nccl ./tests/run_matrix.sh
 # nccl no-merge:  BACKEND=nccl MERGE=0 ./tests/run_matrix.sh
-# Continue on Vast with files:
+# Skip cases:
 #   edit local_notes/matrix_blacklist.txt, then run: BACKEND=nccl ./tests/run_matrix.sh
 # Run only a subset:
 #   edit local_notes/matrix_whitelist.txt, then run: BACKEND=gloo ./tests/run_matrix.sh

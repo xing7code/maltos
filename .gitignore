@@ -11,9 +11,18 @@ __pycache__/
 *.pth
 .DS_Store
 
+# editor / agent config
+.claude/
+.cursor/
+
+# nccl debug logs (local triage artifacts)
+nccl_logs/
+
 # raw profiler artifacts
 profiles/**/trace_case_*/
 profiles/**/profile_case_*/
 profiles/**/*.pt.trace.json
 profiles/**/*.nsys-rep
 profiles/**/*.qdrep
+profiles/bundles/
+profiles/**/*.tar.gz

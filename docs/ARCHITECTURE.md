@@ -47,10 +47,9 @@ trainer loop.
 
 ## Phase Model
 
-The runtime exposes these training phases:
+The runtime exposes these training phases (`RuntimePhase`):
 
 - `SETUP`
-- `TRANSFORM_MODEL`
 - `PRE_MICROBATCH`
 - `PRE_FORWARD`
 - `POST_FORWARD`
@@ -60,6 +59,10 @@ The runtime exposes these training phases:
 - `POST_STEP`
 - `PRE_SAVE`
 - `POST_LOAD`
+
+Model transformation is not a phase: right after `SETUP`, the runtime calls each
+plugin's `transform_model()` hook so TP/SP/PP/ZeRO/etc. can rewrite the module
+before the optimizer is built.
 
 Plugins compose by registering phase behavior rather than rewriting the trainer.
 This is what lets TP/SP/PP/CP/DDP/ZeRO/precision/clip/profiler/metrics stack on
