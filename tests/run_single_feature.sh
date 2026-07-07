@@ -60,6 +60,8 @@ echo "=== grad clip global norm equivalence ==="
 echo "=== tiny transformer tp equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_tp_runtime_core_equivalence.py
 "${PYTHON_BIN}" tests/tiny_transformer_tp_runtime_core_equivalence.py --use-sp true
+"${PYTHON_BIN}" tests/tiny_transformer_tp_runtime_core_equivalence.py --world-size 4 --tp-size 4
+"${PYTHON_BIN}" tests/tiny_transformer_tp_runtime_core_equivalence.py --world-size 4 --tp-size 4 --use-sp true
 
 echo "=== tp checkpoint manifest ==="
 "${PYTHON_BIN}" tests/tiny_transformer_tp_checkpoint_manifest.py
@@ -119,6 +121,7 @@ echo "=== tiny transformer ep equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_tp_sp_zero1 --world-size 8 --dp-size 4 --ep-size 2 --tp-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_tp_sp_zero2 --world-size 8 --dp-size 4 --ep-size 2 --tp-size 2
 "${PYTHON_BIN}" tests/tiny_transformer_ep_runtime_core_equivalence.py --case ep_tp_sp_zero3 --world-size 8 --dp-size 4 --ep-size 2 --tp-size 2
+"${PYTHON_BIN}" tests/tiny_transformer_ep_tp_sp_erep_subgroup_equivalence.py --world-size 4 --tp-size 4 --ep-size 2
 
 echo "=== tiny transformer ep+cp+zero equivalence ==="
 "${PYTHON_BIN}" tests/tiny_transformer_ep_cp_zero_equivalence.py --case ep_cp_zero1 --world-size 4 --dp-size 2 --cp-size 2 --ep-size 2

@@ -19,7 +19,8 @@ class CausalSelfAttention(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads or n_heads
         self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.kv_proj = nn.Linear(dim, 2*self.head_dim*self.n_kv_heads, bias=False)
+        self.k_proj = nn.Linear(dim, self.head_dim*self.n_kv_heads, bias=False)
+        self.v_proj = nn.Linear(dim, self.head_dim*self.n_kv_heads, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
         self.attn_core = _LocalCausalAttentionCore()
 
@@ -28,9 +29,8 @@ class CausalSelfAttention(nn.Module):
         b, s, d = x.size()
         # use -1 for n_heads, n_kv_heads, this dim can be sharded for TP.
         q = self.q_proj(x).view(b, s, -1, self.head_dim).transpose(1, 2)
-        k, v = self.kv_proj(x).view(b, s, -1).chunk(2, dim=-1)
-        k = k.view(b, s, -1, self.head_dim).transpose(1,2)
-        v = v.view(b, s, -1, self.head_dim).transpose(1,2)
+        k = self.k_proj(x).view(b, s, -1, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(b, s, -1, self.head_dim).transpose(1, 2)
         if self.n_heads != self.n_kv_heads:
             k = k.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1)
             v = v.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1)
@@ -214,7 +214,8 @@ class TinyTransformerTp(TinyTransformer):
         for i in range(len(self.layers)):
             rules += [
                 TpSpShardRule(f"layers.{i}.attn.q_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
-                TpSpShardRule(f"layers.{i}.attn.kv_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.k_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.v_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
                 TpSpShardRule(f"layers.{i}.attn.o_proj", shard_axis=TpSpShardAxis.PARAM_IN, post_comm="all_reduce"),
                 TpSpShardRule(f"layers.{i}.mlp.gate", shard_axis=TpSpShardAxis.PARAM_OUT),
                 TpSpShardRule(f"layers.{i}.mlp.up", shard_axis=TpSpShardAxis.PARAM_OUT),
@@ -235,7 +236,8 @@ class TinyTransformerTpSp(TinyTransformer):
             rules += [
                 TpSpShardRule(f"layers.{i}.attn", shard_axis=TpSpShardAxis.SEQUENCE, pre_comm="all_gather", comm_dim=1),
                 TpSpShardRule(f"layers.{i}.attn.q_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
-                TpSpShardRule(f"layers.{i}.attn.kv_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.k_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.v_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
                 TpSpShardRule(f"layers.{i}.attn.o_proj", shard_axis=TpSpShardAxis.PARAM_IN, post_comm="reduce_scatter"),
                 TpSpShardRule(f"layers.{i}.mlp", shard_axis=TpSpShardAxis.SEQUENCE, pre_comm="all_gather", comm_dim=1),
                 TpSpShardRule(f"layers.{i}.mlp.gate", shard_axis=TpSpShardAxis.PARAM_OUT),

@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from parallel.specs import TpSpComm, TpSpShardAxis, TpSpShardRule
-from runtime.core import ParamRole
 from runtime.layers.functional import all_gather
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
@@ -47,20 +46,6 @@ class SequenceParallelPlugin(RuntimePlugin):
     @property
     def world_size(self) -> int:
         return dist.get_world_size(self.sp_group)
-
-    def bind(self, runtime: "RuntimeCore") -> None:
-        super().bind(runtime)
-        active = {plugin.id for plugin in runtime.plugins if plugin is not self}
-        zero_active = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
-        ep_active = PluginId.EP in active
-        if zero_active or ep_active:
-            runtime.register_post_grad_reduction_callback(
-                self._expert_tp_sync_callback,
-                role_filter=ParamRole.EXPERT,
-            )
-
-    def _expert_tp_sync_callback(self, grad: torch.Tensor) -> dist.Work | None:
-        return dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.sp_group, async_op=True)
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         if not isinstance(model, TpSpParallelizableModule):

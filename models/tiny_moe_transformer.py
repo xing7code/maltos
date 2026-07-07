@@ -171,7 +171,8 @@ class TinyMoETransformerTp(TinyMoETransformer):
         for i in range(len(self.layers)):
             rules += [
                 TpSpShardRule(f"layers.{i}.attn.q_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
-                TpSpShardRule(f"layers.{i}.attn.kv_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.k_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.v_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
                 TpSpShardRule(f"layers.{i}.attn.o_proj", shard_axis=TpSpShardAxis.PARAM_IN, post_comm="all_reduce"),
             ]
         return TpSpParallelSpec(rules=rules, tie_rules=[])
@@ -191,7 +192,8 @@ class TinyMoETransformerTpSp(TinyMoETransformer):
                     comm_dim=1,
                 ),
                 TpSpShardRule(f"layers.{i}.attn.q_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
-                TpSpShardRule(f"layers.{i}.attn.kv_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.k_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
+                TpSpShardRule(f"layers.{i}.attn.v_proj", shard_axis=TpSpShardAxis.PARAM_OUT),
                 TpSpShardRule(
                     f"layers.{i}.attn.o_proj",
                     shard_axis=TpSpShardAxis.PARAM_IN,

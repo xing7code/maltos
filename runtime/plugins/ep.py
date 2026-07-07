@@ -15,6 +15,7 @@ from parallel.expert import ExpertParallelMoEModule
 from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import ExpertParallelizableModule, PluginId, RuntimePlugin
+from runtime.plugins.zero_common import expert_erep_correction
 
 
 @dataclass(frozen=True)
@@ -254,12 +255,24 @@ class ExpertParallelPlugin(RuntimePlugin):
                     if param.requires_grad and param.grad is not None and id(param) in self._expert_param_ids
                 ]
                 if self.edp_group is not None and dist.get_world_size(self.edp_group) > 1:
+                    mesh = self.runtime.mesh
+                    plan = self.runtime.plan
+                    correction = expert_erep_correction(
+                        tp=mesh.tp,
+                        cp=mesh.cp,
+                        ep=mesh.ep,
+                        reuse_tp=getattr(plan, "reuse_tp_for_ep", True),
+                        reuse_cp=getattr(plan, "reuse_cp_for_ep", True),
+                    )
                     edp_handles = [
                         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.edp_group, async_op=True)
                         for param in expert_params
                     ]
                     for handle in edp_handles:
                         handle.wait()
+                    if correction != 1.0:
+                        for param in expert_params:
+                            param.grad.mul_(correction)
                 callbacks = self.runtime._post_grad_reduction_callbacks
                 for param in expert_params:
                     if param.grad is None:

@@ -12,6 +12,27 @@ from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
 
 
+def expert_erep_correction(*, tp: int, cp: int, ep: int, reuse_tp: bool, reuse_cp: bool) -> float:
+    """Multiplier to turn an AVG all-reduce over MeshAxis.EREP into the correct op.
+
+    EREP mixes two different kinds of replication depending on how EP reuses
+    other axes: seq-slice multiplicity (when reuse_tp/reuse_cp let EP fall
+    inside TP/CP without full sequence gathering, so different EREP members
+    hold disjoint token subsets and their expert grads must be *summed*) and
+    genuine DP-style data replication (which must be *averaged*). AVG divides
+    by EREP world size unconditionally; multiplying by this correction after
+    AVG turns the seq-slice portion of that division back into a sum while
+    leaving any real DP averaging in place.
+    """
+    if reuse_tp and reuse_cp:
+        return float(tp * cp // ep) if ep <= tp * cp else 1.0
+    if reuse_tp and not reuse_cp:
+        return float(tp // ep) if ep <= tp else 1.0
+    if not reuse_tp and reuse_cp:
+        return float(cp // ep) if ep <= cp else 1.0
+    return 1.0
+
+
 @dataclass(frozen=True)
 class GroupContext:
     group: dist.ProcessGroup | None
@@ -104,22 +125,13 @@ class _ZeroPluginBase(RuntimePlugin):
             if group is None:
                 return GroupContext(None, 1, 0)
             plan = self.runtime.plan
-            reuse_tp = getattr(plan, 'reuse_tp_for_ep', True)
-            reuse_cp = getattr(plan, 'reuse_cp_for_ep', True)
-            if reuse_tp and reuse_cp:
-                # EREP spans (TP*CP/EP) seq slots × DP data slots.
-                # correction = TP*CP/EP when EP ≤ TP*CP (seq multiplicity); else 1.0.
-                correction = float(mesh.tp * mesh.cp // mesh.ep) if mesh.ep <= mesh.tp * mesh.cp else 1.0
-            elif reuse_tp and not reuse_cp:
-                # EP groups per-CP; EREP spans TP/EP TP positions × DP data slots.
-                # CP is not in EREP (groups are per-CP), so no CP factor.
-                correction = float(mesh.tp // mesh.ep) if mesh.ep <= mesh.tp else 1.0
-            elif not reuse_tp and reuse_cp:
-                # EP groups per-TP; EREP spans CP/EP seq slots × DP data slots.
-                correction = float(mesh.cp // mesh.ep) if mesh.ep <= mesh.cp else 1.0
-            else:
-                # EP uses DP only; EREP = pure DP replicas, no seq multiplicity.
-                correction = 1.0
+            correction = expert_erep_correction(
+                tp=mesh.tp,
+                cp=mesh.cp,
+                ep=mesh.ep,
+                reuse_tp=getattr(plan, 'reuse_tp_for_ep', True),
+                reuse_cp=getattr(plan, 'reuse_cp_for_ep', True),
+            )
             return GroupContext(group, dist.get_world_size(group), dist.get_rank(group), correction=correction)
         # SHARED: shard over DCP (DP × CP); AVG divides by dp*cp, want to divide by dp only.
         dcp_group = self.runtime.get_group(MeshAxis.DCP)
