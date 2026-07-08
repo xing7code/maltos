@@ -9,52 +9,14 @@ import torch.nn as nn
 from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId
-from runtime.plugins.zero_common import GroupContext, _ZeroPluginBase
-
-
-class _AllReduceShardWork:
-    def __init__(
-        self,
-        work: dist.Work,
-        grad_buffer: torch.Tensor,
-        local_grad: torch.Tensor,
-        shard_start: int,
-        shard_end: int,
-        correction: float = 1.0,
-    ):
-        self.work = work
-        self.grad_buffer = grad_buffer
-        self.local_grad = local_grad
-        self.shard_start = shard_start
-        self.shard_end = shard_end
-        self.correction = correction
-
-    def wait(self) -> None:
-        self.work.wait()
-        shard = self.grad_buffer[self.shard_start : self.shard_end]
-        self.local_grad.copy_(shard if self.correction == 1.0 else shard * self.correction)
-
-
-class _CorrectedWork:
-    """Wraps a dist.Work and multiplies the output tensor by correction on wait()."""
-
-    def __init__(self, work: dist.Work, tensor: torch.Tensor, correction: float) -> None:
-        self.work = work
-        self.tensor = tensor
-        self.correction = correction
-
-    def wait(self) -> None:
-        self.work.wait()
-        self.tensor.mul_(self.correction)
-
-
-class _LocalCopyWork:
-    def __init__(self, src: torch.Tensor, dst: torch.Tensor) -> None:
-        self.src = src
-        self.dst = dst
-
-    def wait(self) -> None:
-        self.dst.copy_(self.src)
+from runtime.plugins.zero_common import (
+    ChainedWork,
+    GroupContext,
+    LocalCopyWork,
+    NarrowShardWork,
+    ZeroPluginBase,
+    rearm_bucket_pending,
+)
 
 
 @dataclass
@@ -69,11 +31,10 @@ class _Bucket:
     shard_end: int
     local_param: nn.Parameter
     pending: int
-    handle: dist.Work | _AllReduceShardWork | _LocalCopyWork | _CorrectedWork | None = None
-    post_reduction_handles: list[dist.Work] = field(default_factory=list)
+    work: ChainedWork | None = None
 
 
-class Zero1Plugin(_ZeroPluginBase):
+class Zero1Plugin(ZeroPluginBase):
     """ZeRO-1 style optimizer-state sharding over the data-parallel axis."""
 
     def __init__(
@@ -112,16 +73,10 @@ class Zero1Plugin(_ZeroPluginBase):
                 grad_accum_start=context.accum_start,
                 grad_accum_end=context.is_step_boundary,
             )
-            if context.is_step_boundary and self._use_async_worker():
-                self._start_post_reduction_worker()
         elif phase == RuntimePhase.POST_BACKWARD:
-            assert self.runtime is not None
-            if self.runtime.state.step_context.is_step_boundary and (
-                not self._use_async_worker() or not self.runtime._post_grad_reduction_callbacks
-            ):
-                self._fire_post_reductions_sync()
+            if self.runtime is not None and self.runtime.state.step_context.is_step_boundary:
+                self._wait_grad_sync()
         elif phase == RuntimePhase.PRE_STEP:
-            self._wait_grad_sync()
             self._maybe_clip_local_shards()
         elif phase == RuntimePhase.POST_STEP:
             self._gather_updated_params()
@@ -194,34 +149,42 @@ class Zero1Plugin(_ZeroPluginBase):
             if bucket.pending == 0:
                 if bucket.local_param.grad is None:
                     bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
-                bucket.handle = self._reduce_scatter_avg(bucket)
-                if self._use_async_worker():
-                    with self._post_reduction_cond:
-                        self._post_reduction_cond.notify_all()
+                bucket.work = self._new_bucket_work(bucket)
+                bucket.work.fire()
 
         return hook
 
-    def _reduce_scatter_avg(self, bucket: _Bucket) -> dist.Work | _AllReduceShardWork | _LocalCopyWork | _CorrectedWork:
+    def _reduce_scatter_avg_functor(self, bucket: _Bucket):
+        """Root functor: fires the ZeRO reduce-scatter (or all-reduce, on gloo)."""
         assert self.grad_buffer is not None
         assert bucket.local_param.grad is not None
-        full_grad = self.grad_buffer[bucket.start : bucket.end]
-        if bucket.group_context.group is None or bucket.group_context.world_size == 1:
-            return _LocalCopyWork(full_grad[bucket.shard_start - bucket.start : bucket.shard_end - bucket.start], bucket.local_param.grad)
-        if bucket.group_context.is_gloo:
-            work = dist.all_reduce(full_grad, op=dist.ReduceOp.AVG, group=bucket.group_context.group, async_op=True)
-            shard_start = bucket.shard_start - bucket.start
-            shard_end = bucket.shard_end - bucket.start
-            return _AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end, bucket.group_context.correction)
-        work = dist.reduce_scatter_tensor(
-            bucket.local_param.grad,
-            full_grad,
-            op=dist.ReduceOp.AVG,
-            group=bucket.group_context.group,
-            async_op=True,
-        )
-        if bucket.group_context.correction == 1.0:
-            return work
-        return _CorrectedWork(work, bucket.local_param.grad, bucket.group_context.correction)
+
+        def functor() -> dist.Work:
+            full_grad = self.grad_buffer[bucket.start : bucket.end]
+            correction = bucket.group_context.correction
+            if bucket.group_context.group is None or bucket.group_context.world_size == 1:
+                return LocalCopyWork(
+                    full_grad[bucket.shard_start - bucket.start : bucket.shard_end - bucket.start],
+                    bucket.local_param.grad,
+                )
+            if bucket.group_context.is_gloo:
+                if correction != 1.0:
+                    full_grad.mul_(correction)
+                work = dist.all_reduce(full_grad, op=dist.ReduceOp.AVG, group=bucket.group_context.group, async_op=True)
+                shard_start = bucket.shard_start - bucket.start
+                shard_end = bucket.shard_end - bucket.start
+                return NarrowShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end)
+            if correction != 1.0:
+                full_grad.mul_(correction)
+            return dist.reduce_scatter_tensor(
+                bucket.local_param.grad,
+                full_grad,
+                op=dist.ReduceOp.AVG,
+                group=bucket.group_context.group,
+                async_op=True,
+            )
+
+        return functor
 
     def _bucket_local_sq(self, bucket: _Bucket) -> torch.Tensor:
         assert self.runtime is not None
@@ -267,57 +230,30 @@ class Zero1Plugin(_ZeroPluginBase):
             for handle in handles:
                 handle.wait()
 
-    def _post_reduction_worker(self) -> None:
-        assert self.runtime is not None
-        callbacks = self.runtime._post_grad_reduction_callbacks
-        for bucket in self.buckets:
-            with self._post_reduction_cond:
-                self._post_reduction_cond.wait_for(lambda: bucket.handle is not None)
-            if bucket.handle is None:
-                raise RuntimeError("ZeRO1 bucket handle is None after backward")
-            bucket.handle.wait()
-            if bucket.local_param.grad is not None:
-                for cb, role_filter in callbacks:
-                    if role_filter is not None and bucket.role != role_filter:
-                        continue
-                    work = cb(bucket.local_param.grad)
-                    if work is not None:
-                        bucket.post_reduction_handles.append(work)
-
-    def _fire_post_reductions_sync(self) -> None:
-        assert self.runtime is not None
-        callbacks = self.runtime._post_grad_reduction_callbacks
-        for bucket in self.buckets:
-            self._ensure_bucket_handle(bucket)
-            if bucket.handle is None:
-                raise RuntimeError("ZeRO1 bucket handle is None after backward")
-            bucket.handle.wait()
-            bucket.handle = None
-            if bucket.local_param.grad is not None:
-                for cb, role_filter in callbacks:
-                    if role_filter is not None and bucket.role != role_filter:
-                        continue
-                    work = cb(bucket.local_param.grad)
-                    if work is not None:
-                        bucket.post_reduction_handles.append(work)
-
     def _wait_grad_sync(self) -> None:
-        if self._post_reduction_thread is not None:
-            self._post_reduction_thread.join()
-            self._post_reduction_thread = None
         for bucket in self.buckets:
-            for handle in bucket.post_reduction_handles:
-                handle.wait()
-            bucket.post_reduction_handles.clear()
+            self._ensure_bucket_work(bucket)
+            assert bucket.work is not None
+            bucket.work.wait()
+            bucket.work = None
+
+    def _new_bucket_work(self, bucket: _Bucket) -> ChainedWork:
+        work = ChainedWork(
+            None,
+            self._reduce_scatter_avg_functor(bucket),
+            blocks_by_stream=bucket.group_context.supports_async_overlap,
+        )
+        return self._apply_chained_work_wrappers(
+            work, bucket.local_param.grad, bucket.role
+        )
 
     def _reset_buckets(self, *, grad_accum_start: bool, grad_accum_end: bool) -> None:
         assert self.grad_buffer is not None
         if grad_accum_start:
             self.grad_buffer.zero_()
         for bucket in self.buckets:
-            bucket.pending = len(bucket.params) if grad_accum_end else 0
-            bucket.handle = None
-            bucket.post_reduction_handles.clear()
+            bucket.pending = rearm_bucket_pending(len(bucket.params), grad_accum_end=grad_accum_end)
+            bucket.work = None
 
     def _sync_local_params_from_data_buffer(self) -> None:
         assert self.data_buffer is not None
@@ -325,9 +261,14 @@ class Zero1Plugin(_ZeroPluginBase):
             for bucket in self.buckets:
                 bucket.local_param.data.copy_(self.data_buffer[bucket.shard_start : bucket.shard_end])
 
-    def _ensure_bucket_handle(self, bucket: _Bucket) -> None:
-        if bucket.handle is not None:
+    def _ensure_bucket_work(self, bucket: _Bucket) -> None:
+        # Every rank must fire the same sequence of collectives on a bucket's
+        # group, even if this rank's hook never ran (e.g. a PP stage that
+        # doesn't own these params never accumulates a grad for them) --
+        # otherwise a peer rank that DID fire waits forever on this one.
+        if bucket.work is not None:
             return
         if bucket.local_param.grad is None:
             bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
-        bucket.handle = self._reduce_scatter_avg(bucket)
+        bucket.work = self._new_bucket_work(bucket)
+        bucket.work.fire()

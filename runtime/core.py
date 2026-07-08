@@ -150,32 +150,9 @@ class RuntimeCore:
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False)
     _group_manager: ProcessGroupManager | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
-    _post_grad_reduction_callbacks: list[
-        tuple[Callable[[torch.Tensor], "dist.Work | None"], "ParamRole | None"]
-    ] = field(default_factory=list, init=False)
     _module_replacements: "dict[type[nn.Module], set[type[nn.Module]]]" = field(
         default_factory=dict, init=False
     )
-
-    def register_post_grad_reduction_callback(
-        self,
-        cb: Callable[[torch.Tensor], "dist.Work | None"],
-        *,
-        role_filter: "ParamRole | None" = None,
-    ) -> None:
-        """Register a callback invoked after each DP-equivalent gradient reduction completes.
-
-        Any plugin that performs gradient reduction (ZeRO, EP) fires these callbacks
-        after each param/bucket is reduced. Cross-cutting plugins (CP, SP) register
-        here instead of embedding sync logic inside the reducer.
-
-        The callback receives the local gradient shard and may return an async Work
-        handle; the reducer will wait on it before PRE_STEP.
-
-        The callback must be tensor-agnostic: shape and parameter identity vary per
-        invocation. role_filter restricts invocation to buckets/params of that role.
-        """
-        self._post_grad_reduction_callbacks.append((cb, role_filter))
 
     def register_module_replacement(
         self, original: "type[nn.Module]", replacement: "type[nn.Module]"

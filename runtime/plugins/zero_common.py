@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-import threading
 
 import torch
 import torch.distributed as dist
@@ -10,6 +10,129 @@ import torch.nn as nn
 from runtime.core import ParamRole
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
+
+
+class ChainedWork:
+    """A single grad-sync chain: 0..N async collectives fired back-to-back.
+
+    Each link's functor fires its own collective (or does a purely local
+    tensor op and returns a completed no-op Work) and returns a `dist.Work`.
+    `fire()` walks the chain from the root. Between consecutive links it
+    needs to guarantee the next collective observes the data the previous
+    one wrote:
+
+    - On stream-based (NCCL) backends this is a `block_current_stream()`
+      call -- a non-blocking insert of a CUDA stream dependency.
+    - Gloo has no stream/event concept (`block_current_stream()` raises
+      `RuntimeError: Failed to create StreamBlock` on a CPU-only Work), so
+      a gloo parent link must use a real, blocking `.wait()` instead. This
+      matches gloo's own async_op semantics (a background thread already
+      does the blocking internally), so it doesn't give up any overlap
+      gloo didn't already lack.
+
+    Pass `blocks_by_stream=False` for a functor whose collective runs on
+    gloo so its link uses `.wait()` to synchronize with the next link
+    instead of `block_current_stream()`.
+
+    `wait()` only needs to wait on the last link: by the time it completes,
+    everything upstream has completed too (guaranteed by the stream
+    dependency chain on NCCL, or by the blocking wait on gloo).
+
+    This replaces the old pattern of bespoke per-collective wrapper classes
+    and the background-thread post-reduction worker: any per-collective
+    post-processing (e.g. multiplying by a correction factor) belongs
+    *inside* a functor as a pre-communication local op, not as a wait-time
+    step, so a chain of arbitrary length still ends in a single `dist.Work`
+    to wait on. See `CompletedWork`/`LocalCopyWork`/`NarrowShardWork` below
+    for the small set of reusable wait-time tensor ops.
+    """
+
+    def __init__(
+        self,
+        parent: "ChainedWork | None",
+        functor: Callable[[], dist.Work],
+        *,
+        blocks_by_stream: bool = True,
+    ) -> None:
+        self.parent = parent
+        self.functor = functor
+        self.blocks_by_stream = blocks_by_stream
+        self.handle: dist.Work | None = None
+
+    def fire(self) -> None:
+        if self.parent is not None:
+            # A ChainedWork may be persistent and re-fired every training step
+            # (EP buckets do this). Each top-level fire must therefore replay
+            # the entire chain; a non-None handle only describes the previous
+            # invocation and must not suppress the parent's new collective.
+            self.parent.fire()
+            assert self.parent.handle is not None
+            if self.parent.blocks_by_stream:
+                self.parent.handle.block_current_stream()
+            else:
+                self.parent.handle.wait()
+        self.handle = self.functor()
+
+    def wait(self) -> None:
+        if self.handle is None:
+            self.fire()
+        assert self.handle is not None
+        self.handle.wait()
+
+
+class CompletedWork:
+    """dist.Work stand-in for a step that already finished synchronously (or did nothing)."""
+
+    def wait(self) -> None:
+        pass
+
+    def block_current_stream(self) -> None:
+        pass
+
+
+class LocalCopyWork(CompletedWork):
+    """Single-rank (no collective) case: just copy the local shard synchronously."""
+
+    def __init__(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        dst.copy_(src)
+
+
+class NarrowShardWork:
+    """Wraps a full-buffer all-reduce Work; narrows out this rank's shard once
+    the all-reduce completes and writes it into local_grad.
+
+    Pass `accumulate=True` (ZeRO-2/3, where multiple exec_states/microbatches
+    each contribute additively to the same local_param.grad) to add the shard
+    in; leave it False (ZeRO-1, one reduction per bucket) to overwrite.
+    """
+
+    def __init__(
+        self,
+        work: dist.Work,
+        grad_buffer: torch.Tensor,
+        local_grad: torch.Tensor,
+        shard_start: int,
+        shard_end: int,
+        *,
+        accumulate: bool = False,
+    ) -> None:
+        self.work = work
+        self.grad_buffer = grad_buffer
+        self.local_grad = local_grad
+        self.shard_start = shard_start
+        self.shard_end = shard_end
+        self.accumulate = accumulate
+
+    def block_current_stream(self) -> None:
+        self.work.block_current_stream()
+
+    def wait(self) -> None:
+        self.work.wait()
+        shard = self.grad_buffer[self.shard_start : self.shard_end]
+        if self.accumulate:
+            self.local_grad.add_(shard)
+        else:
+            self.local_grad.copy_(shard)
 
 
 def expert_erep_correction(*, tp: int, cp: int, ep: int, reuse_tp: bool, reuse_cp: bool) -> float:
@@ -33,6 +156,42 @@ def expert_erep_correction(*, tp: int, cp: int, ep: int, reuse_tp: bool, reuse_c
     return 1.0
 
 
+def rearm_bucket_pending(num_params: int, *, grad_accum_end: bool) -> int:
+    """Pending-hook-count to arm a bucket with at the start of a backward.
+
+    Grad accumulation reuses the same grad buffer across multiple backward
+    micro-steps without zeroing it between them (only at the first micro-step
+    of the window), so intermediate micro-steps must NOT trigger the bucket's
+    collective -- only the final micro-step (grad_accum_end, i.e.
+    StepContext.is_step_boundary) should. Arming pending to 0 on intermediate
+    steps means each param's hook decrements it negative (-1, -2, ...),
+    never hitting the `pending == 0` check that fires the collective; only
+    when armed to num_params (on the step-boundary micro-step) does the
+    hook's final decrement land exactly on 0.
+    """
+    return num_params if grad_accum_end else 0
+
+
+def build_param_buckets(params: list[nn.Parameter], bucket_byte_size: int) -> list[list[nn.Parameter]]:
+    """Greedily groups params (in the given order) into buckets no larger than
+    bucket_byte_size, so a plugin can coalesce many small collectives into one
+    per bucket instead of firing one collective per parameter."""
+    buckets: list[list[nn.Parameter]] = []
+    curr_bucket: list[nn.Parameter] = []
+    curr_bytes = 0
+    for param in params:
+        param_bytes = param.numel() * param.element_size()
+        if curr_bucket and curr_bytes + param_bytes > bucket_byte_size:
+            buckets.append(curr_bucket)
+            curr_bucket = []
+            curr_bytes = 0
+        curr_bucket.append(param)
+        curr_bytes += param_bytes
+    if curr_bucket:
+        buckets.append(curr_bucket)
+    return buckets
+
+
 @dataclass(frozen=True)
 class GroupContext:
     group: dist.ProcessGroup | None
@@ -52,51 +211,7 @@ class GroupContext:
         return self.group is not None and not self.is_gloo
 
 
-class AllReduceShardWork:
-    def __init__(
-        self,
-        work: dist.Work,
-        grad_buffer: torch.Tensor,
-        local_grad: torch.Tensor,
-        shard_start: int,
-        shard_end: int,
-        correction: float = 1.0,
-    ):
-        self.work = work
-        self.grad_buffer = grad_buffer
-        self.local_grad = local_grad
-        self.shard_start = shard_start
-        self.shard_end = shard_end
-        self.correction = correction
-
-    def wait(self) -> None:
-        self.work.wait()
-        shard = self.grad_buffer[self.shard_start : self.shard_end]
-        if self.correction != 1.0:
-            shard = shard * self.correction
-        self.local_grad.add_(shard)
-
-
-class ReduceScatterShardWork:
-    def __init__(
-        self,
-        work: dist.Work,
-        shard_buffer: torch.Tensor,
-        local_grad: torch.Tensor,
-        correction: float = 1.0,
-    ):
-        self.work = work
-        self.shard_buffer = shard_buffer
-        self.local_grad = local_grad
-        self.correction = correction
-
-    def wait(self) -> None:
-        self.work.wait()
-        shard = self.shard_buffer if self.correction == 1.0 else self.shard_buffer * self.correction
-        self.local_grad.add_(shard)
-
-
-class _ZeroPluginBase(RuntimePlugin):
+class ZeroPluginBase(RuntimePlugin):
     def __init__(
         self,
         *,
@@ -114,8 +229,29 @@ class _ZeroPluginBase(RuntimePlugin):
         self.buckets: list = []
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
-        self._post_reduction_thread: threading.Thread | None = None
-        self._post_reduction_cond = threading.Condition()
+        self._chained_work_wrappers: list[
+            tuple[Callable[[ChainedWork, torch.Tensor], ChainedWork], ParamRole | None]
+        ] = []
+
+    def wrap_chained_work(
+        self,
+        wrap: Callable[[ChainedWork, torch.Tensor], ChainedWork],
+        *,
+        role_filter: ParamRole | None = None,
+    ) -> None:
+        """Append a reduction step to future bucket work chains."""
+        self._chained_work_wrappers.append((wrap, role_filter))
+
+    def _apply_chained_work_wrappers(
+        self,
+        work: ChainedWork,
+        tensor: torch.Tensor,
+        role: ParamRole,
+    ) -> ChainedWork:
+        for wrap, role_filter in self._chained_work_wrappers:
+            if role_filter is None or role_filter == role:
+                work = wrap(work, tensor)
+        return work
 
     def _group_context_for_role(self, role: ParamRole) -> GroupContext:
         assert self.runtime is not None
@@ -143,32 +279,6 @@ class _ZeroPluginBase(RuntimePlugin):
     def _padded_len(self, numel: int, world_size: int) -> int:
         return (numel + world_size - 1) // world_size * world_size
 
-    def _use_async_worker(self) -> bool:
-        if self.dp_group is None or dist.get_backend(self.dp_group) == "gloo":
-            return False
-        # The async post-reduction worker advances by counting grad hooks and
-        # enqueues each bucket's collective from a background thread. Under EP the
-        # MoE layers are PP-sharded, so on stages without those layers the expert
-        # bucket gets no grad, its hook never fires, and the worker blocks forever
-        # in wait_for(pending_exec_reductions == 0) while peer ranks have already
-        # enqueued the EREP/TP collective -> NCCL deadlock. EP must use the
-        # deterministic synchronous path (which enqueues every bucket
-        # unconditionally), matching the gloo path that passes the full matrix.
-        assert self.runtime is not None
-        if any(plugin.id == PluginId.EP for plugin in self.runtime.plugins):
-            return False
-        return True
-
-    def _start_post_reduction_worker(self) -> None:
-        assert self.runtime is not None
-        if not self.runtime._post_grad_reduction_callbacks:
-            self._post_reduction_thread = None
-            return
-        self._post_reduction_thread = threading.Thread(
-            target=self._post_reduction_worker, daemon=True
-        )
-        self._post_reduction_thread.start()
-
     def _role_params(self, model: nn.Module, role: ParamRole) -> list[nn.Parameter]:
         assert self.runtime is not None
         return [
@@ -178,20 +288,7 @@ class _ZeroPluginBase(RuntimePlugin):
         ][::-1]
 
     def _build_param_buckets(self, params: list[nn.Parameter]) -> list[list[nn.Parameter]]:
-        buckets: list[list[nn.Parameter]] = []
-        curr_bucket: list[nn.Parameter] = []
-        curr_bytes = 0
-        for param in params:
-            param_bytes = param.numel() * param.element_size()
-            if curr_bucket and curr_bytes + param_bytes > self.bucket_byte_size:
-                buckets.append(curr_bucket)
-                curr_bucket = []
-                curr_bytes = 0
-            curr_bucket.append(param)
-            curr_bytes += param_bytes
-        if curr_bucket:
-            buckets.append(curr_bucket)
-        return buckets
+        return build_param_buckets(params, self.bucket_byte_size)
 
     def _maybe_clip_local_shards(self) -> None:
         assert self.runtime is not None

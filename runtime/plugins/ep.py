@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -15,7 +16,31 @@ from parallel.expert import ExpertParallelMoEModule
 from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import ExpertParallelizableModule, PluginId, RuntimePlugin
-from runtime.plugins.zero_common import expert_erep_correction
+from runtime.plugins.zero_common import ChainedWork, CompletedWork, build_param_buckets, expert_erep_correction, rearm_bucket_pending
+
+
+@dataclass
+class _GradBucket:
+    """Coalesces several expert params' grads into one shared buffer so their
+    EREP all-reduce (+ any wrap applied via wrap_chained_work, e.g. CP sync)
+    fires once per bucket instead of once per parameter.
+
+    `work` is a single persistent ChainedWork built once (any wrap applied
+    once, at bind time via wrap_chained_work) and re-fired every step:
+    ChainedWork.fire() re-invokes its functors each call, and grad_buffer is
+    a fixed tensor that's zeroed/refilled per step, so re-firing the same
+    chain object is safe and avoids rebuilding the chain every microstep.
+    `fired` tracks whether this step's hook has already fired it (replacing
+    the old "work is None" sentinel, since work is never None now).
+    """
+
+    params: list[nn.Parameter]
+    grad_buffer: torch.Tensor
+    pending: int
+    # Assigned immediately after construction (needs `self` to close over in
+    # its functor) -- never None once _prepare_grad_buckets returns.
+    work: ChainedWork = field(default=None)  # type: ignore[assignment]
+    fired: bool = False
 
 
 @dataclass(frozen=True)
@@ -158,19 +183,47 @@ def _exchange_counts(send_counts: torch.Tensor, group: dist.ProcessGroup) -> tor
     )
     return recv_counts
 
+
 class ExpertParallelPlugin(RuntimePlugin):
-    def __init__(self) -> None:
+    def __init__(self, bucket_mb_size: int = 25) -> None:
         super().__init__(
             id=PluginId.EP,
             name="expert_parallel",
             runs_after={PluginId.TP, PluginId.SP},
             runs_before={PluginId.DP, PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3},
         )
+        self.bucket_byte_size = bucket_mb_size * 1024 * 1024
         self._expert_param_ids: set[int] = set()
         self._shared_grad_sync_handles: list[dist.Work] = []
-        self._post_grad_handles: list[dist.Work] = []
         self._delegate_shared_dp_sync = False
         self._delegate_expert_sync = False
+        # Only populated when EP handles expert-grad sync itself (no ZeRO
+        # active): coalesces expert param grads into a handful of buckets so
+        # POST_BACKWARD fires one EREP all-reduce per bucket, not per param.
+        self._grad_buckets: list[_GradBucket] = []
+
+    def wrap_chained_work(self, wrap: Callable[[ChainedWork, torch.Tensor], ChainedWork]) -> None:
+        """Layer one more sync step onto every expert-grad bucket's chain.
+
+        Must be called after EP's transform_model has built its buckets
+        (e.g. from another plugin's annotate_param_layout, not bind) --
+        raises if called before any buckets exist. `wrap(work, grad_buffer)`
+        receives a bucket's current `ChainedWork` (its EREP all-reduce, or
+        any previously applied wrap) and the bucket's grad buffer tensor,
+        and must return a new `ChainedWork` -- typically `ChainedWork(work,
+        lambda: my_collective(grad_buffer), blocks_by_stream=...)`. Applied
+        immediately, directly, to every existing bucket's `.work`. Callable
+        any number of times -- each call layers one more step on top of
+        whatever is already there, in call order; there's no hidden
+        registration list to reorder, so composing multiple wraps is safe.
+        """
+        if not self._grad_buckets:
+            raise RuntimeError(
+                "ExpertParallelPlugin.wrap_chained_work called before grad buckets exist "
+                "-- call from annotate_param_layout (after transform_model), not bind"
+            )
+        for bucket in self._grad_buckets:
+            bucket.work = wrap(bucket.work, bucket.grad_buffer)
 
     @property
     def ep_group(self) -> dist.ProcessGroup:
@@ -224,7 +277,41 @@ class ExpertParallelPlugin(RuntimePlugin):
                 continue
             role = ParamRole.EXPERT if id(param) in self._expert_param_ids else ParamRole.SHARED
             self.runtime.set_param_role(param, role)
+        if not self._delegate_expert_sync:
+            self._prepare_grad_buckets(model)
         return model
+
+    def _prepare_grad_buckets(self, model: nn.Module) -> None:
+        expert_params = [
+            param
+            for param in model.parameters()
+            if param.requires_grad and id(param) in self._expert_param_ids
+        ]
+        if not expert_params:
+            return
+        dtype, device = expert_params[0].dtype, expert_params[0].device
+        edp_group = self.edp_group
+        edp_blocks_by_stream = edp_group is None or dist.get_backend(edp_group) != "gloo"
+        for bucket_params in build_param_buckets(expert_params, self.bucket_byte_size):
+            grad_buffer = torch.zeros(sum(p.numel() for p in bucket_params), dtype=dtype, device=device)
+            offset = 0
+            for param in bucket_params:
+                param.grad = grad_buffer[offset : offset + param.numel()].view_as(param)
+                offset += param.numel()
+            bucket = _GradBucket(params=bucket_params, grad_buffer=grad_buffer, pending=0)
+            bucket.work = ChainedWork(None, self._bucket_erep_functor(bucket, edp_group), blocks_by_stream=edp_blocks_by_stream)
+            self._grad_buckets.append(bucket)
+            for param in bucket_params:
+                param.register_post_accumulate_grad_hook(self._make_bucket_grad_hook(bucket))
+
+    def _make_bucket_grad_hook(self, bucket: _GradBucket):
+        def hook(_param: nn.Parameter) -> None:
+            bucket.pending -= 1
+            if bucket.pending == 0:
+                bucket.work.fire()
+                bucket.fired = True
+
+        return hook
 
     def is_expert_param(self, param: nn.Parameter) -> bool:
         assert self.runtime is not None
@@ -243,68 +330,79 @@ class ExpertParallelPlugin(RuntimePlugin):
             self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.EREP)
 
     def on_phase(self, phase: RuntimePhase) -> None:
-        if phase == RuntimePhase.POST_BACKWARD:
-            assert self.runtime is not None
-            if not self.runtime.state.step_context.is_step_boundary:
-                return
-            self._post_grad_handles.clear()
-            if not self._delegate_expert_sync:
-                expert_params = [
-                    param
-                    for param in self.runtime.model.parameters()
-                    if param.requires_grad and param.grad is not None and id(param) in self._expert_param_ids
-                ]
-                if self.edp_group is not None and dist.get_world_size(self.edp_group) > 1:
-                    mesh = self.runtime.mesh
-                    plan = self.runtime.plan
-                    correction = expert_erep_correction(
-                        tp=mesh.tp,
-                        cp=mesh.cp,
-                        ep=mesh.ep,
-                        reuse_tp=getattr(plan, "reuse_tp_for_ep", True),
-                        reuse_cp=getattr(plan, "reuse_cp_for_ep", True),
-                    )
-                    edp_handles = [
-                        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.edp_group, async_op=True)
-                        for param in expert_params
-                    ]
-                    for handle in edp_handles:
-                        handle.wait()
-                    if correction != 1.0:
-                        for param in expert_params:
-                            param.grad.mul_(correction)
-                callbacks = self.runtime._post_grad_reduction_callbacks
-                for param in expert_params:
-                    if param.grad is None:
-                        continue
-                    for cb, role_filter in callbacks:
-                        if role_filter is not None and role_filter != ParamRole.EXPERT:
-                            continue
-                        work = cb(param.grad)
-                        if work is not None:
-                            self._post_grad_handles.append(work)
-            if self._delegate_shared_dp_sync:
-                return
-            if self.dp_group is None or dist.get_world_size(self.dp_group) <= 1:
-                return
-            self._shared_grad_sync_handles.clear()
-            for param in self.runtime.model.parameters():
-                if not param.requires_grad or param.grad is None:
-                    continue
-                if id(param) in self._expert_param_ids:
-                    continue
-                self._shared_grad_sync_handles.append(
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
-                )
+        assert self.runtime is not None
+        if phase == RuntimePhase.PRE_BACKWARD:
+            if not self._delegate_expert_sync and self.runtime.state.step_context.accum_start:
+                for bucket in self._grad_buckets:
+                    bucket.grad_buffer.zero_()
+                    offset = 0
+                    for param in bucket.params:
+                        param.grad = bucket.grad_buffer[
+                            offset : offset + param.numel()
+                        ].view_as(param)
+                        offset += param.numel()
+            if self.runtime.state.step_context.backward_start:
+                grad_accum_end = self.runtime.state.step_context.is_step_boundary
+                for bucket in self._grad_buckets:
+                    bucket.pending = rearm_bucket_pending(len(bucket.params), grad_accum_end=grad_accum_end)
+                    bucket.fired = False
             return
-        if phase != RuntimePhase.PRE_STEP:
+        if phase != RuntimePhase.POST_BACKWARD:
             return
-        for handle in self._post_grad_handles:
-            handle.wait()
-        self._post_grad_handles.clear()
+        if not self.runtime.state.step_context.is_step_boundary:
+            return
+        # See Zero1Plugin.on_phase: run_step() callers may read .grad once it
+        # returns, so all grad-sync work below must be fired AND waited here.
+        if not self._delegate_expert_sync:
+            self._wait_expert_grad_sync()
+        if self._delegate_shared_dp_sync:
+            return
+        if self.dp_group is None or dist.get_world_size(self.dp_group) <= 1:
+            return
+        self._shared_grad_sync_handles.clear()
+        for param in self.runtime.model.parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+            if id(param) in self._expert_param_ids:
+                continue
+            self._shared_grad_sync_handles.append(
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
+            )
         for handle in self._shared_grad_sync_handles:
             handle.wait()
         self._shared_grad_sync_handles.clear()
+
+    def _wait_expert_grad_sync(self) -> None:
+        # Every rank must fire the same sequence of collectives on a bucket's
+        # group, even if this rank's hook never ran for it (e.g. a PP stage
+        # that doesn't own these experts this microbatch) -- otherwise a peer
+        # rank that DID fire waits forever on this one.
+        for bucket in self._grad_buckets:
+            if not bucket.fired:
+                bucket.work.fire()
+                bucket.fired = True
+            bucket.work.wait()
+
+    def _bucket_erep_functor(self, bucket: _GradBucket, edp_group: dist.ProcessGroup | None):
+        assert self.runtime is not None
+
+        def functor() -> dist.Work:
+            if edp_group is None or dist.get_world_size(edp_group) <= 1:
+                return CompletedWork()
+            mesh = self.runtime.mesh
+            plan = self.runtime.plan
+            correction = expert_erep_correction(
+                tp=mesh.tp,
+                cp=mesh.cp,
+                ep=mesh.ep,
+                reuse_tp=getattr(plan, "reuse_tp_for_ep", True),
+                reuse_cp=getattr(plan, "reuse_cp_for_ep", True),
+            )
+            if correction != 1.0:
+                bucket.grad_buffer.mul_(correction)
+            return dist.all_reduce(bucket.grad_buffer, op=dist.ReduceOp.AVG, group=edp_group, async_op=True)
+
+        return functor
 
     def _validate_runtime_support(self) -> None:
         assert self.runtime is not None

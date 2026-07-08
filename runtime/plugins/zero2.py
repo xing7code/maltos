@@ -9,16 +9,13 @@ import torch.nn as nn
 from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId
-from runtime.plugins.zero_common import AllReduceShardWork, GroupContext, ReduceScatterShardWork, _ZeroPluginBase
-
-
-class _LocalAddWork:
-    def __init__(self, src: torch.Tensor, dst: torch.Tensor) -> None:
-        self.src = src
-        self.dst = dst
-
-    def wait(self) -> None:
-        self.dst.add_(self.src)
+from runtime.plugins.zero_common import (
+    ChainedWork,
+    CompletedWork,
+    GroupContext,
+    NarrowShardWork,
+    ZeroPluginBase,
+)
 
 
 @dataclass
@@ -33,7 +30,6 @@ class _Bucket:
     shard_end: int
     local_param: nn.Parameter
     pending_exec_reductions: int = 0
-    post_reduction_handles: list[dist.Work] = field(default_factory=list)
     exec_states: list["_BucketExecState"] = field(default_factory=list)
 
 
@@ -42,11 +38,11 @@ class _BucketExecState:
     grad_buffer: torch.Tensor
     shard_buffer: torch.Tensor
     pending: int = 0
-    handle: dist.Work | AllReduceShardWork | ReduceScatterShardWork | _LocalAddWork | None = None
+    work: ChainedWork | None = None
     attached: bool = False
 
 
-class Zero2Plugin(_ZeroPluginBase):
+class Zero2Plugin(ZeroPluginBase):
     """ZeRO-2 style optimizer and gradient sharding over the DP axis."""
 
     def __init__(
@@ -84,16 +80,12 @@ class Zero2Plugin(_ZeroPluginBase):
                 grad_accum_start=context.accum_start,
                 backward_start=context.backward_start,
             )
-            if context.is_step_boundary and self._use_async_worker():
-                self._start_post_reduction_worker()
         elif phase == RuntimePhase.POST_BACKWARD:
-            assert self.runtime is not None
-            if self.runtime.state.step_context.is_step_boundary and (
-                not self._use_async_worker() or not self.runtime._post_grad_reduction_callbacks
-            ):
-                self._fire_post_reductions_sync()
+            # See Zero1Plugin.on_phase: run_step() callers may read .grad once it
+            # returns, so this must block here rather than defer to PRE_STEP.
+            if self.runtime is not None and self.runtime.state.step_context.is_step_boundary:
+                self._wait_grad_sync()
         elif phase == RuntimePhase.PRE_STEP:
-            self._wait_grad_sync()
             self._maybe_clip_local_shards()
         elif phase == RuntimePhase.POST_STEP:
             self._gather_updated_params()
@@ -187,38 +179,47 @@ class Zero2Plugin(_ZeroPluginBase):
             if state.pending == 0:
                 if bucket.local_param.grad is None:
                     bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
-                state.handle = self._reduce_scatter_avg(bucket, state)
-                if self._use_async_worker():
-                    with self._post_reduction_cond:
-                        bucket.pending_exec_reductions -= 1
-                        self._post_reduction_cond.notify_all()
+                state.work = self._new_state_work(bucket, state)
+                state.work.fire()
+                bucket.pending_exec_reductions -= 1
 
         return hook
 
-    def _reduce_scatter_avg(
-        self,
-        bucket: _Bucket,
-        state: _BucketExecState,
-    ) -> dist.Work | AllReduceShardWork | ReduceScatterShardWork:
+    def _reduce_scatter_avg_functor(self, bucket: _Bucket, state: _BucketExecState):
         assert bucket.local_param.grad is not None
-        bucket_numel = bucket.end - bucket.start
-        full_grad = state.grad_buffer[:bucket_numel]
-        if bucket.group_context.group is None or bucket.group_context.world_size == 1:
-            return _LocalAddWork(full_grad[: bucket.local_param.numel()], bucket.local_param.grad)
-        if bucket.group_context.is_gloo:
-            work = dist.all_reduce(full_grad, op=dist.ReduceOp.SUM, group=bucket.group_context.group, async_op=True)
-            shard_len = bucket.local_param.numel()
-            shard_start = bucket.group_context.rank * shard_len
-            shard_end = (bucket.group_context.rank + 1) * shard_len
-            return AllReduceShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end, bucket.group_context.correction / bucket.group_context.world_size)
-        work = dist.reduce_scatter_tensor(
-            state.shard_buffer,
-            full_grad,
-            op=dist.ReduceOp.AVG,
-            group=bucket.group_context.group,
-            async_op=True,
-        )
-        return ReduceScatterShardWork(work, state.shard_buffer, bucket.local_param.grad, bucket.group_context.correction)
+
+        def functor() -> dist.Work:
+            bucket_numel = bucket.end - bucket.start
+            full_grad = state.grad_buffer[:bucket_numel]
+            if bucket.group_context.group is None or bucket.group_context.world_size == 1:
+                shard = full_grad[: bucket.local_param.numel()]
+                state.shard_buffer.copy_(shard)
+                return CompletedWork()
+            if bucket.group_context.is_gloo:
+                # gloo path uses SUM (not AVG), so correction must also fold in
+                # the 1/world_size averaging factor AVG would otherwise apply.
+                gloo_correction = bucket.group_context.correction / bucket.group_context.world_size
+                if gloo_correction != 1.0:
+                    full_grad.mul_(gloo_correction)
+                work = dist.all_reduce(full_grad, op=dist.ReduceOp.SUM, group=bucket.group_context.group, async_op=True)
+                shard_len = bucket.local_param.numel()
+                shard_start = bucket.group_context.rank * shard_len
+                shard_end = (bucket.group_context.rank + 1) * shard_len
+                return NarrowShardWork(
+                    work, full_grad, state.shard_buffer, shard_start, shard_end
+                )
+            if bucket.group_context.correction != 1.0:
+                full_grad.mul_(bucket.group_context.correction)
+            work = dist.reduce_scatter_tensor(
+                state.shard_buffer,
+                full_grad,
+                op=dist.ReduceOp.AVG,
+                group=bucket.group_context.group,
+                async_op=True,
+            )
+            return work
+
+        return functor
 
     def _gather_updated_params(self) -> None:
         assert self.data_buffer is not None
@@ -261,55 +262,17 @@ class Zero2Plugin(_ZeroPluginBase):
             offset = seg_end
         return shard_sq
 
-    def _post_reduction_worker(self) -> None:
-        assert self.runtime is not None
-        callbacks = self.runtime._post_grad_reduction_callbacks
-        for bucket in self.buckets:
-            with self._post_reduction_cond:
-                self._post_reduction_cond.wait_for(lambda: bucket.pending_exec_reductions == 0)
-            for state in bucket.exec_states:
-                if state.handle is None:
-                    raise RuntimeError("ZeRO2 bucket handle is None after backward")
-                state.handle.wait()
-                state.handle = None
-            if bucket.local_param.grad is not None:
-                for cb, role_filter in callbacks:
-                    if role_filter is not None and bucket.role != role_filter:
-                        continue
-                    work = cb(bucket.local_param.grad)
-                    if work is not None:
-                        bucket.post_reduction_handles.append(work)
-
-    def _fire_post_reductions_sync(self) -> None:
-        assert self.runtime is not None
-        callbacks = self.runtime._post_grad_reduction_callbacks
+    def _wait_grad_sync(self) -> None:
         for bucket in self.buckets:
             waited = False
             for state in bucket.exec_states:
-                self._ensure_state_handle(bucket, state)
-                if state.handle is None:
-                    continue
-                state.handle.wait()
-                state.handle = None
+                self._ensure_state_work(bucket, state)
+                assert state.work is not None
+                self._wait_state_work(bucket, state)
+                state.work = None
                 waited = True
             if not waited:
-                raise RuntimeError("ZeRO2 bucket handle is None after backward")
-            if bucket.local_param.grad is not None:
-                for cb, role_filter in callbacks:
-                    if role_filter is not None and bucket.role != role_filter:
-                        continue
-                    work = cb(bucket.local_param.grad)
-                    if work is not None:
-                        bucket.post_reduction_handles.append(work)
-
-    def _wait_grad_sync(self) -> None:
-        if self._post_reduction_thread is not None:
-            self._post_reduction_thread.join()
-            self._post_reduction_thread = None
-        for bucket in self.buckets:
-            for handle in bucket.post_reduction_handles:
-                handle.wait()
-            bucket.post_reduction_handles.clear()
+                raise RuntimeError("ZeRO2 bucket has no exec_states after backward")
 
     def _reset_buckets(self, *, grad_accum_start: bool, backward_start: bool = True) -> None:
         if grad_accum_start:
@@ -318,7 +281,6 @@ class Zero2Plugin(_ZeroPluginBase):
                     bucket.local_param.grad = torch.zeros_like(bucket.local_param.data)
                 else:
                     bucket.local_param.grad.zero_()
-                bucket.post_reduction_handles.clear()
         # Per-micro-step reduction counter: re-armed at every backward phase
         # start, including the step-boundary micro-step (grad_accum > 1) where
         # grad_accum_start is False. See StepContext.backward_start.
@@ -327,9 +289,9 @@ class Zero2Plugin(_ZeroPluginBase):
                 bucket.pending_exec_reductions = len(bucket.exec_states)
         for bucket in self.buckets:
             state = self._exec_state(bucket)
-            if state.handle is not None:
-                state.handle.wait()
-                state.handle = None
+            if state.work is not None:
+                self._wait_state_work(bucket, state)
+                state.work = None
             state.grad_buffer.zero_()
             state.shard_buffer.zero_()
             state.pending = len(bucket.params)
@@ -341,15 +303,30 @@ class Zero2Plugin(_ZeroPluginBase):
             for bucket in self.buckets:
                 bucket.local_param.data.copy_(self.data_buffer[bucket.shard_start : bucket.shard_end])
 
-    def _ensure_state_handle(self, bucket: _Bucket, state: _BucketExecState) -> None:
-        if state.handle is not None:
+    def _ensure_state_work(self, bucket: _Bucket, state: _BucketExecState) -> None:
+        if state.work is not None:
             return
         if bucket.local_param.grad is None:
             bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
         # Do NOT zero grad_buffer here: _reset_buckets already zeroed it at PRE_BACKWARD.
         # Zeroing here would erase valid gradients when this is called after a completed
-        # reduction (handle was waited and set to None by _fire_post_reductions_sync).
-        state.handle = self._reduce_scatter_avg(bucket, state)
+        # reduction (work was waited and set to None by _wait_grad_sync).
+        state.work = self._new_state_work(bucket, state)
+        state.work.fire()
+
+    def _new_state_work(self, bucket: _Bucket, state: _BucketExecState) -> ChainedWork:
+        work = ChainedWork(
+            None,
+            self._reduce_scatter_avg_functor(bucket, state),
+            blocks_by_stream=bucket.group_context.supports_async_overlap,
+        )
+        return self._apply_chained_work_wrappers(work, state.shard_buffer, bucket.role)
+
+    def _wait_state_work(self, bucket: _Bucket, state: _BucketExecState) -> None:
+        assert state.work is not None
+        assert bucket.local_param.grad is not None
+        state.work.wait()
+        bucket.local_param.grad.add_(state.shard_buffer)
 
     def _exec_state(self, bucket: _Bucket) -> _BucketExecState:
         if len(bucket.exec_states) == 1:

@@ -18,6 +18,7 @@ from runtime.mesh import MeshAxis
 from runtime.plugin import ContextParallelizableModule, PluginId, RuntimePlugin
 from runtime.plugins.cp_all_gather import AllGatherKvAttentionCore
 from runtime.plugins.cp_ring import RingAttentionCore
+from runtime.plugins.zero_common import ChainedWork
 
 
 class ContextParallelPlugin(RuntimePlugin):
@@ -56,12 +57,6 @@ class ContextParallelPlugin(RuntimePlugin):
             and PluginId.ZERO2 not in active
             and PluginId.ZERO3 not in active
         )
-        zero_active = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
-        ep_active = PluginId.EP in active
-        # When ZeRO is active it shards over DCP (DP×CP) internally, so no separate CP
-        # callback is needed. Without ZeRO, EP still needs the CP callback for non-expert params.
-        if ep_active and not zero_active:
-            runtime.register_post_grad_reduction_callback(self._cp_grad_sync_callback)
         self._validate_runtime_support()
 
     def transform_model(self, model: nn.Module) -> nn.Module:
@@ -93,13 +88,61 @@ class ContextParallelPlugin(RuntimePlugin):
         if self.world_size <= 1:
             return
         assert self.runtime is not None
-        if PluginId.ZERO1 in self._active_plugin_ids or PluginId.ZERO2 in self._active_plugin_ids or PluginId.ZERO3 in self._active_plugin_ids:
+        active = self._active_plugin_ids
+        zero_active = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
+        # Temporary lifecycle bridge: reduction-chain wiring must happen after
+        # every plugin's transform_model() has run, because EP creates its grad
+        # buckets there. annotate_param_layout() is currently the first hook
+        # with that guarantee. Keep the wiring isolated here so it can move
+        # unchanged to a future post-transform/finalize hook.
+        self._configure_expert_grad_sync_chain(zero_active=zero_active)
+        if zero_active:
             return
         for fq_name, _ in self.runtime.state_manager.iter_param_states():
             param = self.runtime.state_manager.get_param_tensor(fq_name)
             if self.runtime.get_param_role(param) == ParamRole.EXPERT:
                 continue
             self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.CP)
+
+    def _configure_expert_grad_sync_chain(self, *, zero_active: bool) -> None:
+        """Append CP SUM when an EP reducer's EREP group excludes the CP axis."""
+        assert self.runtime is not None
+        active = self._active_plugin_ids
+        # With reuse_cp_for_ep=True, EREP already spans the relevant CP sequence
+        # shards and expert_erep_correction turns that part of AVG back into SUM.
+        # When CP is not reused by EP, append an explicit CP SUM after EREP.
+        reuse_cp = getattr(self.runtime.plan, "reuse_cp_for_ep", True)
+        if PluginId.EP not in active or reuse_cp:
+            return
+
+        reducer_ids = {PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3}
+        if zero_active:
+            reducer = next(
+                plugin
+                for plugin in self.runtime.plugins
+                if plugin.id in reducer_ids
+            )
+        else:
+            reducer = next(
+                plugin
+                for plugin in self.runtime.plugins
+                if plugin.id == PluginId.EP
+            )
+
+        blocks_by_stream = dist.get_backend(self.cp_group) != "gloo"
+        reducer.wrap_chained_work(
+            lambda work, grad_buffer: ChainedWork(
+                work,
+                lambda: dist.all_reduce(
+                    grad_buffer,
+                    op=dist.ReduceOp.SUM,
+                    group=self.cp_group,
+                    async_op=True,
+                ),
+                blocks_by_stream=blocks_by_stream,
+            ),
+            **({"role_filter": ParamRole.EXPERT} if zero_active else {}),
+        )
 
     def on_phase(self, phase: RuntimePhase) -> None:
         if self.world_size <= 1:
@@ -118,11 +161,6 @@ class ContextParallelPlugin(RuntimePlugin):
             return
         if phase == RuntimePhase.PRE_STEP:
             self._wait_grad_sync()
-
-    def _cp_grad_sync_callback(self, grad: torch.Tensor) -> dist.Work | None:
-        if self.world_size <= 1:
-            return None
-        return dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.cp_group, async_op=True)
 
     def _make_grad_sync_hook(self):
         def hook(param: nn.Parameter) -> None:
