@@ -61,7 +61,7 @@ The runtime exposes these training phases (`RuntimePhase`):
 
 Plugin initialization has separate lifecycle hooks: `bind()` attaches runtime
 state, `transform_model()` lets TP/SP/PP/ZeRO/precision/etc. rewrite the module,
-and `annotate_param_layout()` records parameter layout before optimizer state is
+and `annotate_param_metadata()` records parameter metadata before optimizer state is
 built.
 
 Plugins compose by registering phase behavior rather than rewriting the trainer.

@@ -79,7 +79,7 @@ class RuntimeCore:
             self.model = plugin.transform_model(self.model)
         self.state_manager.register_module(self.model)
         for plugin in self.plugins:
-            plugin.annotate_param_layout()
+            plugin.annotate_param_metadata()
         self._populate_static_model_metrics()
         self._maybe_build_runtime_optimizer()
         self._validate_optimizer_owner()

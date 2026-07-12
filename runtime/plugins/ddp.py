@@ -24,7 +24,7 @@ class DataParallelPlugin(RuntimePlugin):
         super().__init__(id=PluginId.DP, name=name)
         self.async_op = async_op
 
-    def annotate_param_layout(self) -> None:
+    def annotate_param_metadata(self) -> None:
         assert self.runtime is not None
         if self.runtime.mesh.dp <= 1:
             return
@@ -163,7 +163,7 @@ class BucketDataParallelPlugin(RuntimePlugin):
     def runtime_optimizer_replicated_axes(self) -> set[MeshAxis]:
         return {MeshAxis.DP} if self.runtime is not None and self.runtime.mesh.dp > 1 else set()
 
-    def annotate_param_layout(self) -> None:
+    def annotate_param_metadata(self) -> None:
         assert self.runtime is not None
         if self.runtime.mesh.dp <= 1:
             return

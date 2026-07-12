@@ -85,7 +85,7 @@ class ContextParallelPlugin(RuntimePlugin):
             )
         return model
 
-    def annotate_param_layout(self) -> None:
+    def annotate_param_metadata(self) -> None:
         if self.world_size <= 1:
             return
         assert self.runtime is not None
@@ -93,7 +93,7 @@ class ContextParallelPlugin(RuntimePlugin):
         zero_active = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
         # Temporary lifecycle bridge: reduction-chain wiring must happen after
         # every plugin's transform_model() has run, because EP creates its grad
-        # buckets there. annotate_param_layout() is currently the first hook
+        # buckets there. annotate_param_metadata() is currently the first hook
         # with that guarantee. Keep the wiring isolated here so it can move
         # unchanged to a future post-transform/finalize hook.
         self._configure_expert_grad_sync_chain(zero_active=zero_active)

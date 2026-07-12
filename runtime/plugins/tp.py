@@ -99,7 +99,7 @@ class TensorParallelPlugin(RuntimePlugin):
             self._param_shard_axis[bias_name] = shard_axis
             self._logical_shapes[bias_name] = tuple(module.bias.shape)
 
-    def annotate_param_layout(self) -> None:
+    def annotate_param_metadata(self) -> None:
         assert self.runtime is not None
         for fq_name, param_state in self.runtime.state_manager.iter_param_states():
             param = self.runtime.state_manager.get_param_tensor(fq_name)

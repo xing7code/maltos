@@ -65,8 +65,8 @@ class RuntimePlugin:
     def transform_model(self, model: nn.Module) -> nn.Module:
         return model
 
-    def annotate_param_layout(self) -> None:
-        """Record parameter-level distributed layout metadata after transform_model()."""
+    def annotate_param_metadata(self) -> None:
+        """Record parameter-level runtime metadata after transform_model()."""
         pass
 
     def on_phase(self, phase: "RuntimePhase") -> None:

@@ -206,7 +206,7 @@ class ExpertParallelPlugin(RuntimePlugin):
         """Layer one more sync step onto every expert-grad bucket's chain.
 
         Must be called after EP's transform_model has built its buckets
-        (e.g. from another plugin's annotate_param_layout, not bind) --
+        (e.g. from another plugin's annotate_param_metadata, not bind) --
         raises if called before any buckets exist. `wrap(work, grad_buffer)`
         receives a bucket's current `ChainedWork` (its EREP all-reduce, or
         any previously applied wrap) and the bucket's grad buffer tensor,
@@ -220,7 +220,7 @@ class ExpertParallelPlugin(RuntimePlugin):
         if not self._grad_buckets:
             raise RuntimeError(
                 "ExpertParallelPlugin.wrap_chained_work called before grad buckets exist "
-                "-- call from annotate_param_layout (after transform_model), not bind"
+                "-- call from annotate_param_metadata (after transform_model), not bind"
             )
         for bucket in self._grad_buckets:
             bucket.work = wrap(bucket.work, bucket.grad_buffer)
@@ -317,7 +317,7 @@ class ExpertParallelPlugin(RuntimePlugin):
         assert self.runtime is not None
         return self.runtime.get_param_role(param) == ParamRole.EXPERT
 
-    def annotate_param_layout(self) -> None:
+    def annotate_param_metadata(self) -> None:
         assert self.runtime is not None
         erep_group = self.edp_group
         erep_size = dist.get_world_size(erep_group) if erep_group is not None else 1
