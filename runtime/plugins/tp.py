@@ -51,8 +51,8 @@ class TensorParallelPlugin(RuntimePlugin):
                     rule.comm_dim,
                 )
                 model.set_submodule(rule.module_path, new_row)
-        self.runtime.register_module_replacement(nn.Linear, ColumnParallelLinear)
-        self.runtime.register_module_replacement(nn.Linear, RowParallelLinear)
+        self.runtime.add_module_replacement(nn.Linear, ColumnParallelLinear)
+        self.runtime.add_module_replacement(nn.Linear, RowParallelLinear)
         return model
 
     def runtime_optimizer_sharded_axes(self) -> set[MeshAxis]:

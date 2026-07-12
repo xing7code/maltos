@@ -110,7 +110,6 @@ class RuntimeState:
     metadata: dict[str, Any] = field(default_factory=dict)
     static_metrics: dict[str, MetricValue] = field(default_factory=dict)
     scaler: torch.amp.GradScaler | None = None
-    omitted_module_paths: set[str] = field(default_factory=set)
 
     @property
     def step(self) -> int:

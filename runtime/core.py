@@ -42,26 +42,10 @@ class RuntimeCore:
     _step_runner: "StepRunner | None" = field(default=None, init=False, repr=False)
     _group_manager: ProcessGroupManager | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _omitted_module_paths: set[str] = field(default_factory=set, init=False, repr=False)
     _module_replacements: "dict[type[nn.Module], set[type[nn.Module]]]" = field(
         default_factory=dict, init=False
     )
-
-    def register_module_replacement(
-        self, original: "type[nn.Module]", replacement: "type[nn.Module]"
-    ) -> None:
-        """Record that a plugin replaced `original` module type with `replacement`.
-
-        Called by transform_model() implementations (e.g. TP replaces nn.Linear).
-        Other plugins (e.g. ZeRO3) query this to discover which concrete types to
-        wrap, without importing plugin-specific layer classes directly.
-        """
-        if original not in self._module_replacements:
-            self._module_replacements[original] = set()
-        self._module_replacements[original].add(replacement)
-
-    def get_module_replacements(self, original: "type[nn.Module]") -> "set[type[nn.Module]]":
-        """Return the set of replacement types registered for `original`."""
-        return self._module_replacements.get(original, set())
 
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
@@ -143,16 +127,32 @@ class RuntimeCore:
         assert self._group_manager is not None
         return self._group_manager.get_group(axis)
 
+    # -------------------------------
+    # Plugin coordination state
+    # -------------------------------
     # Cross-plugin module-path channel: upstream transforms (for example PP)
     # mark paths they have logically removed so later plugins can skip them.
     def mark_module_path_omitted(self, path: str) -> None:
-        self.state.omitted_module_paths.add(path)
+        self._omitted_module_paths.add(path)
 
     def is_module_path_omitted(self, path: str) -> bool:
-        for omitted in self.state.omitted_module_paths:
+        for omitted in self._omitted_module_paths:
             if path == omitted or path.startswith(omitted + "."):
                 return True
         return False
+
+    # Cross-plugin module-type channel: transforms record which concrete types
+    # replaced a base module type so later plugins can discover them without
+    # importing plugin-private layer classes directly.
+    def add_module_replacement(
+        self, original: "type[nn.Module]", replacement: "type[nn.Module]"
+    ) -> None:
+        if original not in self._module_replacements:
+            self._module_replacements[original] = set()
+        self._module_replacements[original].add(replacement)
+
+    def get_module_replacements(self, original: "type[nn.Module]") -> "set[type[nn.Module]]":
+        return self._module_replacements.get(original, set())
 
     # Cross-plugin param-semantics channel: plugins annotate whether a param is
     # shared or expert so later plugins can choose the right communication path.
