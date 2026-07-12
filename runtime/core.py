@@ -83,8 +83,7 @@ class RuntimeCore:
         for plugin in self.plugins:
             plugin.annotate_param_metadata()
         self._populate_static_model_metrics()
-        self._maybe_build_runtime_optimizer()
-        self._validate_optimizer_owner()
+        self._setup_optimizer_and_scheduler()
         self._step_runner = self._resolve_step_runner()
 
     def close(self) -> None:
@@ -130,7 +129,7 @@ class RuntimeCore:
         return self._group_manager.get_group(axis)
 
     # -------------------------------
-    # Plugin coordination state
+    # Plugin coordination state: begin
     # -------------------------------
     # Cross-plugin module-path channel: upstream transforms (for example PP)
     # mark paths they have logically removed so later plugins can skip them.
@@ -164,6 +163,10 @@ class RuntimeCore:
     def get_param_role(self, param: nn.Parameter) -> ParamRole:
         return self._param_roles.get(id(param), ParamRole.SHARED)
 
+    # -------------------------------
+    # Plugin coordination state: end
+    # -------------------------------
+
     def grad_norm_replica_factor(self, param: nn.Parameter) -> int:
         fq_name = self.state_manager.get_param_name(param)
         attrs = self.state_manager.get_param_attrs(fq_name)
@@ -188,7 +191,7 @@ class RuntimeCore:
     # -------------------------------------
     # Optimizer / scheduler methods: begin
     # -------------------------------------
-    def _validate_optimizer_owner(self) -> None:
+    def _setup_optimizer_and_scheduler(self) -> None:
         runtime_owners = ["runtime"] if self._optimizer is not None else []
         plugin_owners = [plugin.id.value for plugin in self.plugins if plugin.owns_optimizer]
         if len(plugin_owners) > 1:
@@ -198,6 +201,10 @@ class RuntimeCore:
                 "Runtime optimizer ownership is mutually exclusive with optimizer-owning plugins, "
                 f"got {runtime_owners + plugin_owners}"
             )
+        if runtime_owners or plugin_owners:
+            return
+        self._optimizer = self.create_optimizer(self.model.parameters())
+        self._scheduler = self.create_scheduler(self._optimizer)
 
     def get_optimizer_and_scheduler(
         self,
@@ -216,12 +223,6 @@ class RuntimeCore:
             if plugin.owns_optimizer:
                 return plugin.id.value
         return None
-
-    def _maybe_build_runtime_optimizer(self) -> None:
-        if self.get_optimizer_owner() is not None:
-            return
-        self._optimizer = self.create_optimizer(self.model.parameters())
-        self._scheduler = self.create_scheduler(self._optimizer)
 
     def create_optimizer(self, params: Iterable[nn.Parameter]) -> torch.optim.Optimizer:
         if self.optimizer_factory is None:

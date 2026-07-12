@@ -1,3 +1,30 @@
+# Checkpoint ownership model for optimizer-state saving.
+#
+# Legend: each cell is "param / optim", where
+#   R = replicate
+#   S = shard
+#
+# Shared params (shared trunk, current ZeRO semantics use DCP = DP x CP):
+#
+#   +-------+--------+--------+--------+--------+
+#   | Axis  |  DDP   | ZeRO1  | ZeRO2  | ZeRO3  |
+#   +-------+--------+--------+--------+--------+
+#   | DCP   | R / R  | R / S  | R / S  | S / S  |
+#   | TP/PP | S / S  | S / S  | S / S  | S / S  |
+#   +-------+--------+--------+--------+--------+
+#
+# Expert params (assuming no TP-on-expert):
+#
+#   +------+--------+--------+--------+--------+
+#   | Axis |  DDP   | ZeRO1  | ZeRO2  | ZeRO3  |
+#   +------+--------+--------+--------+--------+
+#   | EP   | S / S  | S / S  | S / S  | S / S  |
+#   | EREP | R / R  | R / S  | R / S  | S / S  |
+#   | PP   | S / S  | S / S  | S / S  | S / S  |
+#   +------+--------+--------+--------+--------+
+#
+# Optimizer checkpoint ownership follows the "optim" half of these tables:
+# replicated axes save rank 0 of that axis; sharded axes save every rank.
 from __future__ import annotations
 
 import json
@@ -167,7 +194,6 @@ def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> No
         state_manager.import_trainer_state(
             TrainerState(
                 step_context=trainer_state.get("step_context"),
-                consumed_tokens=trainer_state.get("consumed_tokens"),
                 dataloader=trainer_state.get("dataloader"),
                 plugin_states=trainer_state.get("plugin_states"),
                 rng=RngState(

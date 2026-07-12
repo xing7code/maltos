@@ -101,7 +101,7 @@ class TensorParallelPlugin(RuntimePlugin):
 
     def annotate_param_metadata(self) -> None:
         assert self.runtime is not None
-        for fq_name, param_state in self.runtime.state_manager.iter_param_states():
+        for fq_name, param_state in self.runtime.state_manager.param_states.items():
             param = self.runtime.state_manager.get_param_tensor(fq_name)
             logical_shape = self._logical_shapes.get(fq_name, tuple(param.shape))
             local_shape = tuple(param.shape)
@@ -115,7 +115,15 @@ class TensorParallelPlugin(RuntimePlugin):
             if self.runtime.mesh.tp <= 1:
                 continue
             if fq_name in self._param_shard_axis:
-                self.runtime.state_manager.add_param_sharded_axis(fq_name, MeshAxis.TP)
+                attrs = self.runtime.state_manager.get_param_attrs(fq_name)
+                self.runtime.state_manager.update_param_state(
+                    fq_name,
+                    sharded_axes=attrs.sharded_axes | {MeshAxis.TP},
+                )
                 continue
             if self.runtime.get_param_role(param) == ParamRole.SHARED:
-                self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.TP)
+                attrs = self.runtime.state_manager.get_param_attrs(fq_name)
+                self.runtime.state_manager.update_param_state(
+                    fq_name,
+                    replicated_axes=attrs.replicated_axes | {MeshAxis.TP},
+                )

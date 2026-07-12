@@ -28,11 +28,15 @@ class DataParallelPlugin(RuntimePlugin):
         assert self.runtime is not None
         if self.runtime.mesh.dp <= 1:
             return
-        for fq_name, _ in self.runtime.state_manager.iter_param_states():
+        for fq_name in self.runtime.state_manager.param_states:
             param = self.runtime.state_manager.get_param_tensor(fq_name)
             if self.runtime.get_param_role(param) == ParamRole.EXPERT:
                 continue
-            self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.DP)
+            attrs = self.runtime.state_manager.get_param_attrs(fq_name)
+            self.runtime.state_manager.update_param_state(
+                fq_name,
+                replicated_axes=attrs.replicated_axes | {MeshAxis.DP},
+            )
 
     def on_phase(self, phase: RuntimePhase) -> None:
         if phase != RuntimePhase.POST_BACKWARD:
@@ -167,11 +171,15 @@ class BucketDataParallelPlugin(RuntimePlugin):
         assert self.runtime is not None
         if self.runtime.mesh.dp <= 1:
             return
-        for fq_name, _ in self.runtime.state_manager.iter_param_states():
+        for fq_name in self.runtime.state_manager.param_states:
             param = self.runtime.state_manager.get_param_tensor(fq_name)
             if self.runtime.get_param_role(param) == ParamRole.EXPERT:
                 continue
-            self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.DP)
+            attrs = self.runtime.state_manager.get_param_attrs(fq_name)
+            self.runtime.state_manager.update_param_state(
+                fq_name,
+                replicated_axes=attrs.replicated_axes | {MeshAxis.DP},
+            )
 
     def _build_buckets(self, model: nn.Module, dp_group: dist.ProcessGroup) -> None:
         self.buckets = []

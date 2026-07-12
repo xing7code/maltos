@@ -99,11 +99,15 @@ class ContextParallelPlugin(RuntimePlugin):
         self._configure_expert_grad_sync_chain(zero_active=zero_active)
         if zero_active:
             return
-        for fq_name, _ in self.runtime.state_manager.iter_param_states():
+        for fq_name in self.runtime.state_manager.param_states:
             param = self.runtime.state_manager.get_param_tensor(fq_name)
             if self.runtime.get_param_role(param) == ParamRole.EXPERT:
                 continue
-            self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.CP)
+            attrs = self.runtime.state_manager.get_param_attrs(fq_name)
+            self.runtime.state_manager.update_param_state(
+                fq_name,
+                replicated_axes=attrs.replicated_axes | {MeshAxis.CP},
+            )
 
     def _configure_expert_grad_sync_chain(self, *, zero_active: bool) -> None:
         """Append CP SUM when an EP reducer's EREP group excludes the CP axis."""

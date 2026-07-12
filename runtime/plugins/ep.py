@@ -323,11 +323,15 @@ class ExpertParallelPlugin(RuntimePlugin):
         erep_size = dist.get_world_size(erep_group) if erep_group is not None else 1
         if erep_size <= 1:
             return
-        for fq_name, _ in self.runtime.state_manager.iter_param_states():
+        for fq_name in self.runtime.state_manager.param_states:
             param = self.runtime.state_manager.get_param_tensor(fq_name)
             if self.runtime.get_param_role(param) != ParamRole.EXPERT:
                 continue
-            self.runtime.state_manager.add_param_replicated_axis(fq_name, MeshAxis.EREP)
+            attrs = self.runtime.state_manager.get_param_attrs(fq_name)
+            self.runtime.state_manager.update_param_state(
+                fq_name,
+                replicated_axes=attrs.replicated_axes | {MeshAxis.EREP},
+            )
 
     def on_phase(self, phase: RuntimePhase) -> None:
         assert self.runtime is not None

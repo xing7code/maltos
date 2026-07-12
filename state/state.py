@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 class RuntimeParamAttrs:
     """Runtime-only metadata for one parameter reference."""
 
-    logical_shape: tuple[int, ...]
     sharded_axes: set[MeshAxis] = field(default_factory=set)
     replicated_axes: set[MeshAxis] = field(default_factory=set)
 
@@ -47,7 +46,6 @@ class RngState:
 class TrainerState:
     rng: RngState
     step_context: dict[str, Any] | None = None
-    consumed_tokens: int | None = None
     dataloader: dict[str, Any] | None = None
     plugin_states: dict[str, dict[str, Any]] | None = None
 
@@ -69,9 +67,13 @@ class StateManager:
     _dataloader: "StatefulDataLoaderProtocol | None" = field(default=None, init=False, repr=False)
 
     _OPTIMIZER_STATE_PREFIX = "__optimizer_state__."
-    _RUNTIME_OPTIMIZER_STATE_KEY = f"{_OPTIMIZER_STATE_PREFIX}runtime"
     _SCHEDULER_STATE_PREFIX = "__scheduler_state__."
-    _RUNTIME_SCHEDULER_STATE_KEY = f"{_SCHEDULER_STATE_PREFIX}runtime"
+
+    def _optimizer_state_key(self, owner: str) -> str:
+        return f"{self._OPTIMIZER_STATE_PREFIX}{owner}"
+
+    def _scheduler_state_key(self, owner: str) -> str:
+        return f"{self._SCHEDULER_STATE_PREFIX}{owner}"
 
     def _resolve_runtime_name(self, fq_name: str) -> str:
         if fq_name in self._runtime_params or fq_name in self.param_states or fq_name in self._runtime_attrs:
@@ -102,9 +104,7 @@ class StateManager:
                 physical_shape=tuple(param.shape),
                 dtype=str(param.dtype),
             )
-            self._runtime_attrs[fq_name] = RuntimeParamAttrs(
-                logical_shape=tuple(param.shape),
-            )
+            self._runtime_attrs[fq_name] = RuntimeParamAttrs()
 
     def bind(self, runtime: "RuntimeCore") -> None:
         self._runtime = runtime
@@ -126,6 +126,8 @@ class StateManager:
         logical_shapes: list[tuple[int, ...]] | None = None,
         physical_shape: tuple[int, ...] | None = None,
         dtype: str | None = None,
+        sharded_axes: set[MeshAxis] | None = None,
+        replicated_axes: set[MeshAxis] | None = None,
     ) -> None:
         fq_name = self._resolve_runtime_name(fq_name)
         state = self.param_states.get(fq_name)
@@ -140,14 +142,11 @@ class StateManager:
         if dtype is not None:
             state.dtype = dtype
         attrs = self._runtime_attrs.get(fq_name)
-        if attrs is not None and logical_shapes is not None and len(logical_shapes) == 1:
-            attrs.logical_shape = logical_shapes[0]
-
-    def get_param_state(self, fq_name: str) -> ParamState:
-        fq_name = self._resolve_runtime_name(fq_name)
-        if fq_name not in self.param_states:
-            raise KeyError(f"param state not found: {fq_name}")
-        return self.param_states[fq_name]
+        if attrs is not None:
+            if sharded_axes is not None:
+                attrs.sharded_axes = sharded_axes
+            if replicated_axes is not None:
+                attrs.replicated_axes = replicated_axes
 
     def get_param_tensor(self, fq_name: str) -> nn.Parameter:
         fq_name = self._resolve_runtime_name(fq_name)
@@ -167,53 +166,47 @@ class StateManager:
             raise KeyError(f"runtime param attrs not found: {fq_name}")
         return self._runtime_attrs[fq_name]
 
-    def add_param_sharded_axis(self, fq_name: str, axis: MeshAxis) -> None:
-        self.get_param_attrs(fq_name).sharded_axes.add(axis)
-
-    def add_param_replicated_axis(self, fq_name: str, axis: MeshAxis) -> None:
-        self.get_param_attrs(fq_name).replicated_axes.add(axis)
-
-    def iter_param_states(self):
-        return self.param_states.items()
-
-    def export_param_states(self) -> list[ParamState]:
-        entries: list[ParamState] = []
-        for _, state in self.iter_param_states():
-            entries.append(
-                ParamState(
-                    state_key=state.state_key,
-                    logical_names=list(state.logical_names),
-                    logical_shapes=list(state.logical_shapes),
-                    physical_shape=tuple(state.physical_shape),
-                    dtype=state.dtype,
-                    annotations=dict(state.annotations),
-                )
-            )
-        return entries
-
     def export_optimizer_state(self) -> OptimizerState | None:
-        if self._runtime is None:
-            raise RuntimeError("StateManager is not bound to RuntimeCore")
-        runtime = self._runtime
+        runtime = self.runtime
         owner = runtime.get_optimizer_owner()
         optimizer, scheduler = runtime.get_optimizer_and_scheduler()
         if owner is None or optimizer is None:
             return None
-        if owner != "runtime":
-            state: dict[str, Any] = {f"{self._OPTIMIZER_STATE_PREFIX}{owner}": optimizer.state_dict()}
-            if scheduler is not None:
-                state[f"{self._SCHEDULER_STATE_PREFIX}{owner}"] = scheduler.state_dict()
-            return OptimizerState(state=state)
-
-        state: dict[str, Any] = {self._RUNTIME_OPTIMIZER_STATE_KEY: optimizer.state_dict()}
+        state: dict[str, Any] = {self._optimizer_state_key(owner): optimizer.state_dict()}
         if scheduler is not None:
-            state[self._RUNTIME_SCHEDULER_STATE_KEY] = scheduler.state_dict()
+            state[self._scheduler_state_key(owner)] = scheduler.state_dict()
         return OptimizerState(state=state)
 
+    def import_optimizer_state(self, state: OptimizerState) -> None:
+        runtime = self.runtime
+        payload = state.state
+        owner = runtime.get_optimizer_owner()
+        optimizer, scheduler = runtime.get_optimizer_and_scheduler()
+        if owner is None or optimizer is None:
+            raise ValueError("no optimizer available to load state into")
+        optimizer_state = payload.get(self._optimizer_state_key(owner))
+        if optimizer_state is None:
+            raise ValueError(f"no optimizer state found for owner={owner}")
+        optimizer.load_state_dict(optimizer_state)
+        scheduler_state = payload.get(self._scheduler_state_key(owner))
+        if scheduler_state is not None and scheduler is not None:
+            scheduler.load_state_dict(scheduler_state)
+
+    def _export_param_states(self) -> list[ParamState]:
+        return [
+            ParamState(
+                state_key=state.state_key,
+                logical_names=list(state.logical_names),
+                logical_shapes=list(state.logical_shapes),
+                physical_shape=tuple(state.physical_shape),
+                dtype=state.dtype,
+                annotations=dict(state.annotations),
+            )
+            for state in self.param_states.values()
+        ]
+
     def export_model_state(self) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
-        if self._runtime is None:
-            raise RuntimeError("StateManager is not bound to RuntimeCore")
-        runtime = self._runtime
+        runtime = self.runtime
         for plugin in runtime.plugins:
             override_state = plugin.override_param_state_dict()
             if override_state is not None:
@@ -221,8 +214,8 @@ class StateManager:
                 break
         else:
             state = {}
-            entries = self.export_param_states()
-            for name, _ in self.iter_param_states():
+            entries = self._export_param_states()
+            for name in self.param_states:
                 param = self.get_param_tensor(name)
                 state[name] = param.detach().cpu().clone()
 
@@ -232,50 +225,20 @@ class StateManager:
         return state, entries
 
     def import_model_state(self, model_state: dict[str, torch.Tensor]) -> None:
-        if self._runtime is None:
-            raise RuntimeError("StateManager is not bound to RuntimeCore")
-        runtime = self._runtime
+        runtime = self.runtime
         for plugin in runtime.plugins:
             if plugin.load_param_state_dict(model_state):
                 return
 
         for name, tensor in model_state.items():
-            self.get_param_state(name)
+            resolved_name = self._resolve_runtime_name(name)
+            if resolved_name not in self.param_states:
+                raise KeyError(f"param state not found: {resolved_name}")
             param = self.get_param_tensor(name)
             param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
 
-    def import_optimizer_state(self, state: OptimizerState) -> None:
-        if self._runtime is None:
-            raise RuntimeError("StateManager is not bound to RuntimeCore")
-        runtime = self._runtime
-        payload = state.state
-        owner = runtime.get_optimizer_owner()
-        optimizer, scheduler = runtime.get_optimizer_and_scheduler()
-        if owner is None or optimizer is None:
-            raise ValueError("no optimizer available to load state into")
-        if owner != "runtime":
-            optimizer_state = payload.get(f"{self._OPTIMIZER_STATE_PREFIX}{owner}")
-            if optimizer_state is not None:
-                optimizer.load_state_dict(optimizer_state)
-            else:
-                raise ValueError(f"no optimizer state found for owner={owner}")
-            scheduler_state = payload.get(f"{self._SCHEDULER_STATE_PREFIX}{owner}")
-            if scheduler is not None and scheduler_state is not None:
-                scheduler.load_state_dict(scheduler_state)
-            return
-
-        optimizer_state = payload.get(self._RUNTIME_OPTIMIZER_STATE_KEY)
-        if optimizer_state is None:
-            raise ValueError("no runtime optimizer state found")
-        optimizer.load_state_dict(optimizer_state)
-        scheduler_state = payload.get(self._RUNTIME_SCHEDULER_STATE_KEY)
-        if scheduler_state is not None and scheduler is not None:
-            scheduler.load_state_dict(scheduler_state)
-
     def export_trainer_state(self) -> TrainerState:
-        if self._runtime is None:
-            raise RuntimeError("StateManager is not bound to RuntimeCore")
-        runtime = self._runtime
+        runtime = self.runtime
         rng_state = RngState(
             cpu=torch.get_rng_state(),
             cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -288,16 +251,13 @@ class StateManager:
         dataloader_state = self._export_dataloader_state()
         return TrainerState(
             step_context=asdict(runtime.state.step_context) if runtime.state.step_context is not None else None,
-            consumed_tokens=None if dataloader_state is None else int(dataloader_state["consumed_tokens"]),
             dataloader=dataloader_state,
             rng=rng_state,
             plugin_states=plugin_states if plugin_states else None,
         )
 
     def import_trainer_state(self, state: TrainerState) -> None:
-        if self._runtime is None:
-            raise RuntimeError("StateManager is not bound to RuntimeCore")
-        runtime = self._runtime
+        runtime = self.runtime
 
         runtime.state.step_context = StepContext(**state.step_context) if state.step_context is not None else StepContext()
         torch.set_rng_state(state.rng.cpu)
