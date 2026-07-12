@@ -26,8 +26,11 @@ class TensorParallelPlugin(RuntimePlugin):
     def transform_model(self, model: nn.Module) -> nn.Module:
         if not isinstance(model, TpSpParallelizableModule):
             return model
+        assert self.runtime is not None
         spec = model.tpsp_parallelize_spec()
         for rule in spec.rules:
+            if self.runtime.is_module_path_omitted(rule.module_path):
+                continue
             module = model.get_submodule(rule.module_path)
             if not isinstance(module, nn.Linear):
                 continue
@@ -48,7 +51,6 @@ class TensorParallelPlugin(RuntimePlugin):
                     rule.comm_dim,
                 )
                 model.set_submodule(rule.module_path, new_row)
-        assert self.runtime is not None
         self.runtime.register_module_replacement(nn.Linear, ColumnParallelLinear)
         self.runtime.register_module_replacement(nn.Linear, RowParallelLinear)
         return model

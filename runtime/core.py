@@ -74,6 +74,14 @@ class RuntimeCore:
         self._group_manager = ProcessGroupManager.from_plan(self.plan, self.mesh)
         self.plugins = self._resolve_plugin_order(self.plugins)
 
+    def _populate_static_model_metrics(self) -> None:
+        self.state.static_metrics["perf/world_size"] = self.mesh.world_size
+        if isinstance(self.model, FlopsEstimatableModule):
+            try:
+                self.state.static_metrics["perf/flops_per_token"] = float(self.model.flops_per_token())
+            except AttributeError:
+                pass
+
     def setup(self) -> None:
         if self.device is None:
             self.device = _module_device(self.model)
@@ -127,10 +135,16 @@ class RuntimeCore:
         should_step = context.advance_micro_step()
         return loss, should_step
 
+    def _run_phase(self, phase: RuntimePhase) -> None:
+        for plugin in self.plugins:
+            plugin.on_phase(phase)
+
     def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:
         assert self._group_manager is not None
         return self._group_manager.get_group(axis)
 
+    # Cross-plugin module-path channel: upstream transforms (for example PP)
+    # mark paths they have logically removed so later plugins can skip them.
     def mark_module_path_omitted(self, path: str) -> None:
         self.state.omitted_module_paths.add(path)
 
@@ -140,17 +154,19 @@ class RuntimeCore:
                 return True
         return False
 
+    # Cross-plugin param-semantics channel: plugins annotate whether a param is
+    # shared or expert so later plugins can choose the right communication path.
     def set_param_role(self, param: nn.Parameter, role: ParamRole) -> None:
-        self.state.param_roles[id(param)] = role
+        self.state_manager.set_param_role(param, role)
 
     def get_param_role(self, param: nn.Parameter) -> ParamRole:
-        return self.state.param_roles.get(id(param), ParamRole.SHARED)
+        return self.state_manager.get_param_role(param)
 
     def grad_norm_replica_factor(self, param: nn.Parameter) -> int:
         fq_name = self.state_manager.get_param_name(param)
-        layout = self.state_manager.get_param_layout(fq_name)
+        attrs = self.state_manager.get_param_attrs(fq_name)
         factor = 1
-        for axis in layout.replicated_axes:
+        for axis in attrs.replicated_axes:
             if axis == MeshAxis.DP:
                 factor *= self.mesh.dp
             elif axis == MeshAxis.TP:
@@ -166,6 +182,20 @@ class RuntimeCore:
         if factor < 1:
             raise ValueError(f"invalid grad_norm_replica_factor={factor} for param={fq_name}")
         return factor
+
+    # -------------------------------------
+    # Optimizer / scheduler methods: begin
+    # -------------------------------------
+    def _validate_optimizer_owner(self) -> None:
+        runtime_owners = ["runtime"] if self._optimizer is not None else []
+        plugin_owners = [plugin.id.value for plugin in self.plugins if plugin.owns_optimizer]
+        if len(plugin_owners) > 1:
+            raise ValueError(f"RuntimeCore allows only one optimizer-owning plugin, got {plugin_owners}")
+        if runtime_owners and plugin_owners:
+            raise ValueError(
+                "Runtime optimizer ownership is mutually exclusive with optimizer-owning plugins, "
+                f"got {runtime_owners + plugin_owners}"
+            )
 
     def get_optimizer_and_scheduler(
         self,
@@ -184,6 +214,12 @@ class RuntimeCore:
             if plugin.owns_optimizer:
                 return plugin.id.value
         return None
+
+    def _maybe_build_runtime_optimizer(self) -> None:
+        if self.get_optimizer_owner() is not None:
+            return
+        self._optimizer = self.create_optimizer(self.model.parameters())
+        self._scheduler = self.create_scheduler(self._optimizer)
 
     def create_optimizer(self, params: Iterable[nn.Parameter]) -> torch.optim.Optimizer:
         if self.optimizer_factory is None:
@@ -221,6 +257,43 @@ class RuntimeCore:
         self._run_phase(RuntimePhase.POST_STEP)
         self.state.step_context.advance_step()
 
+    def should_save_optimizer(self, rank_id: int) -> bool:
+        return self.optimizer_state_source_rank(rank_id) == rank_id
+
+    def _runtime_optimizer_mesh_axes(self) -> tuple[set[MeshAxis], set[MeshAxis]]:
+        replicated_axes: set[MeshAxis] = set()
+        sharded_axes: set[MeshAxis] = set()
+        for plugin in self.plugins:
+            replicated_axes.update(plugin.runtime_optimizer_replicated_axes())
+            sharded_axes.update(plugin.runtime_optimizer_sharded_axes())
+        return replicated_axes, sharded_axes
+
+    def optimizer_state_source_rank(self, rank_id: int) -> int:
+        for plugin in self.plugins:
+            if plugin.owns_optimizer:
+                return plugin.optimizer_state_source_rank(rank_id)
+
+        replicated_axes, sharded_axes = self._runtime_optimizer_mesh_axes()
+        dp_idx, pp_idx, cp_idx, tp_idx = self.mesh.rank_coordinates(rank_id)
+        coords = {
+            MeshAxis.DP: dp_idx,
+            MeshAxis.PP: pp_idx,
+            MeshAxis.CP: cp_idx,
+            MeshAxis.TP: tp_idx,
+        }
+        for axis in replicated_axes - sharded_axes:
+            coords[axis] = 0
+        return self.mesh.rank_id(
+            dp=coords[MeshAxis.DP],
+            pp=coords[MeshAxis.PP],
+            cp=coords[MeshAxis.CP],
+            tp=coords[MeshAxis.TP],
+        )
+
+    # -------------------------------------
+    # Optimizer / scheduler methods: end
+    # -------------------------------------
+
     def collect_metrics(self) -> dict[str, MetricValue]:
         context = self.state.step_context
         metrics: dict[str, MetricValue] = {
@@ -246,54 +319,6 @@ class RuntimeCore:
                     raise ValueError(f"duplicate metric key={metric_key}")
                 metrics[metric_key] = value
         return metrics
-
-    def should_save_optimizer(self, rank_id: int) -> bool:
-        return self.optimizer_state_source_rank(rank_id) == rank_id
-
-    def optimizer_state_source_rank(self, rank_id: int) -> int:
-        for plugin in self.plugins:
-            if plugin.owns_optimizer:
-                return plugin.optimizer_state_source_rank(rank_id)
-
-        replicated_axes, sharded_axes = self._runtime_optimizer_mesh_axes()
-        dp_idx, pp_idx, cp_idx, tp_idx = self.mesh.rank_coordinates(rank_id)
-        coords = {
-            MeshAxis.DP: dp_idx,
-            MeshAxis.PP: pp_idx,
-            MeshAxis.CP: cp_idx,
-            MeshAxis.TP: tp_idx,
-        }
-        for axis in replicated_axes - sharded_axes:
-            coords[axis] = 0
-        return self.mesh.rank_id(
-            dp=coords[MeshAxis.DP],
-            pp=coords[MeshAxis.PP],
-            cp=coords[MeshAxis.CP],
-            tp=coords[MeshAxis.TP],
-        )
-
-    def _run_phase(self, phase: RuntimePhase) -> None:
-        for plugin in self.plugins:
-            plugin.on_phase(phase)
-
-    def _runtime_optimizer_mesh_axes(self) -> tuple[set[MeshAxis], set[MeshAxis]]:
-        replicated_axes: set[MeshAxis] = set()
-        sharded_axes: set[MeshAxis] = set()
-        for plugin in self.plugins:
-            replicated_axes.update(plugin.runtime_optimizer_replicated_axes())
-            sharded_axes.update(plugin.runtime_optimizer_sharded_axes())
-        return replicated_axes, sharded_axes
-
-    def _validate_optimizer_owner(self) -> None:
-        runtime_owners = ["runtime"] if self._optimizer is not None else []
-        plugin_owners = [plugin.id.value for plugin in self.plugins if plugin.owns_optimizer]
-        if len(plugin_owners) > 1:
-            raise ValueError(f"RuntimeCore allows only one optimizer-owning plugin, got {plugin_owners}")
-        if runtime_owners and plugin_owners:
-            raise ValueError(
-                "Runtime optimizer ownership is mutually exclusive with optimizer-owning plugins, "
-                f"got {runtime_owners + plugin_owners}"
-            )
 
     def _resolve_step_runner(self) -> "StepRunner":
         owner_plugin: RuntimePlugin | None = None
@@ -324,20 +349,6 @@ class RuntimeCore:
                 f"plugin={owner_plugin.id.value} declared owns_step_runner=True but did not provide a step runner"
             )
         return owner_runner
-
-    def _maybe_build_runtime_optimizer(self) -> None:
-        if self.get_optimizer_owner() is not None:
-            return
-        self._optimizer = self.create_optimizer(self.model.parameters())
-        self._scheduler = self.create_scheduler(self._optimizer)
-
-    def _populate_static_model_metrics(self) -> None:
-        self.state.static_metrics["perf/world_size"] = self.mesh.world_size
-        if isinstance(self.model, FlopsEstimatableModule):
-            try:
-                self.state.static_metrics["perf/flops_per_token"] = float(self.model.flops_per_token())
-            except AttributeError:
-                pass
 
     def _resolve_plugin_order(self, plugins: list[RuntimePlugin]) -> list[RuntimePlugin]:
         if not plugins:

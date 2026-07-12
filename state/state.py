@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 from runtime.mesh import MeshAxis
-from runtime.types import StepContext
+from runtime.types import ParamRole, StepContext
 
 if TYPE_CHECKING:
     from data import StatefulDataLoaderProtocol
@@ -14,26 +14,13 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class RuntimeParamStatus:
-    """Runtime-only mutable state for one parameter reference."""
-
-    is_materialized: bool = True
-    is_gathered: bool = False
-
-
-@dataclass
-class RuntimeParamLayout:
-    """Runtime-only distributed layout metadata for one parameter reference."""
+class RuntimeParamAttrs:
+    """Runtime-only metadata for one parameter reference."""
 
     logical_shape: tuple[int, ...]
+    role: ParamRole = ParamRole.SHARED
     sharded_axes: set[MeshAxis] = field(default_factory=set)
     replicated_axes: set[MeshAxis] = field(default_factory=set)
-
-
-# TODO: RuntimeParamStatus / RuntimeParamLayout / ParamState are split
-# across runtime-mutability, runtime layout, and checkpoint metadata. This is
-# workable for now but easy to lose track of; later we should consolidate them
-# behind a clearer single param-metadata model.
 
 
 @dataclass
@@ -77,8 +64,7 @@ class StateManager:
 
     param_states: dict[str, ParamState] = field(default_factory=dict)
     _runtime_params: dict[str, nn.Parameter] = field(default_factory=dict, repr=False)
-    _runtime_status: dict[str, RuntimeParamStatus] = field(default_factory=dict, repr=False)
-    _runtime_layouts: dict[str, RuntimeParamLayout] = field(default_factory=dict, repr=False)
+    _runtime_attrs: dict[str, RuntimeParamAttrs] = field(default_factory=dict, repr=False)
     _param_names_by_id: dict[int, str] = field(default_factory=dict, repr=False)
     _runtime: "RuntimeCore | None" = field(default=None, init=False, repr=False)
     _dataloader: "StatefulDataLoaderProtocol | None" = field(default=None, init=False, repr=False)
@@ -89,32 +75,27 @@ class StateManager:
     _RUNTIME_SCHEDULER_STATE_KEY = f"{_SCHEDULER_STATE_PREFIX}runtime"
 
     def _resolve_runtime_name(self, fq_name: str) -> str:
-        if fq_name in self._runtime_params or fq_name in self.param_states or fq_name in self._runtime_layouts:
+        if fq_name in self._runtime_params or fq_name in self.param_states or fq_name in self._runtime_attrs:
             return fq_name
         with_prefix = f"module.{fq_name}"
-        if with_prefix in self._runtime_params or with_prefix in self.param_states or with_prefix in self._runtime_layouts:
+        if with_prefix in self._runtime_params or with_prefix in self.param_states or with_prefix in self._runtime_attrs:
             return with_prefix
         if fq_name.startswith("module."):
             without_prefix = fq_name[len("module.") :]
-            if without_prefix in self._runtime_params or without_prefix in self.param_states or without_prefix in self._runtime_layouts:
+            if without_prefix in self._runtime_params or without_prefix in self.param_states or without_prefix in self._runtime_attrs:
                 return without_prefix
         return fq_name
 
     def register_module(self, model: nn.Module) -> None:
         self.param_states.clear()
         self._runtime_params.clear()
-        self._runtime_status.clear()
-        self._runtime_layouts.clear()
+        self._runtime_attrs.clear()
         self._param_names_by_id.clear()
         for fq_name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
             self._runtime_params[fq_name] = param
             self._param_names_by_id[id(param)] = fq_name
-            self._runtime_status[fq_name] = RuntimeParamStatus(
-                is_materialized=True,
-                is_gathered=False,
-            )
             self.param_states[fq_name] = ParamState(
                 state_key=fq_name,
                 logical_names=[fq_name],
@@ -122,7 +103,7 @@ class StateManager:
                 physical_shape=tuple(param.shape),
                 dtype=str(param.dtype),
             )
-            self._runtime_layouts[fq_name] = RuntimeParamLayout(
+            self._runtime_attrs[fq_name] = RuntimeParamAttrs(
                 logical_shape=tuple(param.shape),
             )
 
@@ -159,9 +140,9 @@ class StateManager:
             state.physical_shape = physical_shape
         if dtype is not None:
             state.dtype = dtype
-        layout = self._runtime_layouts.get(fq_name)
-        if layout is not None and logical_shapes is not None and len(logical_shapes) == 1:
-            layout.logical_shape = logical_shapes[0]
+        attrs = self._runtime_attrs.get(fq_name)
+        if attrs is not None and logical_shapes is not None and len(logical_shapes) == 1:
+            attrs.logical_shape = logical_shapes[0]
 
     def get_param_state(self, fq_name: str) -> ParamState:
         fq_name = self._resolve_runtime_name(fq_name)
@@ -181,23 +162,25 @@ class StateManager:
             raise KeyError("runtime parameter name not found")
         return fq_name
 
-    def get_param_status(self, fq_name: str) -> RuntimeParamStatus:
+    def get_param_attrs(self, fq_name: str) -> RuntimeParamAttrs:
         fq_name = self._resolve_runtime_name(fq_name)
-        if fq_name not in self._runtime_status:
-            raise KeyError(f"runtime status not found: {fq_name}")
-        return self._runtime_status[fq_name]
-
-    def get_param_layout(self, fq_name: str) -> RuntimeParamLayout:
-        fq_name = self._resolve_runtime_name(fq_name)
-        if fq_name not in self._runtime_layouts:
-            raise KeyError(f"runtime param layout not found: {fq_name}")
-        return self._runtime_layouts[fq_name]
+        if fq_name not in self._runtime_attrs:
+            raise KeyError(f"runtime param attrs not found: {fq_name}")
+        return self._runtime_attrs[fq_name]
 
     def add_param_sharded_axis(self, fq_name: str, axis: MeshAxis) -> None:
-        self.get_param_layout(fq_name).sharded_axes.add(axis)
+        self.get_param_attrs(fq_name).sharded_axes.add(axis)
 
     def add_param_replicated_axis(self, fq_name: str, axis: MeshAxis) -> None:
-        self.get_param_layout(fq_name).replicated_axes.add(axis)
+        self.get_param_attrs(fq_name).replicated_axes.add(axis)
+
+    def set_param_role(self, param: nn.Parameter | str, role: ParamRole) -> None:
+        fq_name = self.get_param_name(param) if isinstance(param, nn.Parameter) else self._resolve_runtime_name(param)
+        self.get_param_attrs(fq_name).role = role
+
+    def get_param_role(self, param: nn.Parameter | str) -> ParamRole:
+        fq_name = self.get_param_name(param) if isinstance(param, nn.Parameter) else self._resolve_runtime_name(param)
+        return self.get_param_attrs(fq_name).role
 
     def iter_param_states(self):
         return self.param_states.items()

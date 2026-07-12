@@ -50,8 +50,11 @@ class SequenceParallelPlugin(RuntimePlugin):
     def transform_model(self, model: nn.Module) -> nn.Module:
         if not isinstance(model, TpSpParallelizableModule):
             return model
+        assert self.runtime is not None
 
         for rule in model.tpsp_parallelize_spec().rules:
+            if self.runtime.is_module_path_omitted(rule.module_path):
+                continue
             if rule.shard_axis != TpSpShardAxis.SEQUENCE:
                 continue
             module = model.get_submodule(rule.module_path)

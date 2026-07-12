@@ -7,7 +7,7 @@ from .state import (
     OptimizerState,
     ParamState,
     RngState,
-    RuntimeParamStatus,
+    RuntimeParamAttrs,
     StateManager,
     TrainerState,
 )
@@ -17,7 +17,7 @@ __all__ = [
     "OptimizerState",
     "ParamState",
     "RngState",
-    "RuntimeParamStatus",
+    "RuntimeParamAttrs",
     "StateManager",
     "TrainerState",
     "load_sharded_checkpoint",

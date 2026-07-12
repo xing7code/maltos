@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import MethodType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -10,9 +9,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from parallel.specs import TpSpParallelSpec
 from runtime.mesh import MeshAxis
-from runtime.plugin import PipelineParallelizableModule, PluginId, RuntimePlugin, TpSpParallelizableModule
+from runtime.plugin import PipelineParallelizableModule, PluginId, RuntimePlugin
 from runtime.step_runners import PipelineScheduleKind, PipelineStepRunner
 
 
@@ -72,7 +70,6 @@ class PipelineParallelPlugin(RuntimePlugin):
         spec = model.pipeline_parallel_spec()
         self.hidden_size = _infer_hidden_size(model, spec)
         self._partition_model(model, spec, pp_idx, self.stage_count)
-        self._filter_tpsp_spec(model, spec, pp_idx, self.stage_count)
         return model
 
     def build_step_runner(self):
@@ -122,45 +119,11 @@ class PipelineParallelPlugin(RuntimePlugin):
             )
             _replace_module_path(model, path, partitioned)
 
-    def _filter_tpsp_spec(self, model: nn.Module, pp_spec, stage_index: int, stage_count: int) -> None:
-        if not isinstance(model, TpSpParallelizableModule):
-            return
-        tpsp_spec = model.tpsp_parallelize_spec()
-        keep_prefixes: list[str] = []
-        if stage_index == 0:
-            keep_prefixes.extend(pp_spec.head_layers)
-        if stage_index == stage_count - 1:
-            keep_prefixes.extend(pp_spec.tail_layers)
-        for path in pp_spec.pipe_layers:
-            module = model.get_submodule(path)
-            if not isinstance(module, nn.ModuleList):
-                continue
-            start, end = _layer_range(len(module), stage_index, stage_count)
-            keep_prefixes.extend(f"{path}.{layer_idx}" for layer_idx in range(start, end))
-
-        filtered_rules = [rule for rule in tpsp_spec.rules if _path_matches_any_prefix(rule.module_path, keep_prefixes)]
-        filtered_tie_rules = [
-            tie_rule
-            for tie_rule in tpsp_spec.tie_rules
-            if _path_matches_any_prefix(tie_rule[0], keep_prefixes)
-            and _path_matches_any_prefix(tie_rule[1], keep_prefixes)
-        ]
-        filtered_spec = TpSpParallelSpec(rules=filtered_rules, tie_rules=filtered_tie_rules)
-        model.tpsp_parallelize_spec = MethodType(lambda _self: filtered_spec, model)
-
-
 def _layer_range(num_layers: int, stage_index: int, stage_count: int) -> tuple[int, int]:
     base, remainder = divmod(num_layers, stage_count)
     start = stage_index * base + min(stage_index, remainder)
     width = base + (1 if stage_index < remainder else 0)
     return start, start + width
-
-
-def _path_matches_any_prefix(path: str, prefixes: list[str]) -> bool:
-    for prefix in prefixes:
-        if path == prefix or path.startswith(prefix + "."):
-            return True
-    return False
 
 
 class _IdentityPipeLayer(nn.Module):
