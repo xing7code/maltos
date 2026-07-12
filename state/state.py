@@ -221,25 +221,20 @@ class StateManager:
         if self._runtime is None:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
-        optimizer, scheduler = runtime._get_runtime_optimizer_and_scheduler()
-        if optimizer is not None:
-            state: dict[str, Any] = {self._RUNTIME_OPTIMIZER_STATE_KEY: optimizer.state_dict()}
+        owner = runtime.get_optimizer_owner()
+        optimizer, scheduler = runtime.get_optimizer_and_scheduler()
+        if owner is None or optimizer is None:
+            return None
+        if owner != "runtime":
+            state: dict[str, Any] = {f"{self._OPTIMIZER_STATE_PREFIX}{owner}": optimizer.state_dict()}
             if scheduler is not None:
-                state[self._RUNTIME_SCHEDULER_STATE_KEY] = scheduler.state_dict()
+                state[f"{self._SCHEDULER_STATE_PREFIX}{owner}"] = scheduler.state_dict()
             return OptimizerState(state=state)
 
-        for plugin in runtime.plugins:
-            if not plugin.owns_optimizer:
-                continue
-            optimizer = getattr(plugin, "optimizer", None)
-            if optimizer is None:
-                continue
-            state: dict[str, Any] = {f"{self._OPTIMIZER_STATE_PREFIX}{plugin.id.value}": optimizer.state_dict()}
-            scheduler = getattr(plugin, "scheduler", None)
-            if scheduler is not None:
-                state[f"{self._SCHEDULER_STATE_PREFIX}{plugin.id.value}"] = scheduler.state_dict()
-            return OptimizerState(state=state)
-        return None
+        state: dict[str, Any] = {self._RUNTIME_OPTIMIZER_STATE_KEY: optimizer.state_dict()}
+        if scheduler is not None:
+            state[self._RUNTIME_SCHEDULER_STATE_KEY] = scheduler.state_dict()
+        return OptimizerState(state=state)
 
     def export_model_state(self) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
         if self._runtime is None:
@@ -280,32 +275,28 @@ class StateManager:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
         payload = state.state
-        optimizer, scheduler = runtime._get_runtime_optimizer_and_scheduler()
-        if optimizer is not None:
-            optimizer_state = payload.get(self._RUNTIME_OPTIMIZER_STATE_KEY)
+        owner = runtime.get_optimizer_owner()
+        optimizer, scheduler = runtime.get_optimizer_and_scheduler()
+        if owner is None or optimizer is None:
+            raise ValueError("no optimizer available to load state into")
+        if owner != "runtime":
+            optimizer_state = payload.get(f"{self._OPTIMIZER_STATE_PREFIX}{owner}")
             if optimizer_state is not None:
                 optimizer.load_state_dict(optimizer_state)
-            scheduler_state = payload.get(self._RUNTIME_SCHEDULER_STATE_KEY)
-            if scheduler_state is not None and scheduler is not None:
-                scheduler.load_state_dict(scheduler_state)
-            return
-
-        for plugin in runtime.plugins:
-            if not plugin.owns_optimizer:
-                continue
-            optimizer = getattr(plugin, "optimizer", None)
-            if optimizer is None:
-                continue
-            optimizer_state = payload.get(f"{self._OPTIMIZER_STATE_PREFIX}{plugin.id.value}")
-            if optimizer_state is None:
-                continue
-            optimizer.load_state_dict(optimizer_state)
-            scheduler = getattr(plugin, "scheduler", None)
-            scheduler_state = payload.get(f"{self._SCHEDULER_STATE_PREFIX}{plugin.id.value}")
+            else:
+                raise ValueError(f"no optimizer state found for owner={owner}")
+            scheduler_state = payload.get(f"{self._SCHEDULER_STATE_PREFIX}{owner}")
             if scheduler is not None and scheduler_state is not None:
                 scheduler.load_state_dict(scheduler_state)
             return
-        raise ValueError("no optimizer state found")
+
+        optimizer_state = payload.get(self._RUNTIME_OPTIMIZER_STATE_KEY)
+        if optimizer_state is None:
+            raise ValueError("no runtime optimizer state found")
+        optimizer.load_state_dict(optimizer_state)
+        scheduler_state = payload.get(self._RUNTIME_SCHEDULER_STATE_KEY)
+        if scheduler_state is not None and scheduler is not None:
+            scheduler.load_state_dict(scheduler_state)
 
     def export_trainer_state(self) -> TrainerState:
         if self._runtime is None:

@@ -177,10 +177,13 @@ class RuntimeCore:
                 return getattr(plugin, "optimizer", None), getattr(plugin, "scheduler", None)
         return None, None
 
-    def _get_runtime_optimizer_and_scheduler(
-        self,
-    ) -> tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LRScheduler | None]:
-        return self._optimizer, self._scheduler
+    def get_optimizer_owner(self) -> str | None:
+        if self._optimizer is not None:
+            return "runtime"
+        for plugin in self.plugins:
+            if plugin.owns_optimizer:
+                return plugin.id.value
+        return None
 
     def create_optimizer(self, params: Iterable[nn.Parameter]) -> torch.optim.Optimizer:
         if self.optimizer_factory is None:
@@ -248,11 +251,9 @@ class RuntimeCore:
         return self.optimizer_state_source_rank(rank_id) == rank_id
 
     def optimizer_state_source_rank(self, rank_id: int) -> int:
-        if self._plugin_owns_optimizer():
-            for plugin in self.plugins:
-                if plugin.owns_optimizer:
-                    return plugin.optimizer_state_source_rank(rank_id)
-            raise RuntimeError("optimizer ownership invariant violated: no optimizer-owning plugin found")
+        for plugin in self.plugins:
+            if plugin.owns_optimizer:
+                return plugin.optimizer_state_source_rank(rank_id)
 
         replicated_axes, sharded_axes = self._runtime_optimizer_mesh_axes()
         dp_idx, pp_idx, cp_idx, tp_idx = self.mesh.rank_coordinates(rank_id)
@@ -274,9 +275,6 @@ class RuntimeCore:
     def _run_phase(self, phase: RuntimePhase) -> None:
         for plugin in self.plugins:
             plugin.on_phase(phase)
-
-    def _plugin_owns_optimizer(self) -> bool:
-        return any(plugin.owns_optimizer for plugin in self.plugins)
 
     def _runtime_optimizer_mesh_axes(self) -> tuple[set[MeshAxis], set[MeshAxis]]:
         replicated_axes: set[MeshAxis] = set()
@@ -328,7 +326,7 @@ class RuntimeCore:
         return owner_runner
 
     def _maybe_build_runtime_optimizer(self) -> None:
-        if self._plugin_owns_optimizer():
+        if self.get_optimizer_owner() is not None:
             return
         self._optimizer = self.create_optimizer(self.model.parameters())
         self._scheduler = self.create_scheduler(self._optimizer)
