@@ -129,7 +129,6 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     core = RuntimeCore(
         mesh=mesh,
         plan=ParallelPlan(
-            zero_stage=zero_stage,
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
         ),
         model=sharded_model,

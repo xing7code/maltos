@@ -108,7 +108,6 @@ def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Name
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=args.ep_size),
         plan=ParallelPlan(
-            zero_stage=args.zero_stage,
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
             reuse_tp_for_ep=args.reuse_tp_for_ep,
@@ -138,7 +137,6 @@ def _make_runtime_core(reference_model: TinyMoETransformer, args: argparse.Names
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=args.ep_size),
         plan=ParallelPlan(
-            zero_stage=args.zero_stage,
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
             reuse_tp_for_ep=args.reuse_tp_for_ep,

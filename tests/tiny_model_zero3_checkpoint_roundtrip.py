@@ -48,7 +48,7 @@ def _build_core(model: TinyModel, world_size: int) -> tuple[RuntimeCore, Zero3Pl
     zero3 = Zero3Plugin()
     core = RuntimeCore(
         mesh=MeshConfig(dp=world_size, tp=1, pp=1, cp=1, ep=1),
-        plan=ParallelPlan(zero_stage=3),
+        plan=ParallelPlan(),
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=[zero3],

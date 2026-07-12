@@ -106,25 +106,25 @@ def _mesh_indices(rank: int, tp_size: int) -> tuple[int, int]:
 def _make_plugins(case: str):
     plugins = [TensorParallelPlugin(), SequenceParallelPlugin()]
     if case == "tp_sp":
-        return plugins, 0
+        return plugins
     if case == "tp_bf16":
-        return [TensorParallelPlugin(), PrecisionPlugin(compute_dtype=torch.bfloat16)], 0
+        return [TensorParallelPlugin(), PrecisionPlugin(compute_dtype=torch.bfloat16)]
     if case == "tp_sp_ddp_sync":
-        return plugins + [DataParallelPlugin(async_op=False)], 0
+        return plugins + [DataParallelPlugin(async_op=False)]
     if case == "tp_sp_ddp_async":
-        return plugins + [DataParallelPlugin(async_op=True)], 0
+        return plugins + [DataParallelPlugin(async_op=True)]
     if case == "tp_sp_ddp_bucket":
-        return plugins + [BucketDataParallelPlugin(bucket_mb_size=0)], 0
+        return plugins + [BucketDataParallelPlugin(bucket_mb_size=0)]
     if case == "tp_sp_zero1":
-        return plugins + [Zero1Plugin(bucket_mb_size=0)], 1
+        return plugins + [Zero1Plugin(bucket_mb_size=0)]
     if case == "tp_sp_zero2":
-        return plugins + [Zero2Plugin(bucket_mb_size=0)], 2
+        return plugins + [Zero2Plugin(bucket_mb_size=0)]
     if case == "tp_sp_zero3":
         return plugins + [
             Zero3Plugin(
                 wrap_cls=_ZERO3_WRAP_CLS,
             )
-        ], 3
+        ]
     if case in {"tp_sp_zero3_bf16_clip", "tp_sp_zero3_bf16_clip_accum2"}:
         return plugins + [
             Zero3Plugin(
@@ -132,7 +132,7 @@ def _make_plugins(case: str):
             ),
             PrecisionPlugin(compute_dtype=torch.bfloat16),
             GradClipPlugin(max_norm=1.0),
-        ], 3
+        ]
     if case in {"tp_zero3_bf16_clip", "tp_zero3_bf16_clip_accum2"}:
         return [
             TensorParallelPlugin(),
@@ -141,7 +141,7 @@ def _make_plugins(case: str):
             ),
             PrecisionPlugin(compute_dtype=torch.bfloat16),
             GradClipPlugin(max_norm=1.0),
-        ], 3
+        ]
     raise ValueError(f"unknown integration case={case}")
 
 
@@ -183,10 +183,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     grad_accum_steps = 2 if args.case in {"tp_zero3_bf16_clip_accum2", "tp_sp_zero3_bf16_clip_accum2"} else 1
     if local_batch_size % grad_accum_steps != 0:
         raise ValueError("local batch size must be divisible by grad_accum_steps")
-    plugins, zero_stage = _make_plugins(args.case)
+    plugins = _make_plugins(args.case)
     core = RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=1, cp=1, ep=1),
-        plan=ParallelPlan(zero_stage=zero_stage),
+        plan=ParallelPlan(),
         model=sharded_model,
         grad_accum_steps=grad_accum_steps,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),

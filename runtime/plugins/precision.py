@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 import torch.nn as nn
 
 from runtime.core import RuntimePhase
 from runtime.plugin import MetricValue, PluginId, RuntimePlugin
-
-if TYPE_CHECKING:
-    from runtime.core import RuntimeCore
 
 
 class _AutocastModelWrapper(nn.Module):
@@ -54,16 +49,16 @@ class PrecisionPlugin(RuntimePlugin):
         self.use_grad_scaler = use_grad_scaler
 
     def transform_model(self, model: nn.Module) -> nn.Module:
+        self._setup_scaler()
         if self.compute_dtype is None:
             return model
         _validate_compute_dtype(self.compute_dtype)
-        return _AutocastModelWrapper(model, self.compute_dtype, _model_device_type(model))
+        assert self.runtime is not None
+        device = torch.device(self.runtime.device)
+        return _AutocastModelWrapper(model, self.compute_dtype, device.type)
 
     def on_phase(self, phase: RuntimePhase) -> None:
         if self.runtime is None:
-            return
-        if phase == RuntimePhase.SETUP:
-            self._setup_scaler()
             return
         if phase == RuntimePhase.PRE_BACKWARD:
             self._scale_loss_for_backward()
@@ -75,8 +70,8 @@ class PrecisionPlugin(RuntimePlugin):
         if self.compute_dtype != torch.float16 or not self.use_grad_scaler:
             self.runtime.state.scaler = None
             return
-        device_type = _model_device_type(self.runtime.model)
-        if device_type != "cuda":
+        device = torch.device(self.runtime.device)
+        if device.type != "cuda":
             raise ValueError("PrecisionPlugin(fp16) requires CUDA model parameters")
         self.runtime.state.scaler = torch.amp.GradScaler(device="cuda")
 
@@ -114,8 +109,3 @@ def _validate_compute_dtype(compute_dtype: torch.dtype) -> None:
         raise ValueError(
             f"PrecisionPlugin only supports compute_dtype in {{torch.float16, torch.bfloat16}}, got {compute_dtype}"
         )
-
-
-def _model_device_type(model: nn.Module) -> str:
-    first_param = next(model.parameters(), None)
-    return "cpu" if first_param is None else first_param.device.type

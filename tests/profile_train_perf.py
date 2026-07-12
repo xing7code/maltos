@@ -218,7 +218,6 @@ def _build_core(cfg: PerfCase, device: torch.device) -> RuntimeCore:
     return RuntimeCore(
         mesh=MeshConfig(dp=cfg.dp, tp=cfg.tp, pp=cfg.pp, cp=cfg.cp, ep=cfg.ep),
         plan=ParallelPlan(
-            zero_stage=cfg.zero_stage,
             pp_schedule=PipelineScheduleConfig(microbatches=cfg.pp_microbatches),
             cp_attn_core=ContextParallelAttentionCoreType(cfg.cp_attn_core),
         ),

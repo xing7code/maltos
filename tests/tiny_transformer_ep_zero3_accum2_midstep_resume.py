@@ -71,7 +71,7 @@ def _build_runtime(seed: int, dp_size: int, ep_size: int) -> tuple[RuntimeCore, 
     zero3 = Zero3Plugin(wrap_cls=_ZERO3_WRAP_CLS)
     core = RuntimeCore(
         mesh=MeshConfig(dp=dp_size, tp=1, pp=1, cp=1, ep=ep_size),
-        plan=ParallelPlan(zero_stage=3),
+        plan=ParallelPlan(),
         model=model,
         grad_accum_steps=2,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),

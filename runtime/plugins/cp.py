@@ -147,7 +147,7 @@ class ContextParallelPlugin(RuntimePlugin):
     def on_phase(self, phase: RuntimePhase) -> None:
         if self.world_size <= 1:
             return
-        if phase == RuntimePhase.PRE_MICROBATCH:
+        if phase == RuntimePhase.PRE_STEP_RUNNER:
             assert self.runtime is not None
             self.runtime.state.batch = _shard_batch_for_cp(
                 self.runtime.state.batch,

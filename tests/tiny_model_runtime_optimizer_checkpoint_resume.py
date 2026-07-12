@@ -76,10 +76,14 @@ def main() -> None:
     restored_core.step_optimizer()
 
     param_name, param_diff = _max_param_diff(continuous_core.model, restored_core.model)
-    assert continuous_core.scheduler is not None
-    assert restored_core.scheduler is not None
-    scheduler_match = continuous_core.scheduler.state_dict() == restored_core.scheduler.state_dict()
-    lr_diff = abs(continuous_core.optimizer.param_groups[0]["lr"] - restored_core.optimizer.param_groups[0]["lr"])
+    continuous_optimizer, continuous_scheduler = continuous_core.get_optimizer_and_scheduler()
+    restored_optimizer, restored_scheduler = restored_core.get_optimizer_and_scheduler()
+    assert continuous_optimizer is not None
+    assert restored_optimizer is not None
+    assert continuous_scheduler is not None
+    assert restored_scheduler is not None
+    scheduler_match = continuous_scheduler.state_dict() == restored_scheduler.state_dict()
+    lr_diff = abs(continuous_optimizer.param_groups[0]["lr"] - restored_optimizer.param_groups[0]["lr"])
     batch_diff = (second_batch - restored_second_batch).abs().max().item()
     print(f"Checkpoint dir    : {checkpoint_dir}")
     print(f"Resume diff       : {param_diff:.2e}  ({param_name}, atol={_ATOL:.2e})")

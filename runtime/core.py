@@ -21,8 +21,7 @@ StepRunnerFn = Callable[[Any], torch.Tensor]
 
 
 class RuntimePhase(str, Enum):
-    SETUP = "setup"
-    PRE_MICROBATCH = "pre_microbatch"
+    PRE_STEP_RUNNER = "pre_step_runner"
     PRE_FORWARD = "pre_forward"
     POST_FORWARD = "post_forward"
     PRE_BACKWARD = "pre_backward"
@@ -146,8 +145,8 @@ class RuntimeCore:
     plugins: list[RuntimePlugin] = field(default_factory=list)
     state_manager: StateManager = field(default_factory=StateManager)
     state: RuntimeState = field(default_factory=RuntimeState)
-    optimizer: torch.optim.Optimizer | None = field(default=None, init=False)
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False)
+    _optimizer: torch.optim.Optimizer | None = field(default=None, init=False, repr=False)
+    _scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False, repr=False)
     _group_manager: ProcessGroupManager | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
     _module_replacements: "dict[type[nn.Module], set[type[nn.Module]]]" = field(
@@ -179,18 +178,18 @@ class RuntimeCore:
         self.state.step_context = StepContext(
             grad_accum_steps=self.grad_accum_steps,
         )
-        self._validate_mesh_and_plan()
         self._group_manager = ProcessGroupManager.from_plan(self.plan, self.mesh)
         self.plugins = self._resolve_plugin_order(self.plugins)
 
     def setup(self) -> None:
-        if self.device is not None:
+        if self.device is None:
+            self.device = _module_device(self.model)
+        else:
             self.device = torch.device(self.device)
             self.model.to(self.device)
         self.state_manager.bind(self)
         for plugin in self.plugins:
             plugin.bind(self)
-        self._run_phase(RuntimePhase.SETUP)
         for plugin in self.plugins:
             self.model = plugin.transform_model(self.model)
         self.state_manager.register_module(self.model)
@@ -221,14 +220,14 @@ class RuntimeCore:
             raise ExceptionGroup("RuntimeCore.close() failed", errors)
 
     def run_step(self, batch: Any) -> tuple[torch.Tensor, bool]:
-        if self.device is not None:
-            batch = _move_to_device(batch, torch.device(self.device))
+        assert self.device is not None, "Runtime device should not be None!"
+        batch = _move_to_device(batch, torch.device(self.device))
         self.state.batch = batch
-        tokens = _count_batch_tokens(batch)
-        if tokens is not None:
-            self.state.metadata["tokens"] = tokens
+        num_tokens = _count_batch_tokens(batch)
+        if num_tokens is not None:
+            self.state.metadata["tokens"] = num_tokens
         context = self.state.step_context
-        self._run_phase(RuntimePhase.PRE_MICROBATCH)
+        self._run_phase(RuntimePhase.PRE_STEP_RUNNER)
         loss = self.get_step_runner()(self.state.batch)
         should_step = context.advance_micro_step()
         return loss, should_step
@@ -310,12 +309,17 @@ class RuntimeCore:
     def get_optimizer_and_scheduler(
         self,
     ) -> tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LRScheduler | None]:
-        if self.optimizer is not None:
-            return self.optimizer, self.scheduler
+        if self._optimizer is not None:
+            return self._optimizer, self._scheduler
         for plugin in self.plugins:
             if plugin.owns_optimizer:
                 return getattr(plugin, "optimizer", None), getattr(plugin, "scheduler", None)
         return None, None
+
+    def _get_runtime_optimizer_and_scheduler(
+        self,
+    ) -> tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LRScheduler | None]:
+        return self._optimizer, self._scheduler
 
     def create_optimizer(self, params: Iterable[nn.Parameter]) -> torch.optim.Optimizer:
         if self.optimizer_factory is None:
@@ -435,7 +439,7 @@ class RuntimeCore:
         return replicated_axes, sharded_axes
 
     def _validate_optimizer_owner(self) -> None:
-        runtime_owners = ["runtime"] if self.optimizer is not None else []
+        runtime_owners = ["runtime"] if self._optimizer is not None else []
         plugin_owners = [plugin.id.value for plugin in self.plugins if plugin.owns_optimizer]
         if len(plugin_owners) > 1:
             raise ValueError(f"RuntimeCore allows only one optimizer-owning plugin, got {plugin_owners}")
@@ -448,8 +452,8 @@ class RuntimeCore:
     def _maybe_build_runtime_optimizer(self) -> None:
         if self._plugin_owns_optimizer():
             return
-        self.optimizer = self.create_optimizer(self.model.parameters())
-        self.scheduler = self.create_scheduler(self.optimizer)
+        self._optimizer = self.create_optimizer(self.model.parameters())
+        self._scheduler = self.create_scheduler(self._optimizer)
 
     def _populate_static_model_metrics(self) -> None:
         self.state.static_metrics["perf/world_size"] = self.mesh.world_size
@@ -458,12 +462,6 @@ class RuntimeCore:
                 self.state.static_metrics["perf/flops_per_token"] = float(self.model.flops_per_token())
             except AttributeError:
                 pass
-
-    def _validate_mesh_and_plan(self) -> None:
-        if self.plan.zero_stage > 0 and self.mesh.dp <= 1:
-            raise ValueError(f"zero_stage={self.plan.zero_stage} requires mesh.dp > 1")
-        if self.mesh.pp <= 1 and self.plan.pp_schedule.virtual_stages > 1:
-            raise ValueError("virtual pipeline stages require mesh.pp > 1")
 
     def _resolve_plugin_order(self, plugins: list[RuntimePlugin]) -> list[RuntimePlugin]:
         if not plugins:
@@ -500,6 +498,17 @@ def _count_batch_tokens(batch: Any) -> int | None:
     if torch.is_tensor(batch):
         return int(batch.numel())
     return None
+
+
+def _module_device(module: nn.Module) -> torch.device:
+    first_param = next(module.parameters(), None)
+    if first_param is not None:
+        return first_param.device
+    first_buffer = next(module.buffers(), None)
+    if first_buffer is not None:
+        return first_buffer.device
+    return torch.device("cpu")
+
 
 def _move_to_device(value: Any, device: torch.device) -> Any:
     if torch.is_tensor(value):

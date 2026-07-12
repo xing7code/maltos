@@ -20,7 +20,7 @@ class PerfMetricsPlugin(RuntimePlugin):
         self._metrics: dict[str, MetricValue] = {}
 
     def on_phase(self, phase: RuntimePhase) -> None:
-        if phase == RuntimePhase.PRE_MICROBATCH:
+        if phase == RuntimePhase.PRE_STEP_RUNNER:
             assert self.runtime is not None
             context = self.runtime.state.step_context
             if context is None or context.accum_start:

@@ -131,20 +131,11 @@ def _validate_ep_for_plan(mesh: MeshConfig, *, reuse_tp: bool, reuse_cp: bool) -
 @dataclass
 class ProcessGroupManager:
     mesh: MeshConfig
-    plan: "ParallelPlan | None" = None
+    plan: ParallelPlan
     groups: dict[MeshAxis, dist.ProcessGroup | None] = field(default_factory=dict)
 
     @classmethod
-    def from_mesh(cls, mesh: MeshConfig) -> "ProcessGroupManager":
-        _validate_ep_for_plan(mesh, reuse_tp=True, reuse_cp=True)
-        manager = cls(mesh=mesh)
-        manager.initialize_groups()
-        return manager
-
-    @classmethod
-    def from_plan(cls, plan: ParallelPlan, mesh: MeshConfig | None = None) -> "ProcessGroupManager":
-        if mesh is None:
-            raise ValueError("from_plan requires mesh because ParallelPlan does not own MeshConfig")
+    def from_plan(cls, plan: ParallelPlan, mesh: MeshConfig) -> "ProcessGroupManager":
         _validate_ep_for_plan(mesh, reuse_tp=plan.reuse_tp_for_ep, reuse_cp=plan.reuse_cp_for_ep)
         manager = cls(mesh=mesh, plan=plan)
         manager.initialize_groups()
@@ -174,6 +165,8 @@ class ProcessGroupManager:
             raise ValueError(f"unable to locate global_rank={global_rank} in mesh ranks={ranks.tolist()}")
         dp_idx, pp_idx, cp_idx, tp_idx = int(dp_indices[0]), int(pp_indices[0]), int(cp_indices[0]), int(tp_indices[0])
 
+        # All ranks must call dist.new_group for every candidate group in the
+        # same order. Non-member ranks discard the returned handle.
         for d in range(self.mesh.dp):
             for p in range(self.mesh.pp):
                 for c in range(self.mesh.cp):
@@ -183,8 +176,8 @@ class ProcessGroupManager:
                         self.groups[MeshAxis.TP] = group
 
         if self.mesh.ep > 1:
-            reuse_tp = self.plan.reuse_tp_for_ep if self.plan is not None else True
-            reuse_cp = self.plan.reuse_cp_for_ep if self.plan is not None else True
+            reuse_tp = self.plan.reuse_tp_for_ep
+            reuse_cp = self.plan.reuse_cp_for_ep
             self._initialize_ep_groups(ranks, dp_idx, pp_idx, cp_idx, tp_idx, reuse_tp, reuse_cp)
 
         for d in range(self.mesh.dp):

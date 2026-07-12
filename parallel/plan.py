@@ -8,7 +8,6 @@ from .schedule import PipelineScheduleConfig
 
 @dataclass(frozen=True)
 class ParallelPlan:
-    zero_stage: int = 0  # 0, 1, 2, 3
     cp_attn_core: ContextParallelAttentionCoreType = ContextParallelAttentionCoreType.ALL_GATHER_KV
     pp_schedule: PipelineScheduleConfig = field(default_factory=PipelineScheduleConfig)
     # EP dimension reuse: whether EP groups borrow TP/CP ranks before spilling into DP.
@@ -17,7 +16,3 @@ class ParallelPlan:
     # If both enabled, EP use ranks in priority TP > CP > DP.
     reuse_tp_for_ep: bool = True
     reuse_cp_for_ep: bool = True
-
-    def __post_init__(self):
-        if self.zero_stage not in (0, 1, 2, 3):
-            raise ValueError(f"zero_stage must be 0/1/2/3, got {self.zero_stage}")

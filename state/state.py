@@ -220,10 +220,11 @@ class StateManager:
         if self._runtime is None:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
-        if runtime.optimizer is not None:
-            state: dict[str, Any] = {self._RUNTIME_OPTIMIZER_STATE_KEY: runtime.optimizer.state_dict()}
-            if runtime.scheduler is not None:
-                state[self._RUNTIME_SCHEDULER_STATE_KEY] = runtime.scheduler.state_dict()
+        optimizer, scheduler = runtime._get_runtime_optimizer_and_scheduler()
+        if optimizer is not None:
+            state: dict[str, Any] = {self._RUNTIME_OPTIMIZER_STATE_KEY: optimizer.state_dict()}
+            if scheduler is not None:
+                state[self._RUNTIME_SCHEDULER_STATE_KEY] = scheduler.state_dict()
             return OptimizerState(state=state)
 
         for plugin in runtime.plugins:
@@ -278,13 +279,14 @@ class StateManager:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
         payload = state.state
-        if runtime.optimizer is not None:
+        optimizer, scheduler = runtime._get_runtime_optimizer_and_scheduler()
+        if optimizer is not None:
             optimizer_state = payload.get(self._RUNTIME_OPTIMIZER_STATE_KEY)
             if optimizer_state is not None:
-                runtime.optimizer.load_state_dict(optimizer_state)
+                optimizer.load_state_dict(optimizer_state)
             scheduler_state = payload.get(self._RUNTIME_SCHEDULER_STATE_KEY)
-            if scheduler_state is not None and runtime.scheduler is not None:
-                runtime.scheduler.load_state_dict(scheduler_state)
+            if scheduler_state is not None and scheduler is not None:
+                scheduler.load_state_dict(scheduler_state)
             return
 
         for plugin in runtime.plugins:

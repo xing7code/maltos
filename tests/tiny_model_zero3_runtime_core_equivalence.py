@@ -90,7 +90,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     zero3 = Zero3Plugin()
     core = RuntimeCore(
         mesh=MeshConfig(dp=args.world_size, tp=1, pp=1, cp=1, ep=1),
-        plan=ParallelPlan(zero_stage=3),
+        plan=ParallelPlan(),
         model=zero_model,
         grad_accum_steps=args.grad_accum_steps,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),

@@ -126,6 +126,19 @@ def test_plugin_ordering() -> None:
     assert [plugin.name for plugin in core.plugins] == ["custom_tensor", "checkpoint", "custom_metrics"]
 
 
+def test_runtime_device_is_canonicalized_on_setup() -> None:
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=LossModel(),
+        optimizer_factory=_sgd_factory(),
+    )
+    assert core.device is None
+    core.setup()
+    assert isinstance(core.device, torch.device)
+    assert core.device == torch.device("cpu")
+
+
 def test_optimizer_factory_runs_after_model_transform() -> None:
     captured_param_ids: list[int] = []
 
@@ -147,7 +160,9 @@ def test_optimizer_factory_runs_after_model_transform() -> None:
 
     assert old_param_ids.isdisjoint(new_param_ids)
     assert set(captured_param_ids) == new_param_ids
-    assert {id(param) for group in core.optimizer.param_groups for param in group["params"]} == new_param_ids
+    optimizer, _ = core.get_optimizer_and_scheduler()
+    assert optimizer is not None
+    assert {id(param) for group in optimizer.param_groups for param in group["params"]} == new_param_ids
 
 
 def test_scheduler_factory_supports_plugin_owned_optimizer() -> None:
@@ -203,9 +218,8 @@ def test_train_step_phases_and_state_manager() -> None:
     assert core.state.step == 1
     assert "proj.weight" in core.state_manager.param_states
     assert events == [
-        "recorder:setup",
         "recorder:transform",
-        "recorder:pre_microbatch",
+        "recorder:pre_step_runner",
         "recorder:pre_forward",
         "recorder:post_forward",
         "recorder:pre_backward",

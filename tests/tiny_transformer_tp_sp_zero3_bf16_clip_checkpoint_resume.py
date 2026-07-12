@@ -82,7 +82,7 @@ def _build_runtime(model: TinyTransformerTpSp, dp_size: int, tp_size: int) -> tu
     )
     core = RuntimeCore(
         mesh=MeshConfig(dp=dp_size, tp=tp_size, pp=1, cp=1, ep=1),
-        plan=ParallelPlan(zero_stage=3),
+        plan=ParallelPlan(),
         model=model,
         grad_clip_max_norm=1.0,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),

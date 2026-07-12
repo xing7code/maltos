@@ -362,7 +362,6 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=args.ep_size),
         plan=ParallelPlan(
-            zero_stage=args.zero_stage,
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
         ),

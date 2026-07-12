@@ -127,7 +127,6 @@ def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespa
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=1),
         plan=ParallelPlan(
-            zero_stage=args.zero_stage,
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
         ),
         model=model,
@@ -154,7 +153,6 @@ def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespac
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=1),
         plan=ParallelPlan(
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
-            zero_stage=args.zero_stage,
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
         ),
         model=model,

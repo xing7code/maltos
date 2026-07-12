@@ -324,7 +324,6 @@ from parallel.context import ContextParallelAttentionCoreType
 from parallel.schedule import PipelineScheduleConfig
 
 plan = ParallelPlan(
-    zero_stage=3,
     cp_attn_core=ContextParallelAttentionCoreType.ALL_GATHER_KV,
     pp_schedule=PipelineScheduleConfig(microbatches=4),
 )

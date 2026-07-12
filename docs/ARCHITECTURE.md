@@ -23,7 +23,7 @@ runtime plus composable plugins.
   - Tracks parameter metadata plus model, optimizer, scheduler, trainer, RNG, plugin, and dataloader state.
 - `ParallelPlan` and `MeshConfig`
   - `MeshConfig` describes process-mesh axes and process groups.
-  - `ParallelPlan` describes strategy choices such as ZeRO stage, CP attention core, and PP schedule.
+  - `ParallelPlan` describes mesh-dependent strategy choices such as CP attention core and PP schedule.
 
 ## Step Contract
 
@@ -49,8 +49,7 @@ trainer loop.
 
 The runtime exposes these training phases (`RuntimePhase`):
 
-- `SETUP`
-- `PRE_MICROBATCH`
+- `PRE_STEP_RUNNER`
 - `PRE_FORWARD`
 - `POST_FORWARD`
 - `PRE_BACKWARD`
@@ -60,9 +59,10 @@ The runtime exposes these training phases (`RuntimePhase`):
 - `PRE_SAVE`
 - `POST_LOAD`
 
-Model transformation is not a phase: right after `SETUP`, the runtime calls each
-plugin's `transform_model()` hook so TP/SP/PP/ZeRO/etc. can rewrite the module
-before the optimizer is built.
+Plugin initialization has separate lifecycle hooks: `bind()` attaches runtime
+state, `transform_model()` lets TP/SP/PP/ZeRO/precision/etc. rewrite the module,
+and `annotate_param_layout()` records parameter layout before optimizer state is
+built.
 
 Plugins compose by registering phase behavior rather than rewriting the trainer.
 This is what lets TP/SP/PP/CP/DDP/ZeRO/precision/clip/profiler/metrics stack on

@@ -133,7 +133,6 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     core = RuntimeCore(
         mesh=mesh,
         plan=ParallelPlan(
-            zero_stage=zero_stage,
             cp_attn_core=cp_attn_core,
             reuse_tp_for_ep=args.reuse_tp_for_ep,
             reuse_cp_for_ep=args.reuse_cp_for_ep,

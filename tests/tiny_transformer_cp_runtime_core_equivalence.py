@@ -164,11 +164,9 @@ def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespac
         plugins.append(Zero2Plugin(bucket_mb_size=0))
     if args.case == "cp_zero3":
         plugins.append(Zero3Plugin(wrap_cls={torch.nn.Linear, torch.nn.Embedding, RmsNorm}))
-    _zero_stage = {"cp_zero1": 1, "cp_zero2": 2, "cp_zero3": 3}.get(args.case, 0)
     return RuntimeCore(
         mesh=MeshConfig(dp=args.dp_size, pp=1, cp=args.cp_size, tp=args.tp_size, ep=1),
         plan=ParallelPlan(
-            zero_stage=_zero_stage,
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
         ),
         model=model,
