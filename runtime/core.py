@@ -46,6 +46,7 @@ class RuntimeCore:
     _module_replacements: "dict[type[nn.Module], set[type[nn.Module]]]" = field(
         default_factory=dict, init=False
     )
+    _param_roles: dict[int, ParamRole] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
@@ -73,6 +74,7 @@ class RuntimeCore:
             self.device = torch.device(self.device)
             self.model.to(self.device)
         self.state_manager.bind(self)
+        self._param_roles.clear()
         for plugin in self.plugins:
             plugin.bind(self)
         for plugin in self.plugins:
@@ -157,10 +159,10 @@ class RuntimeCore:
     # Cross-plugin param-semantics channel: plugins annotate whether a param is
     # shared or expert so later plugins can choose the right communication path.
     def set_param_role(self, param: nn.Parameter, role: ParamRole) -> None:
-        self.state_manager.set_param_role(param, role)
+        self._param_roles[id(param)] = role
 
     def get_param_role(self, param: nn.Parameter) -> ParamRole:
-        return self.state_manager.get_param_role(param)
+        return self._param_roles.get(id(param), ParamRole.SHARED)
 
     def grad_norm_replica_factor(self, param: nn.Parameter) -> int:
         fq_name = self.state_manager.get_param_name(param)

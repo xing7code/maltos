@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 from runtime.mesh import MeshAxis
-from runtime.types import ParamRole, StepContext
+from runtime.types import StepContext
 
 if TYPE_CHECKING:
     from data import StatefulDataLoaderProtocol
@@ -18,7 +18,6 @@ class RuntimeParamAttrs:
     """Runtime-only metadata for one parameter reference."""
 
     logical_shape: tuple[int, ...]
-    role: ParamRole = ParamRole.SHARED
     sharded_axes: set[MeshAxis] = field(default_factory=set)
     replicated_axes: set[MeshAxis] = field(default_factory=set)
 
@@ -173,14 +172,6 @@ class StateManager:
 
     def add_param_replicated_axis(self, fq_name: str, axis: MeshAxis) -> None:
         self.get_param_attrs(fq_name).replicated_axes.add(axis)
-
-    def set_param_role(self, param: nn.Parameter | str, role: ParamRole) -> None:
-        fq_name = self.get_param_name(param) if isinstance(param, nn.Parameter) else self._resolve_runtime_name(param)
-        self.get_param_attrs(fq_name).role = role
-
-    def get_param_role(self, param: nn.Parameter | str) -> ParamRole:
-        fq_name = self.get_param_name(param) if isinstance(param, nn.Parameter) else self._resolve_runtime_name(param)
-        return self.get_param_attrs(fq_name).role
 
     def iter_param_states(self):
         return self.param_states.items()
