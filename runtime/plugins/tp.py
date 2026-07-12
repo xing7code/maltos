@@ -55,9 +55,6 @@ class TensorParallelPlugin(RuntimePlugin):
         self.runtime.add_module_replacement(nn.Linear, RowParallelLinear)
         return model
 
-    def runtime_optimizer_sharded_axes(self) -> set[MeshAxis]:
-        return {MeshAxis.TP} if self.runtime is not None and self.runtime.mesh.tp > 1 else set()
-
     def annotate_checkpoint_state(self, entry: ParamState) -> None:
         group = self.tp_group
         if group is None:

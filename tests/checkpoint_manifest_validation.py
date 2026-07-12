@@ -85,7 +85,7 @@ def test_world_size_mismatch_fails() -> None:
 def test_optimizer_source_mapping_mismatch_fails() -> None:
     checkpoint_dir, _ = _save_base_checkpoint()
     runtime = _build_core()
-    runtime.optimizer_state_source_rank = lambda _rank: 1  # type: ignore[method-assign]
+    runtime.optimizer_checkpoint_rank = lambda _rank: 1  # type: ignore[method-assign]
 
     _expect_value_error(
         lambda: load_sharded_checkpoint(runtime.state_manager, checkpoint_dir),

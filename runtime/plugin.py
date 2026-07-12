@@ -13,7 +13,6 @@ from parallel.protocols import (
     PipelineParallelizableModule,
     TpSpParallelizableModule,
 )
-from runtime.mesh import MeshAxis
 from state.state import ParamState
 
 if TYPE_CHECKING:
@@ -58,6 +57,10 @@ class RuntimePlugin:
     def __post_init__(self) -> None:
         if self.name is None:
             self.name = self.id.value
+        if self.owns_optimizer and type(self).optimizer_state_source_rank is RuntimePlugin.optimizer_state_source_rank:
+            raise ValueError(
+                f"plugin={self.id.value} owns_optimizer=True must implement optimizer_state_source_rank()"
+            )
 
     def bind(self, runtime: "RuntimeCore") -> None:
         self.runtime = runtime
@@ -75,16 +78,10 @@ class RuntimePlugin:
     def build_step_runner(self) -> "StepRunner | None":
         return None
 
-    def runtime_optimizer_replicated_axes(self) -> set[MeshAxis]:
-        """Optimizer-level replicated axes for source-rank/checkpoint ownership."""
-        return set()
-
-    def runtime_optimizer_sharded_axes(self) -> set[MeshAxis]:
-        """Optimizer-level sharded axes for source-rank/checkpoint ownership."""
-        return set()
-
     def optimizer_state_source_rank(self, rank_id: int) -> int:
-        return rank_id
+        raise NotImplementedError(
+            f"plugin={self.id.value} owns_optimizer={self.owns_optimizer} must implement optimizer_state_source_rank()"
+        )
 
     def override_param_state_dict(self) -> tuple[dict[str, torch.Tensor], list[ParamState]] | None:
         return None

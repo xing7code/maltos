@@ -12,7 +12,7 @@ import torch.distributed as dist
 
 from parallel.plan import ParallelPlan
 from runtime.mesh import MeshAxis, MeshConfig, ProcessGroupManager
-from runtime.plugin import FlopsEstimatableModule, RuntimePlugin
+from runtime.plugin import FlopsEstimatableModule, PluginId, RuntimePlugin
 from runtime.step_runners import DefaultStepRunner
 from runtime.types import MetricValue, ParamRole, RuntimePhase, RuntimeState, StepContext
 from state.state import StateManager
@@ -193,13 +193,15 @@ class RuntimeCore:
     # -------------------------------------
     def _setup_optimizer_and_scheduler(self) -> None:
         runtime_owners = ["runtime"] if self._optimizer is not None else []
-        plugin_owners = [plugin.id.value for plugin in self.plugins if plugin.owns_optimizer]
+        plugin_owners = [plugin for plugin in self.plugins if plugin.owns_optimizer]
         if len(plugin_owners) > 1:
-            raise ValueError(f"RuntimeCore allows only one optimizer-owning plugin, got {plugin_owners}")
+            raise ValueError(
+                f"RuntimeCore allows only one optimizer-owning plugin, got {[plugin.id.value for plugin in plugin_owners]}"
+            )
         if runtime_owners and plugin_owners:
             raise ValueError(
                 "Runtime optimizer ownership is mutually exclusive with optimizer-owning plugins, "
-                f"got {runtime_owners + plugin_owners}"
+                f"got {runtime_owners + [plugin.id.value for plugin in plugin_owners]}"
             )
         if runtime_owners or plugin_owners:
             return
@@ -261,37 +263,41 @@ class RuntimeCore:
         self.state.step_context.advance_step()
 
     def should_save_optimizer(self, rank_id: int) -> bool:
-        return self.optimizer_state_source_rank(rank_id) == rank_id
+        return self.optimizer_checkpoint_rank(rank_id) == rank_id
 
-    def _runtime_optimizer_mesh_axes(self) -> tuple[set[MeshAxis], set[MeshAxis]]:
-        replicated_axes: set[MeshAxis] = set()
-        sharded_axes: set[MeshAxis] = set()
-        for plugin in self.plugins:
-            replicated_axes.update(plugin.runtime_optimizer_replicated_axes())
-            sharded_axes.update(plugin.runtime_optimizer_sharded_axes())
-        return replicated_axes, sharded_axes
-
-    def optimizer_state_source_rank(self, rank_id: int) -> int:
+    def optimizer_checkpoint_rank(self, rank_id: int) -> int:
         for plugin in self.plugins:
             if plugin.owns_optimizer:
                 return plugin.optimizer_state_source_rank(rank_id)
 
-        replicated_axes, sharded_axes = self._runtime_optimizer_mesh_axes()
-        dp_idx, pp_idx, cp_idx, tp_idx = self.mesh.rank_coordinates(rank_id)
-        coords = {
-            MeshAxis.DP: dp_idx,
-            MeshAxis.PP: pp_idx,
-            MeshAxis.CP: cp_idx,
-            MeshAxis.TP: tp_idx,
-        }
-        for axis in replicated_axes - sharded_axes:
-            coords[axis] = 0
-        return self.mesh.rank_id(
-            dp=coords[MeshAxis.DP],
-            pp=coords[MeshAxis.PP],
-            cp=coords[MeshAxis.CP],
-            tp=coords[MeshAxis.TP],
-        )
+        if any(plugin.id in {PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} for plugin in self.plugins):
+            return rank_id
+
+        has_shared = False
+        has_expert = False
+        for param in self.model.parameters():
+            if not param.requires_grad:
+                continue
+            role = self.get_param_role(param)
+            if role == ParamRole.EXPERT:
+                has_expert = True
+            else:
+                has_shared = True
+            if has_shared and has_expert:
+                return rank_id
+        if has_shared:
+            return self.mesh.infer_checkpoint_rank(
+                rank_id,
+                plan=self.plan,
+                replicated_axes={MeshAxis.DCP},
+            )
+        if has_expert:
+            return self.mesh.infer_checkpoint_rank(
+                rank_id,
+                plan=self.plan,
+                replicated_axes={MeshAxis.EREP},
+            )
+        return rank_id
 
     # -------------------------------------
     # Optimizer / scheduler methods: end

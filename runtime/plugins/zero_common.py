@@ -233,6 +233,9 @@ class ZeroPluginBase(RuntimePlugin):
             tuple[Callable[[ChainedWork, torch.Tensor], ChainedWork], ParamRole | None]
         ] = []
 
+    def optimizer_state_source_rank(self, rank_id: int) -> int:
+        return rank_id
+
     def wrap_chained_work(
         self,
         wrap: Callable[[ChainedWork, torch.Tensor], ChainedWork],

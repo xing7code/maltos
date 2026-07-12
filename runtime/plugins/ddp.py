@@ -67,10 +67,6 @@ class DataParallelPlugin(RuntimePlugin):
         for handle in handles:
             handle.wait()
 
-    def runtime_optimizer_replicated_axes(self) -> set[MeshAxis]:
-        return {MeshAxis.DP} if self.runtime is not None and self.runtime.mesh.dp > 1 else set()
-
-
 @dataclass
 class _Bucket:
     group: dist.ProcessGroup
@@ -163,9 +159,6 @@ class BucketDataParallelPlugin(RuntimePlugin):
                 if bucket.handle is None:
                     raise RuntimeError(f"bucket with {len(bucket.params)} params was never synchronized")
                 bucket.handle.wait()
-
-    def runtime_optimizer_replicated_axes(self) -> set[MeshAxis]:
-        return {MeshAxis.DP} if self.runtime is not None and self.runtime.mesh.dp > 1 else set()
 
     def annotate_param_metadata(self) -> None:
         assert self.runtime is not None

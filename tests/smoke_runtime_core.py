@@ -15,7 +15,7 @@ import torch.nn as nn
 
 from models import ActivationCheckpointConfig, LlamaConfig, LlamaForCausalLM
 from parallel import ParallelPlan
-from runtime import DefaultStepRunner, MeshConfig, PluginId, RuntimeCore, RuntimePhase
+from runtime import DefaultStepRunner, MeshConfig, ParamRole, PluginId, RuntimeCore, RuntimePhase
 from runtime.plugins.ddp import DataParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.precision import PrecisionPlugin
@@ -31,6 +31,13 @@ class LossModel(nn.Module):
 
     def forward(self, batch: torch.Tensor) -> torch.Tensor:
         return self.proj(batch).pow(2).mean()
+
+
+class SharedExpertModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.shared = nn.Parameter(torch.ones(1))
+        self.expert = nn.Parameter(torch.ones(1))
 
 
 class RecordingPlugin(RuntimePlugin):
@@ -93,6 +100,9 @@ class OptimizerOwnerPlugin(RuntimePlugin):
         self.optimizer = self.runtime.create_optimizer(model.parameters())
         self.scheduler = self.runtime.create_scheduler(self.optimizer)
         return model
+
+    def optimizer_state_source_rank(self, rank_id: int) -> int:
+        return rank_id
 
 
 class StepRunnerOwnerPlugin(RuntimePlugin):
@@ -328,7 +338,7 @@ def test_runtime_optimizer_checkpoint_policy() -> None:
         plugin.bind(dp_core)
     assert dp_core.should_save_optimizer(0)
     assert not dp_core.should_save_optimizer(1)
-    assert dp_core.optimizer_state_source_rank(1) == 0
+    assert dp_core.optimizer_checkpoint_rank(1) == 0
 
     tp_model = LossModel()
     tp_core = RuntimeCore(
@@ -342,8 +352,8 @@ def test_runtime_optimizer_checkpoint_policy() -> None:
         plugin.bind(tp_core)
     assert tp_core.should_save_optimizer(0)
     assert tp_core.should_save_optimizer(1)
-    assert tp_core.optimizer_state_source_rank(0) == 0
-    assert tp_core.optimizer_state_source_rank(1) == 1
+    assert tp_core.optimizer_checkpoint_rank(0) == 0
+    assert tp_core.optimizer_checkpoint_rank(1) == 1
 
     tp_dp_model = LossModel()
     tp_dp_core = RuntimeCore(
@@ -359,8 +369,23 @@ def test_runtime_optimizer_checkpoint_policy() -> None:
     assert tp_dp_core.should_save_optimizer(1)
     assert not tp_dp_core.should_save_optimizer(2)
     assert not tp_dp_core.should_save_optimizer(3)
-    assert tp_dp_core.optimizer_state_source_rank(2) == 0
-    assert tp_dp_core.optimizer_state_source_rank(3) == 1
+    assert tp_dp_core.optimizer_checkpoint_rank(2) == 0
+    assert tp_dp_core.optimizer_checkpoint_rank(3) == 1
+
+    mixed_model = SharedExpertModel()
+    mixed_core = RuntimeCore(
+        mesh=MeshConfig(dp=2, tp=1, pp=1, cp=1, ep=1),
+        plan=ParallelPlan(),
+        model=mixed_model,
+        optimizer_factory=_sgd_factory(),
+        plugins=[DataParallelPlugin()],
+    )
+    mixed_core.setup()
+    mixed_core.set_param_role(mixed_core.model.expert, ParamRole.EXPERT)
+    assert mixed_core.should_save_optimizer(0)
+    assert mixed_core.should_save_optimizer(1)
+    assert mixed_core.optimizer_checkpoint_rank(0) == 0
+    assert mixed_core.optimizer_checkpoint_rank(1) == 1
 
 
 def test_precision_plugin_metrics_and_clip() -> None:

@@ -137,7 +137,7 @@ def _save_sharded_checkpoint_contents(state_manager: StateManager, checkpoint_di
         gathered_artifacts[0] = local_artifacts
 
     if rank == 0:
-        optimizer_source_ranks = [runtime.optimizer_state_source_rank(rank_id) for rank_id in range(world_size)]
+        optimizer_source_ranks = [runtime.optimizer_checkpoint_rank(rank_id) for rank_id in range(world_size)]
         manifest = CheckpointManifest(
             version=1,
             world_size=world_size,
@@ -289,7 +289,7 @@ def _validate_manifest_for_runtime(manifest: CheckpointManifest, runtime) -> Non
                     f"manifest missing optimizer artifact for source rank={source_rank} (used by rank={rank_id})"
                 )
         for rank_id in range(manifest.world_size):
-            runtime_source_rank = runtime.optimizer_state_source_rank(rank_id)
+            runtime_source_rank = runtime.optimizer_checkpoint_rank(rank_id)
             if runtime_source_rank != manifest.optimizer_source_ranks[rank_id]:
                 raise ValueError(
                     "optimizer source mapping mismatch between runtime and checkpoint manifest: "

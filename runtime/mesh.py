@@ -53,6 +53,40 @@ class MeshConfig:
             raise ValueError(f"invalid mesh coordinates: dp={dp}, pp={pp}, cp={cp}, tp={tp}")
         return (((dp * self.pp) + pp) * self.cp + cp) * self.tp + tp
 
+    def infer_checkpoint_rank(
+        self,
+        rank_id: int,
+        *,
+        plan: ParallelPlan,
+        replicated_axes: set["MeshAxis"],
+    ) -> int:
+        """Infer the checkpoint-owner rank for a replicated local shard.
+
+        Replicated axes collapse to the rank-0 member of that axis group.
+        Virtual axes such as DCP and EREP are expanded here so checkpoint
+        ownership can be computed without consulting live ProcessGroup handles.
+        """
+        dp_idx, pp_idx, cp_idx, tp_idx = self.rank_coordinates(rank_id)
+
+        if MeshAxis.DP in replicated_axes or MeshAxis.DCP in replicated_axes:
+            dp_idx = 0
+        if MeshAxis.CP in replicated_axes or MeshAxis.DCP in replicated_axes:
+            cp_idx = 0
+        if MeshAxis.PP in replicated_axes:
+            pp_idx = 0
+        if MeshAxis.TP in replicated_axes:
+            tp_idx = 0
+        if MeshAxis.EREP in replicated_axes:
+            dp_idx, cp_idx, tp_idx = _erep_source_coordinates(
+                mesh=self,
+                plan=plan,
+                dp_idx=dp_idx,
+                cp_idx=cp_idx,
+                tp_idx=tp_idx,
+            )
+
+        return self.rank_id(dp=dp_idx, pp=pp_idx, cp=cp_idx, tp=tp_idx)
+
     def _validate(self) -> None:
         for axis, size in {
             MeshAxis.DP: self.dp,
@@ -126,6 +160,51 @@ def _validate_ep_for_plan(mesh: MeshConfig, *, reuse_tp: bool, reuse_cp: bool) -
             raise ValueError(f"With reuse_tp/cp_for_ep=False, EP must be <= DP={dp}, got ep={ep}")
         if dp % ep != 0:
             raise ValueError(f"With reuse_tp/cp_for_ep=False, DP={dp} must be divisible by EP={ep}")
+
+
+def _erep_source_coordinates(
+    *,
+    mesh: MeshConfig,
+    plan: ParallelPlan,
+    dp_idx: int,
+    cp_idx: int,
+    tp_idx: int,
+) -> tuple[int, int, int]:
+    """Return the rank-0 member of the current rank's EREP group."""
+    ep = mesh.ep
+    tp = mesh.tp
+    cp = mesh.cp
+    reuse_tp = plan.reuse_tp_for_ep
+    reuse_cp = plan.reuse_cp_for_ep
+
+    if ep <= 1:
+        return dp_idx, cp_idx, tp_idx
+
+    if reuse_tp and reuse_cp:
+        ep_local = (tp_idx + cp_idx * tp + dp_idx * tp * cp) % ep
+        source_flat = ep_local
+        source_dp = source_flat // (tp * cp)
+        rem = source_flat % (tp * cp)
+        source_cp = rem // tp
+        source_tp = rem % tp
+        return source_dp, source_cp, source_tp
+
+    if reuse_tp and not reuse_cp:
+        ep_local = (tp_idx + dp_idx * tp) % ep
+        source_flat = ep_local
+        source_dp = source_flat // tp
+        source_tp = source_flat % tp
+        return source_dp, cp_idx, source_tp
+
+    if not reuse_tp and reuse_cp:
+        ep_local = (cp_idx + dp_idx * cp) % ep
+        source_flat = ep_local
+        source_dp = source_flat // cp
+        source_cp = source_flat % cp
+        return source_dp, source_cp, tp_idx
+
+    source_dp = dp_idx % ep
+    return source_dp, cp_idx, tp_idx
 
 
 @dataclass
