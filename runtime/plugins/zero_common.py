@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from runtime.core import ParamRole
+from runtime.types import ParamRole
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
 

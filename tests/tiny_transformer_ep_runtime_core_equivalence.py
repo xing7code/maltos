@@ -22,7 +22,7 @@ from models import TinyMoETransformer, TinyMoETransformerTp, TinyMoETransformerT
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
 from runtime import MeshAxis, MeshConfig, RuntimeCore
-from runtime.core import RuntimePhase
+from runtime.types import RuntimePhase
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.sp import SequenceParallelPlugin

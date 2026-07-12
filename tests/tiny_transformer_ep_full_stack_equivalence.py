@@ -22,7 +22,7 @@ from models.tiny_transformer import RmsNorm
 from parallel import ContextParallelAttentionCoreType, ParallelPlan
 from parallel.schedule import PipelineScheduleConfig
 from runtime import MeshAxis, MeshConfig, RuntimeCore
-from runtime.core import RuntimePhase
+from runtime.types import RuntimePhase
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.pp import PipelineParallelPlugin

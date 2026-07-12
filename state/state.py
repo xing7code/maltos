@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 from runtime.mesh import MeshAxis
+from runtime.types import StepContext
 
 if TYPE_CHECKING:
     from data import StatefulDataLoaderProtocol
@@ -332,7 +333,6 @@ class StateManager:
         if self._runtime is None:
             raise RuntimeError("StateManager is not bound to RuntimeCore")
         runtime = self._runtime
-        from runtime.core import StepContext
 
         runtime.state.step_context = StepContext(**state.step_context) if state.step_context is not None else StepContext()
         torch.set_rng_state(state.rng.cpu)

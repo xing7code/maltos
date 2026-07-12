@@ -8,7 +8,6 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from runtime.buffer_allocator import allocate_buffer
-from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId
 from runtime.plugins.zero_common import (
@@ -18,6 +17,7 @@ from runtime.plugins.zero_common import (
     NarrowShardWork,
     ZeroPluginBase,
 )
+from runtime.types import ParamRole, RuntimePhase
 from state.state import ParamState
 
 

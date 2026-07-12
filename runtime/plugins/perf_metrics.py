@@ -4,8 +4,8 @@ import time
 
 import torch
 
-from runtime.core import RuntimePhase
-from runtime.plugin import MetricValue, PluginId, RuntimePlugin
+from runtime.plugin import PluginId, RuntimePlugin
+from runtime.types import MetricValue, RuntimePhase
 
 
 class PerfMetricsPlugin(RuntimePlugin):

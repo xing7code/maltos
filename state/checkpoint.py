@@ -15,6 +15,7 @@ from state.state import (
     StateManager,
     TrainerState,
 )
+from runtime.types import PpStatus, RuntimePhase
 from utils.distributed import distributed_barrier
 
 
@@ -135,7 +136,6 @@ def _save_sharded_checkpoint_contents(state_manager: StateManager, checkpoint_di
 
 def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> None:
     runtime = state_manager.runtime
-    from runtime.core import PpStatus
 
     checkpoint_dir = Path(path)
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -176,8 +176,6 @@ def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> No
                 ),
             )
         )
-
-    from runtime.core import RuntimePhase
 
     runtime._run_phase(RuntimePhase.POST_LOAD)
     distributed_barrier()

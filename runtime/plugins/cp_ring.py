@@ -9,7 +9,7 @@ import torch.nn as nn
 from runtime.buffer_allocator import allocate_buffer
 
 if TYPE_CHECKING:
-    from runtime.core import StepContext
+    from runtime.types import StepContext
 
 
 class _RingShift(torch.autograd.Function):

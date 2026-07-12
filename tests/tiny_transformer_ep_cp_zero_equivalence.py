@@ -25,7 +25,7 @@ from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
 from parallel.context import ContextParallelAttentionCoreType
 from runtime import MeshAxis, MeshConfig, RuntimeCore
-from runtime.core import RuntimePhase
+from runtime.types import RuntimePhase
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ddp import BucketDataParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin

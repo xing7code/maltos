@@ -3,9 +3,9 @@ from __future__ import annotations
 import torch.nn as nn
 
 from parallel.specs import TpSpShardAxis
-from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
+from runtime.types import ParamRole, RuntimePhase
 from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
 from state.state import ParamState
 

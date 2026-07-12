@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from runtime.core import RuntimeCore, StepContext
+    from runtime.core import RuntimeCore
+    from runtime.types import StepContext
 
 import torch
 import torch.distributed as dist
@@ -13,12 +14,12 @@ from parallel.context import (
     ContextParallelAttentionCore,
     ContextParallelAttentionCoreType,
 )
-from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import ContextParallelizableModule, PluginId, RuntimePlugin
 from runtime.plugins.cp_all_gather import AllGatherKvAttentionCore
 from runtime.plugins.cp_ring import RingAttentionCore
 from runtime.plugins.zero_common import ChainedWork
+from runtime.types import ParamRole, RuntimePhase
 
 
 class ContextParallelPlugin(RuntimePlugin):

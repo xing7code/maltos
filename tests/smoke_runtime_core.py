@@ -7,6 +7,7 @@ pieces remain easy to validate in a single process.
 from __future__ import annotations
 
 import tempfile
+import warnings
 from pathlib import Path
 
 import torch
@@ -14,7 +15,7 @@ import torch.nn as nn
 
 from models import ActivationCheckpointConfig, LlamaConfig, LlamaForCausalLM
 from parallel import ParallelPlan
-from runtime import MeshConfig, PluginId, RuntimeCore, RuntimePhase
+from runtime import DefaultStepRunner, MeshConfig, PluginId, RuntimeCore, RuntimePhase
 from runtime.plugins.ddp import DataParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.precision import PrecisionPlugin
@@ -92,6 +93,22 @@ class OptimizerOwnerPlugin(RuntimePlugin):
         self.optimizer = self.runtime.create_optimizer(model.parameters())
         self.scheduler = self.runtime.create_scheduler(self.optimizer)
         return model
+
+
+class StepRunnerOwnerPlugin(RuntimePlugin):
+    def __init__(self, plugin_id: PluginId) -> None:
+        super().__init__(id=plugin_id, name=f"{plugin_id.value}_runner", owns_step_runner=True)
+
+    def build_step_runner(self):
+        return DefaultStepRunner()
+
+
+class StrayStepRunnerPlugin(RuntimePlugin):
+    def __init__(self, plugin_id: PluginId) -> None:
+        super().__init__(id=plugin_id, name=f"{plugin_id.value}_stray_runner")
+
+    def build_step_runner(self):
+        return DefaultStepRunner()
 
 
 class ReplaceLinearPlugin(RuntimePlugin):
@@ -246,6 +263,42 @@ def test_multiple_optimizer_plugin_owners_fail() -> None:
         assert "only one optimizer-owning plugin" in str(exc)
     else:
         raise AssertionError("RuntimeCore accepted multiple optimizer-owning plugins")
+
+
+def test_multiple_step_runner_plugin_owners_fail() -> None:
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=LossModel(),
+        optimizer_factory=_sgd_factory(),
+        plugins=[
+            StepRunnerOwnerPlugin(PluginId.PP),
+            StepRunnerOwnerPlugin(PluginId.CP),
+        ],
+    )
+    try:
+        core.setup()
+    except ValueError as exc:
+        assert "only one step-runner-owning plugin" in str(exc)
+    else:
+        raise AssertionError("RuntimeCore accepted multiple step-runner-owning plugins")
+
+
+def test_stray_step_runner_plugin_fails() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        core = RuntimeCore(
+            mesh=MeshConfig(),
+            plan=ParallelPlan(),
+            model=LossModel(),
+            optimizer_factory=_sgd_factory(),
+            plugins=[StrayStepRunnerPlugin(PluginId.CP)],
+        )
+        core.setup()
+
+    assert isinstance(core._step_runner, DefaultStepRunner)
+    assert len(caught) == 1
+    assert "without declaring owns_step_runner=True" in str(caught[0].message)
 
 
 def test_runtime_core_requires_optimizer_owner() -> None:

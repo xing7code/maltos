@@ -5,8 +5,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from runtime.core import RuntimePhase
-from runtime.plugin import MetricValue, PluginId, RuntimePlugin
+from runtime.plugin import PluginId, RuntimePlugin
+from runtime.types import MetricValue, RuntimePhase
 
 
 class TorchProfilerPlugin(RuntimePlugin):

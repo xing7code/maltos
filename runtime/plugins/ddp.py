@@ -6,9 +6,9 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
+from runtime.types import ParamRole, RuntimePhase
 
 
 class _NullWork:

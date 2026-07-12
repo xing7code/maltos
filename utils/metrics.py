@@ -11,7 +11,7 @@ from typing import Any, Protocol
 import torch
 import torch.distributed as dist
 
-from runtime.plugin import MetricValue
+from runtime.types import MetricValue
 
 
 class MetricLogger(Protocol):

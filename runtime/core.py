@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from enum import Enum
 from graphlib import TopologicalSorter
-from typing import Any
+from typing import TYPE_CHECKING, Any
+import warnings
 
 import torch
 import torch.nn as nn
@@ -12,124 +12,16 @@ import torch.distributed as dist
 
 from parallel.plan import ParallelPlan
 from runtime.mesh import MeshAxis, MeshConfig, ProcessGroupManager
-from runtime.plugin import FlopsEstimatableModule, MetricValue, RuntimePlugin
+from runtime.plugin import FlopsEstimatableModule, RuntimePlugin
+from runtime.step_runners import DefaultStepRunner
+from runtime.types import MetricValue, ParamRole, RuntimePhase, RuntimeState, StepContext
 from state.state import StateManager
+
+if TYPE_CHECKING:
+    from runtime.step_runners import StepRunner
 
 OptimizerFactory = Callable[[Iterable[nn.Parameter]], torch.optim.Optimizer]
 SchedulerFactory = Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler.LRScheduler]
-StepRunnerFn = Callable[[Any], torch.Tensor]
-
-
-class RuntimePhase(str, Enum):
-    PRE_STEP_RUNNER = "pre_step_runner"
-    PRE_FORWARD = "pre_forward"
-    POST_FORWARD = "post_forward"
-    PRE_BACKWARD = "pre_backward"
-    POST_BACKWARD = "post_backward"
-    PRE_STEP = "pre_step"
-    POST_STEP = "post_step"
-    PRE_SAVE = "pre_save"
-    POST_LOAD = "post_load"
-
-
-class ParamRole(str, Enum):
-    SHARED = "shared"
-    EXPERT = "expert"
-
-
-class PpStatus(str, Enum):
-    IDLE = "idle"
-    FORWARD = "forward"
-    BACKWARD_START = "backward_start"
-    BACKWARD_MIDDLE = "backward_middle"
-    BACKWARD_END = "backward_end"
-
-
-@dataclass
-class StepContext:
-    step: int = 0
-    microbatch_idx: int = 0
-    grad_accum_steps: int = 1
-    pp_cur_microbatch_idx: int = 0
-    pp_status: PpStatus = PpStatus.IDLE
-
-    def __post_init__(self) -> None:
-        if self.grad_accum_steps < 1:
-            raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
-
-    @property
-    def accum_start(self) -> bool:
-        return self.microbatch_idx == 0 and self.pp_status in {PpStatus.IDLE, PpStatus.BACKWARD_START}
-
-    @property
-    def is_step_boundary(self) -> bool:
-        return (
-            ((self.microbatch_idx + 1) % self.grad_accum_steps) == 0
-            and self.pp_status in {PpStatus.IDLE, PpStatus.BACKWARD_END}
-        )
-
-    @property
-    def backward_start(self) -> bool:
-        """True at the first backward of each grad-accum micro-step.
-
-        Unlike ``accum_start`` (gated on ``microbatch_idx == 0``, so False for
-        every accum step after the first), this fires once per micro-step's
-        backward phase. Per-micro-step reduction counters must be re-armed here,
-        not at ``accum_start``: on the step-boundary micro-step (microbatch_idx
-        != 0 when grad_accum > 1) the counter would otherwise never be reset and
-        the async grad-reduce worker reads a stale zero, firing before backward
-        has produced its handles.
-        """
-        return self.pp_status in {PpStatus.IDLE, PpStatus.BACKWARD_START}
-
-    @property
-    def loss_divisor(self) -> float:
-        return float(self.grad_accum_steps)
-
-    def set_pp_state(self, *, microbatch_idx: int, status: PpStatus) -> None:
-        if microbatch_idx < 0:
-            raise ValueError(f"pp_cur_microbatch_idx must be >= 0, got {microbatch_idx}")
-        self.pp_cur_microbatch_idx = microbatch_idx
-        self.pp_status = status
-
-    def advance_micro_step(self) -> bool:
-        should_step = self.is_step_boundary
-        self.microbatch_idx = (self.microbatch_idx + 1) % self.grad_accum_steps
-        self.pp_cur_microbatch_idx = 0
-        self.pp_status = PpStatus.IDLE
-        return should_step
-
-    def advance_step(self) -> None:
-        self.step += 1
-
-
-@dataclass
-class RuntimeState:
-    """Transient execution context for the current step.
-
-    This is intentionally not a checkpoint manifest. Plugins use it as a
-    shared scratchpad for phase-local data such as the current batch, loss,
-    microbatch index, profiler annotations, or temporary scheduling metadata.
-    Durable training state should be declared through checkpoint/state APIs.
-    """
-
-    step_context: StepContext = field(default_factory=StepContext)
-    loss: torch.Tensor | None = None
-    batch: Any = None
-    outputs: Any = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-    static_metrics: dict[str, MetricValue] = field(default_factory=dict)
-    scaler: torch.amp.GradScaler | None = None
-    omitted_module_paths: set[str] = field(default_factory=set)
-    param_roles: dict[int, ParamRole] = field(default_factory=dict)
-
-    @property
-    def step(self) -> int:
-        return self.step_context.step
-
-    @step.setter
-    def step(self, value: int) -> None:
-        self.step_context.step = value
 
 
 @dataclass
@@ -147,6 +39,7 @@ class RuntimeCore:
     state: RuntimeState = field(default_factory=RuntimeState)
     _optimizer: torch.optim.Optimizer | None = field(default=None, init=False, repr=False)
     _scheduler: torch.optim.lr_scheduler.LRScheduler | None = field(default=None, init=False, repr=False)
+    _step_runner: "StepRunner | None" = field(default=None, init=False, repr=False)
     _group_manager: ProcessGroupManager | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
     _module_replacements: "dict[type[nn.Module], set[type[nn.Module]]]" = field(
@@ -198,6 +91,7 @@ class RuntimeCore:
         self._populate_static_model_metrics()
         self._maybe_build_runtime_optimizer()
         self._validate_optimizer_owner()
+        self._step_runner = self._resolve_step_runner()
 
     def close(self) -> None:
         if self._closed:
@@ -221,6 +115,7 @@ class RuntimeCore:
 
     def run_step(self, batch: Any) -> tuple[torch.Tensor, bool]:
         assert self.device is not None, "Runtime device should not be None!"
+        assert self._step_runner is not None, "RuntimeCore step runner is not initialized; call setup() first"
         batch = _move_to_device(batch, torch.device(self.device))
         self.state.batch = batch
         num_tokens = _count_batch_tokens(batch)
@@ -228,43 +123,9 @@ class RuntimeCore:
             self.state.metadata["tokens"] = num_tokens
         context = self.state.step_context
         self._run_phase(RuntimePhase.PRE_STEP_RUNNER)
-        loss = self.get_step_runner()(self.state.batch)
+        loss = self._step_runner.run(self, self.state.batch)
         should_step = context.advance_micro_step()
         return loss, should_step
-
-    def _run_step_impl(self, batch: Any) -> torch.Tensor:
-        self._forward_step_impl(batch)
-        if not torch.is_tensor(self.state.loss):
-            raise TypeError("RuntimeCore expects model(batch) to return a Tensor loss during training.")
-        self._backward_step_impl()
-        assert self.state.loss is not None
-        return self.state.loss
-
-    def _forward_step_impl(self, batch: Any) -> None:
-        self._run_phase(RuntimePhase.PRE_FORWARD)
-        outputs = self.model(batch)
-        self.state.outputs = outputs
-        self.state.loss = outputs if torch.is_tensor(outputs) else None
-        self._run_phase(RuntimePhase.POST_FORWARD)
-
-    def _backward_step_impl(
-        self,
-        *,
-        grad_output: torch.Tensor | None = None,
-    ) -> None:
-        self._run_phase(RuntimePhase.PRE_BACKWARD)
-        if grad_output is None:
-            if self.state.loss is None:
-                raise TypeError("RuntimeCore expected self.state.loss to be a Tensor before backward()")
-            divisor = self.state.step_context.loss_divisor
-            if divisor != 1:
-                self.state.loss = self.state.loss / divisor
-            self.state.loss.backward()
-        else:
-            if not torch.is_tensor(self.state.outputs):
-                raise TypeError("RuntimeCore expected self.state.outputs Tensor for activation backward()")
-            self.state.outputs.backward(grad_output)
-        self._run_phase(RuntimePhase.POST_BACKWARD)
 
     def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:
         assert self._group_manager is not None
@@ -333,19 +194,6 @@ class RuntimeCore:
         if self.scheduler_factory is None:
             return None
         return self.scheduler_factory(optimizer)
-
-    def get_step_runner(self) -> StepRunnerFn:
-        runners = []
-        for plugin in self.plugins:
-            runner = plugin.build_step_runner()
-            if runner is not None:
-                runners.append((plugin.id.value, runner))
-        if len(runners) > 1:
-            names = [name for name, _ in runners]
-            raise ValueError(f"RuntimeCore allows only one step runner plugin, got {names}")
-        if runners:
-            return runners[0][1]
-        return self._run_step_impl
 
     def step_optimizer(self) -> None:
         self._run_phase(RuntimePhase.PRE_STEP)
@@ -448,6 +296,36 @@ class RuntimeCore:
                 "Runtime optimizer ownership is mutually exclusive with optimizer-owning plugins, "
                 f"got {runtime_owners + plugin_owners}"
             )
+
+    def _resolve_step_runner(self) -> "StepRunner":
+        owner_plugin: RuntimePlugin | None = None
+        owner_runner: StepRunner | None = None
+        stray_runners: list[str] = []
+        for plugin in self.plugins:
+            runner = plugin.build_step_runner()
+            if plugin.owns_step_runner:
+                if owner_plugin is not None:
+                    names = [owner_plugin.id.value, plugin.id.value]
+                    raise ValueError(f"RuntimeCore allows only one step-runner-owning plugin, got {names}")
+                owner_plugin = plugin
+                owner_runner = runner
+                continue
+            if runner is not None:
+                stray_runners.append(plugin.id.value)
+
+        if stray_runners:
+            warnings.warn(
+                "plugins returned step runners without declaring owns_step_runner=True; "
+                f"their step runners will be ignored: {stray_runners}",
+                stacklevel=2,
+            )
+        if owner_plugin is None:
+            return DefaultStepRunner()
+        if owner_runner is None:
+            raise ValueError(
+                f"plugin={owner_plugin.id.value} declared owns_step_runner=True but did not provide a step runner"
+            )
+        return owner_runner
 
     def _maybe_build_runtime_optimizer(self) -> None:
         if self._plugin_owns_optimizer():

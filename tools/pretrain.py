@@ -716,6 +716,7 @@ def _build_run_manifest(
                     "id": plugin.id.value,
                     "name": plugin.name,
                     "owns_optimizer": plugin.owns_optimizer,
+                    "owns_step_runner": plugin.owns_step_runner,
                 }
                 for plugin in runtime.plugins
             ],

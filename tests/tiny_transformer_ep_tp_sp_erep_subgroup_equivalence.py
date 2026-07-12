@@ -45,7 +45,7 @@ from helpers import causal_lm_batch
 from models import TinyMoETransformer, TinyMoETransformerTpSp
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
-from runtime.core import RuntimePhase
+from runtime.types import RuntimePhase
 from runtime.plugins.ep import ExpertParallelPlugin, _ExpertParallelMoE
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin

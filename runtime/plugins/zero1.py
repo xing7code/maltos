@@ -6,7 +6,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from runtime.core import ParamRole, RuntimePhase
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId
 from runtime.plugins.zero_common import (
@@ -17,6 +16,7 @@ from runtime.plugins.zero_common import (
     ZeroPluginBase,
     rearm_bucket_pending,
 )
+from runtime.types import ParamRole, RuntimePhase
 
 
 @dataclass
