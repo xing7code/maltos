@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from parallel.context import ContextParallelSpec
-from parallel.expert import ExpertParallelSpec
-from parallel.pipeline import PipelineParallelSpec
-from parallel.specs import TpSpParallelSpec
+from parallel.protocols import (
+    ContextParallelizableModule,
+    ExpertParallelizableModule,
+    FlopsEstimatableModule,
+    PipelineParallelizableModule,
+    TpSpParallelizableModule,
+)
 from runtime.mesh import MeshAxis
 from state.state import ParamState
 
@@ -19,32 +22,6 @@ if TYPE_CHECKING:
     from runtime.types import RuntimePhase
 
 from runtime.types import MetricValue
-
-
-@runtime_checkable
-class TpSpParallelizableModule(Protocol):
-    def tpsp_parallelize_spec(self) -> TpSpParallelSpec: ...
-
-
-@runtime_checkable
-class PipelineParallelizableModule(Protocol):
-    def pipeline_parallel_spec(self) -> PipelineParallelSpec: ...
-
-
-@runtime_checkable
-class ContextParallelizableModule(Protocol):
-    def context_parallel_spec(self) -> ContextParallelSpec: ...
-
-
-@runtime_checkable
-class ExpertParallelizableModule(Protocol):
-    def expert_parallel_spec(self) -> ExpertParallelSpec: ...
-
-
-@runtime_checkable
-class FlopsEstimatableModule(Protocol):
-    def flops_per_token(self) -> float: ...
-
 
 class PluginId(str, Enum):
     PRECISION = "precision"

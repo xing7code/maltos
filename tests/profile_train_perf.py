@@ -38,7 +38,7 @@ from models.activation_checkpointing import ActivationCheckpointConfig
 from models.llama import LlamaRMSNorm
 from models.tiny_transformer import RmsNorm
 from parallel import ContextParallelAttentionCoreType, ParallelPlan
-from parallel.schedule import PipelineScheduleConfig
+from parallel.plan import PipelineScheduleConfig
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin

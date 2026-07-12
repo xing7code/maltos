@@ -9,8 +9,8 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from models.activation_checkpointing import ActivationCheckpointConfig
-from parallel.context import ContextParallelSpec
-from parallel.pipeline import PipelineParallelSpec
+from parallel.specs import ContextParallelSpec
+from parallel.specs import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 
 

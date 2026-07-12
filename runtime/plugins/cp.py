@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from parallel.context import (
+from parallel.context_interfaces import (
     ContextParallelAttentionCore,
     ContextParallelAttentionCoreType,
 )

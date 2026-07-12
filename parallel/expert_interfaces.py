@@ -1,14 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 import torch.nn as nn
-
-
-@dataclass(frozen=True)
-class ExpertParallelSpec:
-    moe_paths: list[str]
 
 
 @runtime_checkable

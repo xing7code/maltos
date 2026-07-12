@@ -19,7 +19,7 @@ from helpers import causal_lm_batch
 from models import TinyMoETransformer
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
-from parallel.schedule import PipelineScheduleConfig
+from parallel.plan import PipelineScheduleConfig
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.ddp import BucketDataParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin

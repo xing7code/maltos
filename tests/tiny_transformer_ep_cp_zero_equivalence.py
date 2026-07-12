@@ -23,7 +23,7 @@ from helpers import causal_lm_batch
 from models import TinyMoETransformer
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
-from parallel.context import ContextParallelAttentionCoreType
+from parallel.context_interfaces import ContextParallelAttentionCoreType
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.types import RuntimePhase
 from runtime.plugins.cp import ContextParallelPlugin

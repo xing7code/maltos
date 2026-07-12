@@ -1,15 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
 import torch
-
-
-@dataclass(frozen=True)
-class ContextParallelSpec:
-    attention_paths: list[str]
 
 
 class ContextParallelAttentionCoreType(str, Enum):

@@ -30,8 +30,8 @@ from models import (
 from models.llama import LlamaRMSNorm
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
-from parallel.context import ContextParallelAttentionCoreType
-from parallel.schedule import PipelineScheduleConfig
+from parallel.context_interfaces import ContextParallelAttentionCoreType
+from parallel.plan import PipelineScheduleConfig
 from runtime import MeshConfig, RuntimeCore
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.cp import ContextParallelPlugin

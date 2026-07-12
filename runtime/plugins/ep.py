@@ -12,7 +12,7 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 import torch.nn as nn
 
-from parallel.expert import ExpertParallelMoEModule
+from parallel.expert_interfaces import ExpertParallelMoEModule
 from runtime.mesh import MeshAxis
 from runtime.plugin import ExpertParallelizableModule, PluginId, RuntimePlugin
 from runtime.plugins.zero_common import ChainedWork, CompletedWork, build_param_buckets, expert_erep_correction, rearm_bucket_pending

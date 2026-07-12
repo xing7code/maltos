@@ -1,13 +1,25 @@
-from .context import (
+from .context_interfaces import (
     ContextParallelAttentionCore,
     ContextParallelAttentionCoreType,
-    ContextParallelSpec,
 )
-from .expert import ExpertParallelMoEModule, ExpertParallelSpec
-from .plan import ParallelPlan
-from .pipeline import PipelineParallelSpec
-from .schedule import PipelineScheduleConfig
-from .specs import TpSpComm, TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
+from .expert_interfaces import ExpertParallelMoEModule
+from .plan import ParallelPlan, PipelineScheduleConfig, PipelineScheduleType
+from .protocols import (
+    ContextParallelizableModule,
+    ExpertParallelizableModule,
+    FlopsEstimatableModule,
+    PipelineParallelizableModule,
+    TpSpParallelizableModule,
+)
+from .specs import (
+    ContextParallelSpec,
+    ExpertParallelSpec,
+    PipelineParallelSpec,
+    TpSpComm,
+    TpSpParallelSpec,
+    TpSpShardAxis,
+    TpSpShardRule,
+)
 
 __all__ = [
     "ContextParallelSpec",
@@ -15,11 +27,17 @@ __all__ = [
     "ContextParallelAttentionCoreType",
     "ExpertParallelMoEModule",
     "ExpertParallelSpec",
+    "ContextParallelizableModule",
+    "ExpertParallelizableModule",
+    "FlopsEstimatableModule",
     "ParallelPlan",
     "PipelineParallelSpec",
     "PipelineScheduleConfig",
+    "PipelineScheduleType",
+    "PipelineParallelizableModule",
     "TpSpComm",
     "TpSpParallelSpec",
+    "TpSpParallelizableModule",
     "TpSpShardAxis",
     "TpSpShardRule",
 ]

@@ -4,9 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from parallel.context import ContextParallelSpec
-from parallel.expert import ExpertParallelMoEModule, ExpertParallelSpec
-from parallel.pipeline import PipelineParallelSpec
+from parallel.expert_interfaces import ExpertParallelMoEModule
+from parallel.specs import ContextParallelSpec, ExpertParallelSpec, PipelineParallelSpec
 from parallel.specs import TpSpComm, TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from models.tiny_transformer import CausalSelfAttention, RmsNorm, RoPE, MLP
 

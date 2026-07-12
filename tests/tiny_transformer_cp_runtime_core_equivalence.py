@@ -17,7 +17,7 @@ from distributed_test_utils import (
 )
 from helpers import causal_lm_batch
 from models import TinyTransformer, TinyTransformerTp, TinyTransformerTpSp
-from parallel.context import ContextParallelAttentionCoreType
+from parallel.context_interfaces import ContextParallelAttentionCoreType
 from parallel import ParallelPlan
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.cp import ContextParallelPlugin

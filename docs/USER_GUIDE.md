@@ -320,8 +320,8 @@ mesh = MeshConfig(
 
 ```python
 from parallel import ParallelPlan
-from parallel.context import ContextParallelAttentionCoreType
-from parallel.schedule import PipelineScheduleConfig
+from parallel.context_interfaces import ContextParallelAttentionCoreType
+from parallel.plan import PipelineScheduleConfig
 
 plan = ParallelPlan(
     cp_attn_core=ContextParallelAttentionCoreType.ALL_GATHER_KV,
@@ -431,7 +431,7 @@ Your model needs to describe where embeddings, transformer blocks, and output
 layers live.
 
 ```python
-from parallel.pipeline import PipelineParallelSpec
+from parallel.specs import PipelineParallelSpec
 
 
 def pipeline_parallel_spec(self) -> PipelineParallelSpec:
@@ -465,7 +465,7 @@ implementations for this pattern.
 Expose the attention module paths:
 
 ```python
-from parallel.context import ContextParallelSpec
+from parallel.specs import ContextParallelSpec
 
 
 def context_parallel_spec(self) -> ContextParallelSpec:
@@ -488,7 +488,7 @@ pattern instead of designing this from scratch.
 Expose the MoE module paths:
 
 ```python
-from parallel.expert import ExpertParallelSpec
+from parallel.specs import ExpertParallelSpec
 
 
 def expert_parallel_spec(self) -> ExpertParallelSpec:

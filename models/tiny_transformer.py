@@ -6,8 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from parallel.context import ContextParallelSpec
-from parallel.pipeline import PipelineParallelSpec
+from parallel.specs import ContextParallelSpec
+from parallel.specs import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from utils.logging import debug_log
 
