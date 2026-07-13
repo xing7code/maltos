@@ -34,7 +34,7 @@ class PluginId(str, Enum):
     ZERO2 = "zero2"
     ZERO3 = "zero3"
     CHECKPOINT = "checkpoint"
-    PERF_METRICS = "perf_metrics"
+    METRICS = "metrics"
     TORCH_PROFILER = "torch_profiler"
 
 

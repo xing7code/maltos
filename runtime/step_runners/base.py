@@ -26,10 +26,12 @@ class DefaultStepRunner:
     @staticmethod
     def run_forward(runtime: "RuntimeCore", batch: Any) -> None:
         runtime._run_phase(RuntimePhase.PRE_FORWARD)
-        outputs = runtime.model(batch)
-        runtime.state.outputs = outputs
-        runtime.state.loss = outputs if torch.is_tensor(outputs) else None
-        runtime._run_phase(RuntimePhase.POST_FORWARD)
+        try:
+            outputs = runtime.model(batch)
+            runtime.state.outputs = outputs
+            runtime.state.loss = outputs if torch.is_tensor(outputs) else None
+        finally:
+            runtime._run_phase(RuntimePhase.POST_FORWARD)
 
     @staticmethod
     def run_backward(
@@ -50,4 +52,3 @@ class DefaultStepRunner:
                 raise TypeError("RuntimeCore expected runtime.state.outputs Tensor for activation backward()")
             runtime.state.outputs.backward(grad_output)
         runtime._run_phase(RuntimePhase.POST_BACKWARD)
-

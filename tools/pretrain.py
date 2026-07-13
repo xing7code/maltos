@@ -37,7 +37,7 @@ from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
-from runtime.plugins.perf_metrics import PerfMetricsPlugin
+from runtime.plugins.metrics import MetricPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ddp-mode", type=str, default=None, choices=("sync", "async", "bucket"))
     parser.add_argument("--precision", type=str, default="fp32", choices=("fp32", "bf16", "fp16"))
     parser.add_argument("--grad-clip", type=float, default=None)
-    parser.add_argument("--disable-perf-metrics", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--disable-metrics", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--torch-profiler", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--torch-profiler-dir", type=str, default="traces/pretrain")
     parser.add_argument("--torch-profiler-wait", type=int, default=1)
@@ -341,8 +341,8 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
             plugins.append(GradClipPlugin(max_norm=args.grad_clip))
         else:
             grad_clip_max_norm = args.grad_clip
-    if not args.disable_perf_metrics:
-        plugins.append(PerfMetricsPlugin())
+    if not args.disable_metrics:
+        plugins.append(MetricPlugin())
     if args.torch_profiler:
         plugins.append(
             TorchProfilerPlugin(
@@ -532,7 +532,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("training", "min_lr"): "min_lr",
         ("training", "precision"): "precision",
         ("training", "grad_clip"): "grad_clip",
-        ("training", "disable_perf_metrics"): "disable_perf_metrics",
+        ("training", "disable_metrics"): "disable_metrics",
         ("profiling", "torch_profiler"): "torch_profiler",
         ("profiling", "torch_profiler_dir"): "torch_profiler_dir",
         ("profiling", "torch_profiler_wait"): "torch_profiler_wait",

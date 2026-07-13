@@ -8,7 +8,7 @@ from runtime.types import MetricValue, RuntimePhase
 
 
 class GradClipPlugin(RuntimePlugin):
-    def __init__(self, max_norm: float, record_grad_norm: bool = True) -> None:
+    def __init__(self, max_norm: float) -> None:
         super().__init__(
             id=PluginId.GRAD_CLIP,
             name="grad_clip",
@@ -18,7 +18,6 @@ class GradClipPlugin(RuntimePlugin):
             runs_after={PluginId.PRECISION, PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3},
         )
         self.max_norm = max_norm
-        self.record_grad_norm = record_grad_norm
 
     def bind(self, runtime) -> None:
         super().bind(runtime)
@@ -54,8 +53,7 @@ class GradClipPlugin(RuntimePlugin):
             for param in grad_params:
                 param.grad.detach().mul_(clip_coef)
 
-        if self.record_grad_norm:
-            self.runtime.state.metadata["grad_norm"] = global_norm
+        self.runtime.state.metadata["grad_norm"] = global_norm
 
     def _global_grad_norm(self, params: list) -> float:
         assert self.runtime is not None
@@ -73,7 +71,7 @@ class GradClipPlugin(RuntimePlugin):
         return float(local_sq.sqrt().item())
 
     def collect_metrics(self) -> dict[str, MetricValue]:
-        if self.runtime is None or not self.record_grad_norm:
+        if self.runtime is None:
             return {}
         grad_norm = self.runtime.state.metadata.get("grad_norm")
         if grad_norm is None:

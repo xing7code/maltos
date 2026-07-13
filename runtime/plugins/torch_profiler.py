@@ -51,8 +51,6 @@ class TorchProfilerPlugin(RuntimePlugin):
         self.rank0_only = rank0_only
         self._profiler: torch.profiler.profile | None = None
         self._enabled = False
-        self._closed = False
-        self._rank = 0
         self._trace_path: Path | None = None
 
     def bind(self, runtime: "RuntimeCore") -> None:
@@ -75,21 +73,18 @@ class TorchProfilerPlugin(RuntimePlugin):
         }
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
         if self._profiler is None:
             return
         self._profiler.__exit__(None, None, None)
         self._profiler = None
 
     def _start(self) -> None:
-        self._rank = dist.get_rank() if dist.is_initialized() else 0
-        if self.rank0_only and self._rank != 0:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if self.rank0_only and rank != 0:
             self._enabled = False
             return
 
-        trace_path = self.trace_dir / f"rank_{self._rank:05d}"
+        trace_path = self.trace_dir / f"rank_{rank:05d}"
         trace_path.mkdir(parents=True, exist_ok=True)
         self._trace_path = trace_path
         activities = [torch.profiler.ProfilerActivity.CPU]
@@ -105,7 +100,7 @@ class TorchProfilerPlugin(RuntimePlugin):
             ),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
                 str(trace_path),
-                worker_name=f"rank_{self._rank:05d}",
+                worker_name=f"rank_{rank:05d}",
             ),
             record_shapes=self.record_shapes,
             profile_memory=self.profile_memory,

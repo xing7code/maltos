@@ -89,7 +89,7 @@ from data import SimpleTensorDataLoader
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
 from runtime.plugins.grad_clip import GradClipPlugin
-from runtime.plugins.perf_metrics import PerfMetricsPlugin
+from runtime.plugins.metrics import MetricPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from train import Trainer, TrainerConfig
 
@@ -116,7 +116,7 @@ def main() -> None:
         plugins=[
             PrecisionPlugin(compute_dtype=torch.bfloat16),
             GradClipPlugin(max_norm=1.0),
-            PerfMetricsPlugin(),
+            MetricPlugin(),
         ],
     )
 
@@ -256,7 +256,7 @@ The most common plugin combinations look like this.
 plugins = [
     PrecisionPlugin(compute_dtype=torch.bfloat16),
     GradClipPlugin(max_norm=1.0),
-    PerfMetricsPlugin(),
+    MetricPlugin(),
 ]
 ```
 
@@ -269,7 +269,7 @@ plugins = [
     DataParallelPlugin(async_op=False),
     PrecisionPlugin(compute_dtype=torch.bfloat16),
     GradClipPlugin(max_norm=1.0),
-    PerfMetricsPlugin(),
+    MetricPlugin(),
 ]
 ```
 
@@ -282,7 +282,7 @@ plugins = [
     BucketDataParallelPlugin(bucket_mb_size=25),
     PrecisionPlugin(compute_dtype=torch.bfloat16),
     GradClipPlugin(max_norm=1.0),
-    PerfMetricsPlugin(),
+    MetricPlugin(),
 ]
 ```
 
@@ -295,7 +295,7 @@ plugins = [
     Zero3Plugin(wrap_cls={nn.Linear}),
     PrecisionPlugin(compute_dtype=torch.bfloat16),
     GradClipPlugin(max_norm=1.0),
-    PerfMetricsPlugin(),
+    MetricPlugin(),
 ]
 ```
 

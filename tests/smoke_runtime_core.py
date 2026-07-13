@@ -42,6 +42,16 @@ class SharedExpertModel(nn.Module):
         self.expert = nn.Parameter(torch.ones(1))
 
 
+class FailingModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(4, 1)
+
+    def forward(self, batch: torch.Tensor) -> torch.Tensor:
+        _ = self.proj(batch)
+        raise RuntimeError("boom")
+
+
 class RecordingPlugin(RuntimePlugin):
     def __init__(
         self,
@@ -85,7 +95,7 @@ class PluginStateEcho(RuntimePlugin):
 
 class MetricsPlugin(RuntimePlugin):
     def __init__(self) -> None:
-        super().__init__(id=PluginId.PERF_METRICS, name="metrics_plugin")
+        super().__init__(id=PluginId.METRICS, name="metrics_plugin")
 
     def collect_metrics(self) -> dict[str, float | int | str | bool | None]:
         return {"tokens_per_sec": 12.5, "enabled": True}
@@ -139,9 +149,9 @@ def _sgd_factory(lr: float = 0.01):
 def test_plugin_ordering() -> None:
     events: list[str] = []
     plugins = [
-        RecordingPlugin(PluginId.PERF_METRICS, events, name="custom_metrics", runs_after={PluginId.CP, PluginId.TP}),
+        RecordingPlugin(PluginId.METRICS, events, name="custom_metrics", runs_after={PluginId.CP, PluginId.TP}),
         RecordingPlugin(PluginId.TP, events, name="custom_tensor"),
-        RecordingPlugin(PluginId.CHECKPOINT, events, runs_before={PluginId.PERF_METRICS}),
+        RecordingPlugin(PluginId.CHECKPOINT, events, runs_before={PluginId.METRICS}),
     ]
     core = RuntimeCore(
         mesh=MeshConfig(),
@@ -151,7 +161,7 @@ def test_plugin_ordering() -> None:
         plugins=plugins,
     )
 
-    assert [plugin.id for plugin in core.plugins] == [PluginId.TP, PluginId.CHECKPOINT, PluginId.PERF_METRICS]
+    assert [plugin.id for plugin in core.plugins] == [PluginId.TP, PluginId.CHECKPOINT, PluginId.METRICS]
     assert [plugin.name for plugin in core.plugins] == ["custom_tensor", "checkpoint", "custom_metrics"]
 
 
@@ -467,6 +477,29 @@ def test_precision_plugin_metrics_and_clip() -> None:
     assert metrics["grad_clip/max_norm"] == 1.0
 
 
+def test_post_forward_runs_when_model_forward_raises() -> None:
+    events: list[str] = []
+    plugin = RecordingPlugin(PluginId.METRICS, events, name="recorder")
+    precision = PrecisionPlugin(compute_dtype=torch.bfloat16)
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=FailingModel(),
+        optimizer_factory=_sgd_factory(),
+        plugins=[plugin, precision],
+    )
+    core.setup()
+    try:
+        core.run_step(torch.ones(2, 4))
+    except RuntimeError as exc:
+        assert str(exc) == "boom"
+    else:
+        raise AssertionError("FailingModel forward should raise")
+    assert "recorder:pre_forward" in events
+    assert "recorder:post_forward" in events
+    assert precision._autocast_context is None
+
+
 def test_runtime_collects_plugin_metrics() -> None:
     model = LossModel()
     core = RuntimeCore(
@@ -479,8 +512,8 @@ def test_runtime_collects_plugin_metrics() -> None:
     core.setup()
     _, should_step = core.run_step(torch.ones(2, 4))
     metrics = core.collect_metrics()
-    assert metrics["perf_metrics/tokens_per_sec"] == 12.5
-    assert metrics["perf_metrics/enabled"] is True
+    assert metrics["metrics/tokens_per_sec"] == 12.5
+    assert metrics["metrics/enabled"] is True
 
 
 def test_torch_profiler_plugin_writes_trace() -> None:
@@ -712,6 +745,7 @@ def main() -> None:
     test_tp_bias_layout_metadata()
     test_state_manager_exports_only_owned_model_params()
     test_precision_plugin_metrics_and_clip()
+    test_post_forward_runs_when_model_forward_raises()
     test_runtime_collects_plugin_metrics()
     test_torch_profiler_plugin_writes_trace()
     test_precision_plugin_fp16_requires_cuda()
