@@ -17,6 +17,7 @@ from runtime.plugins.zero_common import (
     rearm_bucket_pending,
 )
 from runtime.types import ParamRole, RuntimePhase
+from utils.distributed import all_gather_single, reduce_scatter_single
 
 
 @dataclass
@@ -176,7 +177,7 @@ class Zero1Plugin(ZeroPluginBase):
                 return NarrowShardWork(work, full_grad, bucket.local_param.grad, shard_start, shard_end)
             if correction != 1.0:
                 full_grad.mul_(correction)
-            return dist.reduce_scatter_tensor(
+            return reduce_scatter_single(
                 bucket.local_param.grad,
                 full_grad,
                 op=dist.ReduceOp.AVG,
@@ -220,7 +221,7 @@ class Zero1Plugin(ZeroPluginBase):
                     self.data_buffer[bucket.start : bucket.end].copy_(local_data)
                     continue
                 handles.append(
-                    dist.all_gather_into_tensor(
+                    all_gather_single(
                         self.data_buffer[bucket.start : bucket.end],
                         local_data,
                         group=bucket.group_context.group,

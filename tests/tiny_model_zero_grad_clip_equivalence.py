@@ -1,12 +1,11 @@
-"""Equivalence test: full-batch TinyModel vs RuntimeCore ZeRO-2 v2.
+"""Equivalence test: full-batch TinyModel baseline vs RuntimeCore ZeRO grad clip.
 
-Each rank sees a different local batch. Zero2Plugin reuses a bucket-local grad
-buffer, reduce-scatters averaged gradients into optimizer-owned parameter
-shards, steps those shards, then all-gathers updated parameters.
+The selected ZeRO plugin must compute a global gradient norm across ranks and
+clip uniformly while gradients or parameters are sharded.
 
 Usage:
-  PYTHONPATH=. .venv/bin/python tests/tiny_model_zero2_runtime_core_equivalence.py \
-    --world-size 2
+  PYTHONPATH=. .venv/bin/python tests/tiny_model_zero_grad_clip_equivalence.py \
+    --zero-stage 1
 """
 
 from __future__ import annotations
@@ -21,24 +20,26 @@ import torch.multiprocessing as mp
 from models import TinyModel
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
+from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
+from runtime.plugins.zero3 import Zero3Plugin
 
 
-_ATOL = 1e-6
+_ATOL = 1e-5
 _LR = 1e-2
+_CLIP_FRACTION = 0.5
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--zero-stage", type=int, choices=(1, 2, 3), required=True)
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
-    parser.add_argument("--master-port", type=int, default=29521)
+    parser.add_argument("--master-port", type=int, default=29545)
     parser.add_argument("--backend", type=str, default="gloo")
     parser.add_argument("--global-batch-size", type=int, default=8)
     parser.add_argument("--hidden-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--bucket-mb-size", type=int, default=25)
-    parser.add_argument("--grad-accum-steps", type=int, default=1)
     return parser.parse_args()
 
 
@@ -49,10 +50,18 @@ def _build_reference(seed: int, global_batch_size: int, hidden_size: int) -> tup
     return model, batch
 
 
+def _make_zero_plugin(args: argparse.Namespace) -> Zero1Plugin | Zero2Plugin | Zero3Plugin:
+    if args.zero_stage == 1:
+        return Zero1Plugin(bucket_mb_size=0)
+    if args.zero_stage == 2:
+        return Zero2Plugin(bucket_mb_size=0)
+    return Zero3Plugin()
+
+
 def _max_param_diff(lhs: TinyModel, rhs: TinyModel) -> tuple[str, float]:
     worst_name = ""
     worst_diff = 0.0
-    for (lhs_name, lhs_param), (rhs_name, rhs_param) in zip(lhs.named_parameters(), rhs.named_parameters()):
+    for (lhs_name, lhs_param), (rhs_name, rhs_param) in zip(lhs.named_parameters(), rhs.named_parameters(), strict=True):
         assert lhs_name == rhs_name
         diff = (lhs_param.detach() - rhs_param.detach()).abs().max().item()
         if diff > worst_diff:
@@ -77,49 +86,55 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     zero_model.load_state_dict(baseline_model.state_dict())
 
     local_batch_size = args.global_batch_size // args.world_size
-    if local_batch_size % args.grad_accum_steps != 0:
-        raise ValueError("local batch size must be divisible by grad_accum_steps")
     local_batch = full_batch.narrow(0, rank * local_batch_size, local_batch_size).contiguous()
 
     baseline_optimizer = torch.optim.SGD(baseline_model.parameters(), lr=_LR)
     baseline_optimizer.zero_grad(set_to_none=True)
     baseline_loss = baseline_model(full_batch)
     baseline_loss.backward()
+    baseline_norm = torch.nn.utils.clip_grad_norm_(baseline_model.parameters(), max_norm=float("inf")).item()
+    max_norm = baseline_norm * _CLIP_FRACTION
+    torch.nn.utils.clip_grad_norm_(baseline_model.parameters(), max_norm=max_norm)
+    baseline_optimizer.step()
 
+    zero_plugin = _make_zero_plugin(args)
     core = RuntimeCore(
         mesh=MeshConfig(dp=args.world_size, tp=1, pp=1, cp=1, ep=1),
         plan=ParallelPlan(),
         model=zero_model,
-        grad_accum_steps=args.grad_accum_steps,
+        grad_clip_max_norm=max_norm,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
-        plugins=[Zero2Plugin(bucket_mb_size=args.bucket_mb_size)],
+        plugins=[zero_plugin],
     )
     core.setup()
-    micro_batch_size = local_batch_size // args.grad_accum_steps
-    local_loss = torch.zeros((), dtype=local_batch.dtype, device=local_batch.device)
-    for micro_idx in range(args.grad_accum_steps):
-        micro_batch = local_batch.narrow(0, micro_idx * micro_batch_size, micro_batch_size).contiguous()
-        loss, _ = core.run_step(micro_batch)
-        local_loss = local_loss + loss.detach()
+    loss, _ = core.run_step(local_batch)
     core.step_optimizer()
-    baseline_optimizer.step()
 
-    avg_loss = local_loss.detach().clone()
+    avg_loss = loss.detach().clone()
     dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+
+    if isinstance(zero_plugin, Zero3Plugin):
+        zero_plugin.materialize_model()
     param_name, param_diff = _max_param_diff(baseline_model, core.model)
 
     if rank == 0:
         loss_diff = abs(baseline_loss.item() - avg_loss.item())
-        print(f"Baseline loss     : {baseline_loss.item():.6f}")
-        print(f"RuntimeCore ZeRO2 : {avg_loss.item():.6f}")
-        print(f"Loss diff         : {loss_diff:.2e}  (atol={_ATOL:.2e})")
-        print(f"Post-step diff    : {param_diff:.2e}  ({param_name}, atol={_ATOL:.2e})")
+        print(f"Baseline loss           : {baseline_loss.item():.6f}")
+        print(f"RuntimeCore ZeRO{args.zero_stage}+clip  : {avg_loss.item():.6f}")
+        print(f"Baseline grad norm      : {baseline_norm:.6f}")
+        print(f"max_norm                : {max_norm:.6f}  (fraction={_CLIP_FRACTION})")
+        print(f"Loss diff               : {loss_diff:.2e}  (atol={_ATOL:.2e})")
+        print(f"Post-step diff          : {param_diff:.2e}  ({param_name}, atol={_ATOL:.2e})")
         if loss_diff > _ATOL:
-            raise AssertionError(f"ZeRO2 loss equivalence failed: diff={loss_diff:.2e}")
+            raise AssertionError(f"ZeRO{args.zero_stage}+clip loss equivalence failed: diff={loss_diff:.2e}")
         if param_diff > _ATOL:
-            raise AssertionError(f"ZeRO2 one-step equivalence failed: param={param_name}, diff={param_diff:.2e}")
+            raise AssertionError(
+                f"ZeRO{args.zero_stage}+clip one-step equivalence failed: param={param_name}, diff={param_diff:.2e}"
+            )
         print("PASS")
 
+    if isinstance(zero_plugin, Zero3Plugin):
+        zero_plugin.reshard_model()
     dist.destroy_process_group()
 
 

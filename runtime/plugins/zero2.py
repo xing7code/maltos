@@ -16,6 +16,7 @@ from runtime.plugins.zero_common import (
     ZeroPluginBase,
 )
 from runtime.types import ParamRole, RuntimePhase
+from utils.distributed import all_gather_single, reduce_scatter_single
 
 
 @dataclass
@@ -210,7 +211,7 @@ class Zero2Plugin(ZeroPluginBase):
                 )
             if bucket.group_context.correction != 1.0:
                 full_grad.mul_(bucket.group_context.correction)
-            work = dist.reduce_scatter_tensor(
+            work = reduce_scatter_single(
                 state.shard_buffer,
                 full_grad,
                 op=dist.ReduceOp.AVG,
@@ -230,7 +231,7 @@ class Zero2Plugin(ZeroPluginBase):
                     self.data_buffer[bucket.start : bucket.end].copy_(bucket.local_param.detach())
                     continue
                 handles.append(
-                    dist.all_gather_into_tensor(
+                    all_gather_single(
                         self.data_buffer[bucket.start : bucket.end],
                         bucket.local_param.detach().contiguous(),
                         group=bucket.group_context.group,

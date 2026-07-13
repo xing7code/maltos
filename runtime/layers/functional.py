@@ -3,6 +3,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from runtime.buffer_allocator import allocate_buffer
+from utils.distributed import all_gather_single, reduce_scatter_single
 
 
 class AllGather(torch.autograd.Function):
@@ -30,7 +31,7 @@ class AllGather(torch.autograd.Function):
             dtype=x.dtype,
             device=x.device,
         )
-        dist.all_gather_into_tensor(out_t, x_t, group=group)
+        all_gather_single(out_t, x_t, group=group)
         return out_t.transpose(0, comm_dim).contiguous()
 
     @staticmethod
@@ -62,7 +63,7 @@ class ReduceScatter(torch.autograd.Function):
             dtype=x.dtype,
             device=x.device,
         )
-        dist.reduce_scatter_tensor(out, x_t, group=ctx.group, op=reduce_op)
+        reduce_scatter_single(out, x_t, group=ctx.group, op=reduce_op)
         return out.transpose(0, comm_dim).contiguous()
 
     @staticmethod
@@ -75,7 +76,7 @@ class ReduceScatter(torch.autograd.Function):
             dtype=grad_output.dtype,
             device=grad_output.device,
         )
-        dist.all_gather_into_tensor(out_t, grad_output_t, group=ctx.group)
+        all_gather_single(out_t, grad_output_t, group=ctx.group)
         return out_t.transpose(0, ctx.comm_dim).contiguous(), None, None, None, None
 
 
@@ -131,7 +132,7 @@ class _RowParallelReduceScatterAsync(torch.autograd.Function):
             dtype=grad_output.dtype,
             device=grad_output.device,
         )
-        handle = dist.all_gather_into_tensor(
+        handle = all_gather_single(
             gathered_grad_output_t,
             grad_output_t,
             group=ctx.tp_group,

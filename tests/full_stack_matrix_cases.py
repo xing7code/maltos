@@ -430,6 +430,59 @@ def build_full_stack_matrix_cases(
         )
     )
 
+    # H: explicit no-reuse coverage. These replace the old standalone
+    # EP+CP/EP+PP targeted runners while keeping the matrix as the one
+    # distributed transformer entry point.
+    add(
+        _case(
+            "H/ep_no_reuse_cp/ep_full_eq_z1",
+            "ep_full_eq",
+            backend=backend,
+            world_size=world_size,
+            dp_size=2,
+            pp_size=2,
+            cp_size=2,
+            tp_size=1,
+            ep_size=2,
+            zero_stage=1,
+            cp_attn_core="ring",
+            reuse_cp_for_ep=False,
+        )
+    )
+    add(
+        _case(
+            "H/ep_no_reuse_tp/ep_full_eq_z1",
+            "ep_full_eq",
+            backend=backend,
+            world_size=world_size,
+            dp_size=2,
+            pp_size=2,
+            cp_size=1,
+            tp_size=2,
+            ep_size=2,
+            zero_stage=1,
+            reuse_tp_for_ep=False,
+        )
+    )
+    add(
+        _case(
+            "H/ep_no_reuse_tp_cp/ep_full_eq_z1",
+            "ep_full_eq",
+            backend=backend,
+            world_size=world_size,
+            dp_size=2,
+            pp_size=1,
+            cp_size=2,
+            tp_size=2,
+            ep_size=2,
+            pp_microbatches=1,
+            zero_stage=1,
+            cp_attn_core="ring",
+            reuse_tp_for_ep=False,
+            reuse_cp_for_ep=False,
+        )
+    )
+
     if case_names:
         ordered_names: list[str] = []
         seen: set[str] = set()

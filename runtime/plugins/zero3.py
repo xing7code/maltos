@@ -19,6 +19,7 @@ from runtime.plugins.zero_common import (
 )
 from runtime.types import ParamRole, RuntimePhase
 from state.state import ParamState
+from utils.distributed import all_gather_single, reduce_scatter_single
 
 
 class _ExecDirection(str, Enum):
@@ -306,7 +307,7 @@ class Zero3Plugin(ZeroPluginBase):
         else:
             if state.bwd_handle is not None:
                 return
-        handle = dist.all_gather_into_tensor(
+        handle = all_gather_single(
             state.data_buffer,
             bucket.local_param.detach().contiguous(),
             group=bucket.group_context.group,
@@ -382,7 +383,7 @@ class Zero3Plugin(ZeroPluginBase):
         if bucket.group_context.group is None or bucket.group_context.world_size == 1:
             buffer.copy_(bucket.local_param.detach())
         else:
-            dist.all_gather_into_tensor(
+            all_gather_single(
                 buffer,
                 bucket.local_param.detach().contiguous(),
                 group=bucket.group_context.group,
@@ -431,7 +432,7 @@ class Zero3Plugin(ZeroPluginBase):
                 )
             if bucket.group_context.correction != 1.0:
                 state.grad_buffer.mul_(bucket.group_context.correction)
-            work = dist.reduce_scatter_tensor(
+            work = reduce_scatter_single(
                 state.shard_buffer,
                 state.grad_buffer,
                 op=dist.ReduceOp.AVG,

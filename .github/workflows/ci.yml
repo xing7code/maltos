@@ -69,28 +69,46 @@ jobs:
         env:
           PYTHONPATH: .
           OMP_NUM_THREADS: "1"
+          GLOO_SOCKET_IFNAME: lo
         run: |
-          python tests/tiny_transformer_tp_runtime_core_equivalence.py \
-            --world-size 2 \
-            --tp-size 2 \
+          python tests/tiny_model_ddp_runtime_core_equivalence.py \
+            --ddp-mode naive \
             --master-port 29555
 
-          python tests/tiny_transformer_pp_runtime_core_equivalence.py \
-            --case pp \
-            --world-size 2 \
-            --dp-size 1 \
-            --pp-size 2 \
+          python tests/tiny_model_zero_runtime_core_equivalence.py \
+            --zero-stage 1 \
             --master-port 29566
 
-          python tests/tiny_transformer_cp_runtime_core_equivalence.py \
-            --case cp \
-            --world-size 2 \
-            --dp-size 1 \
-            --cp-size 2 \
+          python tests/tiny_model_zero_runtime_core_equivalence.py \
+            --zero-stage 2 \
             --master-port 29582
 
-          python tests/tiny_transformer_ep_zero3_accum2_midstep_resume.py \
-            --world-size 2 \
-            --dp-size 2 \
-            --ep-size 2 \
+          python tests/tiny_model_zero_runtime_core_equivalence.py \
+            --zero-stage 3 \
             --master-port 29611
+
+          python tests/tiny_model_zero_runtime_core_equivalence.py \
+            --zero-stage 3 \
+            --grad-accum-steps 2 \
+            --master-port 29612
+
+          python tests/tiny_model_zero_grad_clip_equivalence.py \
+            --zero-stage 1 \
+            --master-port 29613
+
+          python tests/tiny_model_zero_grad_clip_equivalence.py \
+            --zero-stage 2 \
+            --master-port 29614
+
+          python tests/tiny_model_zero_grad_clip_equivalence.py \
+            --zero-stage 3 \
+            --master-port 29615
+
+          python tests/tiny_model_zero3_checkpoint_resume.py \
+            --master-port 29616
+
+          python tests/tiny_model_zero3_checkpoint_roundtrip.py \
+            --master-port 29617
+
+          python tests/tiny_transformer_tp_checkpoint_manifest.py \
+            --master-port 29618

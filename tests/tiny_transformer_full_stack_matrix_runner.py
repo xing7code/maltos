@@ -82,6 +82,8 @@ def _read_case_list(path_str: str | None) -> list[str]:
     if path_str is None:
         return []
     path = Path(path_str)
+    if not path.exists():
+        return []
     case_names: list[str] = []
     for line in path.read_text().splitlines():
         stripped = line.strip()

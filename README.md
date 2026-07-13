@@ -46,13 +46,13 @@ research workflows.
 
 ## Validation Snapshot
 
-- `bash tests/run_single_feature.sh` passes on the maintained single-feature regression suite.
 - `bash tests/run_matrix.sh` passes on the maintained full-stack matrix.
+- `bash tests/run_smoke_regressions.sh` passes on focused non-matrix regressions.
 - Core smokes pass:
   - `tests/smoke_runtime_core.py`
   - `tests/smoke_trainer_loop.py`
   - `tests/smoke_pretrain_cli.py`
-- Distributed CI runs a smaller regression subset covering TP, PP, CP, and EP+ZeRO resume.
+- Distributed CI runs smoke tests, focused checkpoint/dataloader regressions, and a smaller matrix subset covering TP, PP, CP, and EP+ZeRO resume.
 - Real runs have been exercised on Vast.ai at 1 GPU, 2 GPU, and 4 GPU scale.
 - A 4x4090 50M-token run used `DP=2, TP=2, SP, ZeRO-3, bf16, grad clip` and reached:
   - final step around `3100`
@@ -245,15 +245,31 @@ PYTHONPATH=. .venv/bin/python tests/smoke_trainer_loop.py
 PYTHONPATH=. .venv/bin/python tests/smoke_pretrain_cli.py
 ```
 
-Run a TP equivalence test:
+Run the focused non-matrix regression suite:
 
 ```bash
-PYTHONPATH=. .venv/bin/python tests/tiny_transformer_tp_runtime_core_equivalence.py \
-  --world-size 2 \
-  --tp-size 2
+PYTHONPATH=. PYTHON_BIN=.venv/bin/python bash tests/run_smoke_regressions.sh
 ```
 
-Run a heavier integration case:
+List the maintained full-stack matrix cases:
+
+```bash
+PYTHONPATH=. .venv/bin/python tests/tiny_transformer_full_stack_matrix_runner.py --list-cases
+```
+
+Run a focused full-stack matrix case:
+
+```bash
+PYTHONPATH=. PYTHON_BIN=.venv/bin/python CASE_FILTER=B/full_eq/z3 bash tests/run_matrix.sh
+```
+
+Run the maintained full-stack matrix:
+
+```bash
+PYTHONPATH=. PYTHON_BIN=.venv/bin/python bash tests/run_matrix.sh
+```
+
+Run a heavier dataloader resume regression:
 
 ```bash
 PYTHONPATH=. .venv/bin/python tests/pretraining_loader_tp_sp_zero3_bf16_clip_accum2_resume.py \
@@ -267,18 +283,6 @@ That case exercises:
 ```text
 PretrainingDataLoader + TP + SP + ZeRO-3 + bf16 + grad clip
 + gradient accumulation + checkpoint save/load + dataloader resume
-```
-
-Run the maintained single-feature regression suite:
-
-```bash
-PYTHONPATH=. PYTHON_BIN=.venv/bin/python bash tests/run_single_feature.sh
-```
-
-Run the maintained full-stack matrix:
-
-```bash
-PYTHONPATH=. PYTHON_BIN=.venv/bin/python bash tests/run_matrix.sh
 ```
 
 ## Preparing Token Shards

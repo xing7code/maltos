@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, RuntimeCore
-from runtime.plugins.ep import _ExpertParallelMoE
+from runtime.layers.moe import ExpertParallelMoE
 
 
 def _configure_default_gloo_socket_ifname() -> None:
@@ -206,7 +206,7 @@ def moe_local_expert_tensors(
 ) -> dict[str, torch.Tensor]:
     tensors: dict[str, torch.Tensor] = {}
     for module_name, module in model.named_modules():
-        if not isinstance(module, _ExpertParallelMoE):
+        if not isinstance(module, ExpertParallelMoE):
             continue
         for local_idx, global_idx in enumerate(module.local_expert_ids):
             expert = module.local_experts[local_idx]

@@ -36,6 +36,15 @@ PASSES_FILE="${PASSES_FILE:-local_notes/matrix_passes.txt}"
 export PYTHONPATH="${PYTHONPATH:-.}"
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-180}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-180}"
+if [ "${BACKEND}" = "gloo" ]; then
+  if [ -z "${GLOO_SOCKET_IFNAME:-}" ]; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+      export GLOO_SOCKET_IFNAME="lo0"
+    else
+      export GLOO_SOCKET_IFNAME="lo"
+    fi
+  fi
+fi
 mkdir -p local_notes
 touch "${WHITELIST}" "${BLACKLIST}" "${REPORT_FILE}" "${FAILURES_FILE}" "${PASSES_FILE}"
 
