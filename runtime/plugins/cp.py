@@ -14,10 +14,9 @@ from parallel.context_interfaces import (
     ContextParallelAttentionCore,
     ContextParallelAttentionCoreType,
 )
+from runtime.layers.attention import AllGatherKvAttentionCore, RingAttentionCore
 from runtime.mesh import MeshAxis
 from runtime.plugin import ContextParallelizableModule, PluginId, RuntimePlugin
-from runtime.plugins.cp_all_gather import AllGatherKvAttentionCore
-from runtime.plugins.cp_ring import RingAttentionCore
 from runtime.plugins.zero_common import ChainedWork
 from runtime.types import ParamRole, RuntimePhase
 

@@ -6,7 +6,7 @@ from parallel.specs import TpSpShardAxis
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
 from runtime.types import ParamRole, RuntimePhase
-from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
+from runtime.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 
 class TensorParallelPlugin(RuntimePlugin):

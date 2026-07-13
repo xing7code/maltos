@@ -5,93 +5,56 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 
-from runtime.buffer_allocator import allocate_buffer
+from runtime.layers.functional import all_gather, ring_shift
 
 if TYPE_CHECKING:
     from runtime.types import StepContext
 
 
-class _RingShift(torch.autograd.Function):
-    @staticmethod
+class AllGatherKvAttentionCore(nn.Module):
+    def __init__(self, group: dist.ProcessGroup) -> None:
+        super().__init__()
+        self.group = group
+
     def forward(
-        ctx,
-        x: torch.Tensor,
-        group: dist.ProcessGroup,
-        send_to: int,
-        recv_from: int,
-        alloc_key: str,
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        position_offset: int,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        ctx.group = group
-        ctx.send_to = send_to
-        ctx.recv_from = recv_from
-        ctx.alloc_key = alloc_key
-        if dist.get_world_size(group) == 1:
-            return x
-        out = allocate_buffer(
-            key=f"{alloc_key}.forward",
-            shape=tuple(x.shape),
-            dtype=x.dtype,
-            device=x.device,
+        gathered_k = all_gather(
+            k,
+            self.group,
+            comm_dim=2,
+            alloc_key=f"cp.all_gather_kv.{id(self)}.k",
+            backward_reduce_op=dist.ReduceOp.SUM,
         )
-        send_global_rank = dist.get_global_rank(group, send_to)
-        recv_global_rank = dist.get_global_rank(group, recv_from)
-        _pairwise_send_recv(
-            x.contiguous(),
-            out,
-            send_rank=send_global_rank,
-            recv_rank=recv_global_rank,
-            group=group,
+        gathered_v = all_gather(
+            v,
+            self.group,
+            comm_dim=2,
+            alloc_key=f"cp.all_gather_kv.{id(self)}.v",
+            backward_reduce_op=dist.ReduceOp.SUM,
         )
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        if dist.get_world_size(ctx.group) == 1:
-            return grad_output, None, None, None, None
-        grad_input = allocate_buffer(
-            key=f"{ctx.alloc_key}.backward",
-            shape=tuple(grad_output.shape),
-            dtype=grad_output.dtype,
-            device=grad_output.device,
+        local_positions = _canonical_positions(
+            position_ids,
+            position_offset=position_offset,
+            seq_len=q.size(-2),
+            device=q.device,
         )
-        send_global_rank = dist.get_global_rank(ctx.group, ctx.recv_from)
-        recv_global_rank = dist.get_global_rank(ctx.group, ctx.send_to)
-        _pairwise_send_recv(
-            grad_output.contiguous(),
-            grad_input,
-            send_rank=send_global_rank,
-            recv_rank=recv_global_rank,
-            group=ctx.group,
+        gathered_positions = [torch.empty_like(local_positions) for _ in range(dist.get_world_size(self.group))]
+        dist.all_gather(gathered_positions, local_positions.contiguous(), group=self.group)
+        return _eager_cp_causal_attention(
+            q,
+            gathered_k,
+            gathered_v,
+            q_positions=local_positions,
+            k_positions=torch.cat(gathered_positions, dim=0),
         )
-        return grad_input, None, None, None, None
-
-
-def _ring_shift(
-    x: torch.Tensor,
-    group: dist.ProcessGroup,
-    send_to: int,
-    recv_from: int,
-    *,
-    alloc_key: str,
-) -> torch.Tensor:
-    return _RingShift.apply(x, group, send_to, recv_from, alloc_key)
-
-
-def _pairwise_send_recv(
-    send_tensor: torch.Tensor,
-    recv_tensor: torch.Tensor,
-    *,
-    send_rank: int,
-    recv_rank: int,
-    group: dist.ProcessGroup,
-) -> None:
-    ops = [
-        dist.P2POp(dist.isend, send_tensor, send_rank, group),
-        dist.P2POp(dist.irecv, recv_tensor, recv_rank, group),
-    ]
-    for work in dist.batch_isend_irecv(ops):
-        work.wait()
 
 
 class RingAttentionCore(nn.Module):
@@ -161,7 +124,7 @@ class RingAttentionCore(nn.Module):
             )
             if step + 1 == world_size:
                 break
-            current_kv = _ring_shift(
+            current_kv = ring_shift(
                 current_kv,
                 self.group,
                 send_to,
@@ -201,6 +164,22 @@ def _canonical_positions(
     return positions.to(device=device, dtype=torch.long)
 
 
+def _eager_cp_causal_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    q_positions: torch.Tensor,
+    k_positions: torch.Tensor,
+) -> torch.Tensor:
+    scale = q.size(-1) ** -0.5
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    causal_mask = k_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
+    scores = scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(scores.dtype).min)
+    probs = F.softmax(scores, dim=-1)
+    return torch.matmul(probs, v)
+
+
 def _ring_exchange_tensor(
     x: torch.Tensor,
     group: dist.ProcessGroup,
@@ -209,22 +188,7 @@ def _ring_exchange_tensor(
     *,
     alloc_key: str,
 ) -> torch.Tensor:
-    out = allocate_buffer(
-        key=alloc_key,
-        shape=tuple(x.shape),
-        dtype=x.dtype,
-        device=x.device,
-    )
-    send_global_rank = dist.get_global_rank(group, send_to)
-    recv_global_rank = dist.get_global_rank(group, recv_from)
-    _pairwise_send_recv(
-        x.contiguous(),
-        out,
-        send_rank=send_global_rank,
-        recv_rank=recv_global_rank,
-        group=group,
-    )
-    return out
+    return ring_shift(x, group, send_to, recv_from, alloc_key=alloc_key)
 
 
 def _ring_block_causal_attention(

@@ -7,75 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from runtime.buffer_allocator import allocate_buffer
-from runtime.layers.functional import all_gather, all_reduce, reduce_scatter
-
-
-class _RowParallelReduceScatterAsync(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, weight, bias, tp_group, alloc_key: str):
-        ctx.tp_group = tp_group
-        ctx.alloc_key = alloc_key
-        ctx.use_bias = bias is not None
-        ctx.input_shape = tuple(input.shape)
-        ctx.rank = dist.get_rank(tp_group)
-        ctx.world_size = dist.get_world_size(tp_group)
-        ctx.save_for_backward(input, weight)
-
-        output = F.linear(input, weight, None)
-        output = reduce_scatter(
-            output,
-            tp_group,
-            1,
-            alloc_key=f"{alloc_key}.forward.reduce_scatter",
-        )
-        if bias is not None:
-            output = output + bias
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        input, weight = ctx.saved_tensors
-        grad_output = grad_output.contiguous()
-        grad_output_weight = weight.to(dtype=grad_output.dtype)
-        grad_weight_dtype = weight.dtype
-
-        grad_output_t = grad_output.transpose(0, 1).contiguous()
-        gathered_shape = (ctx.world_size * grad_output_t.shape[0], *grad_output_t.shape[1:])
-        gathered_grad_output_t = allocate_buffer(
-            key=f"{ctx.alloc_key}.backward.all_gather",
-            shape=gathered_shape,
-            dtype=grad_output.dtype,
-            device=grad_output.device,
-        )
-        handle = dist.all_gather_into_tensor(
-            gathered_grad_output_t,
-            grad_output_t,
-            group=ctx.tp_group,
-            async_op=True,
-        )
-
-        grad_input = torch.empty(ctx.input_shape, dtype=grad_output.dtype, device=grad_output.device)
-        local_seq = grad_output.shape[1]
-        local_start = ctx.rank * local_seq
-        local_end = local_start + local_seq
-        grad_input.narrow(1, local_start, local_seq).copy_(grad_output.matmul(grad_output_weight))
-
-        handle.wait()
-
-        gathered_grad_output = gathered_grad_output_t.transpose(0, 1)
-        if local_start > 0:
-            left = gathered_grad_output.narrow(1, 0, local_start)
-            grad_input.narrow(1, 0, local_start).copy_(left.matmul(grad_output_weight))
-        if local_end < grad_input.shape[1]:
-            right = gathered_grad_output.narrow(1, local_end, grad_input.shape[1] - local_end)
-            grad_input.narrow(1, local_end, grad_input.shape[1] - local_end).copy_(right.matmul(grad_output_weight))
-
-        grad_weight = gathered_grad_output.reshape(-1, gathered_grad_output.shape[-1]).to(grad_weight_dtype).t().matmul(
-            input.reshape(-1, input.shape[-1]).to(grad_weight_dtype)
-        )
-        grad_bias = gathered_grad_output.to(grad_weight_dtype).sum(dim=(0, 1)) if ctx.use_bias else None
-        return grad_input, grad_weight, grad_bias, None, None
+from runtime.layers.functional import all_gather, all_reduce, row_parallel_reduce_scatter_async
 
 
 class ColumnParallelLinear(nn.Module):
@@ -191,12 +123,12 @@ class RowParallelLinear(nn.Module):
     def forward(self, input):
         if self.comm == "reduce_scatter":
             if self.world_size > 1:
-                return _RowParallelReduceScatterAsync.apply(
+                return row_parallel_reduce_scatter_async(
                     input,
                     self.weight,
                     self.bias,
                     self.tp_group,
-                    f"tp.row_parallel_linear.{id(self)}",
+                    alloc_key=f"tp.row_parallel_linear.{id(self)}",
                 )
             output = F.linear(input, self.weight, None)
             if self.bias is not None:
