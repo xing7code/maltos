@@ -362,6 +362,74 @@ def build_full_stack_matrix_cases(
             )
         )
 
+    # E/F/G: targeted EP-span coverage for the three reuse_tp/reuse_cp regimes
+    # under the default reuse_tp_for_ep=True, reuse_cp_for_ep=True plan.
+    #
+    # E: EP <= TP
+    add(_case("E/ep_topology_ep_le_tp/ep_full_eq_z3", "ep_full_eq", backend=backend, world_size=world_size, dp_size=2, pp_size=1, cp_size=1, tp_size=4, ep_size=2, pp_microbatches=1, zero_stage=3))
+    add(
+        _case(
+            "E/ep_topology_ep_le_tp/ep_full_resume_z3_afab_acc2",
+            "ep_full_resume",
+            needs_checkpoint_dir=True,
+            backend=backend,
+            world_size=world_size,
+            dp_size=2,
+            pp_size=1,
+            cp_size=1,
+            tp_size=4,
+            ep_size=2,
+            pp_microbatches=1,
+            zero_stage=3,
+            pp_schedule="afab",
+            grad_accum_steps=2,
+        )
+    )
+
+    # F: TP < EP <= TP*CP
+    add(_case("F/ep_topology_tp_lt_ep_le_tp_cp/ep_full_eq_z3", "ep_full_eq", backend=backend, world_size=world_size, dp_size=2, pp_size=1, cp_size=2, tp_size=2, ep_size=4, pp_microbatches=1, zero_stage=3, cp_attn_core="ring"))
+    add(
+        _case(
+            "F/ep_topology_tp_lt_ep_le_tp_cp/ep_full_resume_z3_afab_acc2",
+            "ep_full_resume",
+            needs_checkpoint_dir=True,
+            backend=backend,
+            world_size=world_size,
+            dp_size=2,
+            pp_size=1,
+            cp_size=2,
+            tp_size=2,
+            ep_size=4,
+            pp_microbatches=1,
+            zero_stage=3,
+            pp_schedule="afab",
+            grad_accum_steps=2,
+            cp_attn_core="ring",
+        )
+    )
+
+    # G: TP*CP < EP <= TP*CP*DP
+    add(_case("G/ep_topology_tp_cp_lt_ep_le_tp_cp_dp/ep_full_eq_z3", "ep_full_eq", backend=backend, world_size=world_size, dp_size=2, pp_size=1, cp_size=2, tp_size=2, ep_size=8, pp_microbatches=1, zero_stage=3, cp_attn_core="ring"))
+    add(
+        _case(
+            "G/ep_topology_tp_cp_lt_ep_le_tp_cp_dp/ep_full_resume_z3_afab_acc2",
+            "ep_full_resume",
+            needs_checkpoint_dir=True,
+            backend=backend,
+            world_size=world_size,
+            dp_size=2,
+            pp_size=1,
+            cp_size=2,
+            tp_size=2,
+            ep_size=8,
+            pp_microbatches=1,
+            zero_stage=3,
+            pp_schedule="afab",
+            grad_accum_steps=2,
+            cp_attn_core="ring",
+        )
+    )
+
     if case_names:
         ordered_names: list[str] = []
         seen: set[str] = set()

@@ -75,12 +75,14 @@ class SequenceParallelPlugin(RuntimePlugin):
 
     def _make_all_gather_hook(self, comm_dim: int, module_path: str):
         def hook(module, input):
+            assert self.runtime is not None
             x, *args = input
+            microbatch_idx = self.runtime.state.step_context.pp_cur_microbatch_idx
             x = all_gather(
                 x,
                 self.sp_group,
                 comm_dim,
-                alloc_key=f"sp.{module_path}.all_gather",
+                alloc_key=f"sp.{module_path}.mb{microbatch_idx}.all_gather",
             )
             return (x, *args)
 

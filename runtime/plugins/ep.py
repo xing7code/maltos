@@ -149,9 +149,14 @@ class _ExpertParallelMoE(nn.Module):
         recv_outputs = torch.zeros_like(recv_tokens)
         for local_idx, expert in enumerate(self.local_experts):
             mask = recv_local_expert_idx == local_idx
-            if not torch.any(mask):
-                continue
-            expert_out = expert(recv_tokens[mask]) * recv_weights[mask].unsqueeze(1)
+            # Keep wrapped expert-module execution order identical across EREP
+            # replicas even when this rank routed zero tokens to a given
+            # expert. ZeRO3 hooks hang if one replica skips a wrapped module
+            # that its peer enters, so we still call the expert on the empty
+            # tensor rather than skipping the module entirely.
+            expert_input = recv_tokens[mask]
+            expert_out = expert(expert_input)
+            expert_out = expert_out * recv_weights[mask].unsqueeze(1)
             recv_outputs[mask] = expert_out.to(recv_outputs.dtype)
 
         returned_outputs = torch.empty_like(send_tokens)
