@@ -1,4 +1,4 @@
-# Checkpoint ownership model for optimizer-state saving.
+# Checkpoint ownership model for param and optimizer saving.
 #
 # Legend: each cell is "param / optim", where
 #   R = replicate
@@ -23,8 +23,11 @@
 #   | PP   | S / S  | S / S  | S / S  | S / S  |
 #   +------+--------+--------+--------+--------+
 #
-# Optimizer checkpoint ownership follows the "optim" half of these tables:
-# replicated axes save rank 0 of that axis; sharded axes save every rank.
+# ParamState.source_rank records which global rank owns the checkpoint payload
+# for each logical entry. Replicated entries collapse to rank 0 of their
+# replica group; sharded entries use their local rank. Optimizer ownership is
+# still resolved separately because optimizer state is currently treated as one
+# owned object, not per-param.
 from __future__ import annotations
 
 import json
@@ -67,6 +70,17 @@ class CheckpointArtifact:
     rank: int
     path: str
     source_rank: int | None = None
+
+
+def _param_state_from_dict(item: dict[str, Any]) -> ParamState:
+    return ParamState(
+        state_key=item["state_key"],
+        logical_names=[str(name) for name in item["logical_names"]],
+        logical_shapes=[tuple(shape) for shape in item["logical_shapes"]],
+        physical_shape=tuple(item["physical_shape"]),
+        dtype=item["dtype"],
+        source_rank=int(item["source_rank"]) if item.get("source_rank") is not None else None,
+    )
 
 
 def save_sharded_checkpoint(
@@ -127,16 +141,22 @@ def _save_sharded_checkpoint_contents(state_manager: StateManager, checkpoint_di
     torch.save(asdict(state_manager.export_trainer_state()), trainer_path)
     local_artifacts.append(asdict(CheckpointArtifact(kind="trainer", rank=rank, path=trainer_path.name)))
 
-    gathered_metadata: list[list[dict] | None] = [None for _ in range(world_size)]
-    gathered_artifacts: list[list[dict] | None] = [None for _ in range(world_size)]
+    gathered_metadata: list[list[dict] | None] | None = [None for _ in range(world_size)] if rank == 0 else None
+    gathered_artifacts: list[list[dict] | None] | None = [None for _ in range(world_size)] if rank == 0 else None
     if dist.is_initialized():
-        dist.all_gather_object(gathered_metadata, [asdict(item) for item in rank_entries])
-        dist.all_gather_object(gathered_artifacts, local_artifacts)
+        # TODO: support async checkpointing by snapshotting state first, then
+        # decoupling manifest assembly / file I/O from the training critical path.
+        dist.gather_object([asdict(item) for item in rank_entries], gathered_metadata, dst=0)
+        dist.gather_object(local_artifacts, gathered_artifacts, dst=0)
     else:
+        assert gathered_metadata is not None
+        assert gathered_artifacts is not None
         gathered_metadata[0] = [asdict(item) for item in rank_entries]
         gathered_artifacts[0] = local_artifacts
 
     if rank == 0:
+        assert gathered_metadata is not None
+        assert gathered_artifacts is not None
         optimizer_source_ranks = [runtime.optimizer_checkpoint_rank(rank_id) for rank_id in range(world_size)]
         manifest = CheckpointManifest(
             version=1,
@@ -144,7 +164,7 @@ def _save_sharded_checkpoint_contents(state_manager: StateManager, checkpoint_di
             ranks=[
                 RankCheckpointMetadata(
                     rank=rank_idx,
-                    entries=[ParamState(**item) for item in (entries or [])],
+                    entries=[_param_state_from_dict(item) for item in (entries or [])],
                 )
                 for rank_idx, entries in enumerate(gathered_metadata)
             ],
@@ -169,10 +189,12 @@ def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> No
     manifest = _load_manifest(checkpoint_dir)
     _validate_manifest_for_runtime(manifest, runtime)
 
-    model_artifact = _find_artifact(manifest, kind="model", rank=rank)
-    if model_artifact is None:
-        raise ValueError(f"manifest missing model artifact for rank={rank}")
-    model_state = torch.load(checkpoint_dir / model_artifact.path, map_location="cpu", weights_only=True)
+    model_state = _load_model_state_for_rank(
+        checkpoint_dir,
+        manifest,
+        rank_metadata=manifest.ranks[rank],
+        rank=rank,
+    )
 
     trainer_artifact = _find_artifact(manifest, kind="trainer", rank=rank)
     if trainer_artifact is None:
@@ -223,7 +245,7 @@ def _load_manifest(checkpoint_dir: Path) -> CheckpointManifest:
         ranks=[
             RankCheckpointMetadata(
                 rank=int(rank_meta["rank"]),
-                entries=[ParamState(**entry) for entry in rank_meta["entries"]],
+                entries=[_param_state_from_dict(entry) for entry in rank_meta["entries"]],
             )
             for rank_meta in raw["ranks"]
         ],
@@ -251,6 +273,39 @@ def _find_artifact(
     return None
 
 
+def _load_model_state_for_rank(
+    checkpoint_dir: Path,
+    manifest: CheckpointManifest,
+    rank_metadata: RankCheckpointMetadata,
+    rank: int,
+) -> dict[str, torch.Tensor]:
+    loaded_states: dict[int, dict[str, torch.Tensor]] = {}
+    merged_state: dict[str, torch.Tensor] = {}
+    for entry in rank_metadata.entries:
+        if entry.source_rank is None:
+            raise ValueError(f"manifest missing model source rank for entry={entry.state_key}, rank={rank}")
+        source_rank = entry.source_rank
+        artifact = _find_artifact(manifest, kind="model", rank=source_rank)
+        if artifact is None:
+            raise ValueError(
+                f"manifest missing model artifact for source rank={source_rank} "
+                f"(used by rank={rank}, entry={entry.state_key})"
+            )
+        if source_rank not in loaded_states:
+            loaded_states[source_rank] = torch.load(
+                checkpoint_dir / artifact.path,
+                map_location="cpu",
+                weights_only=True,
+            )
+        source_state = loaded_states[source_rank]
+        if entry.state_key not in source_state:
+            raise ValueError(
+                f"model state missing entry={entry.state_key} in source rank={source_rank} artifact"
+            )
+        merged_state[entry.state_key] = source_state[entry.state_key]
+    return merged_state
+
+
 def _validate_manifest_for_runtime(manifest: CheckpointManifest, runtime) -> None:
     runtime_world_size = dist.get_world_size() if dist.is_initialized() else 1
     runtime_rank = dist.get_rank() if dist.is_initialized() else 0
@@ -276,6 +331,23 @@ def _validate_manifest_for_runtime(manifest: CheckpointManifest, runtime) -> Non
         if _find_artifact(manifest, kind="trainer", rank=rank_id) is None:
             raise ValueError(f"manifest missing trainer artifact for rank={rank_id}")
     _validate_unique_artifacts(manifest)
+
+    for rank_meta in manifest.ranks:
+        for entry in rank_meta.entries:
+            if entry.source_rank is None:
+                raise ValueError(
+                    f"manifest missing model source rank for entry={entry.state_key}, rank={rank_meta.rank}"
+                )
+            if entry.source_rank < 0 or entry.source_rank >= manifest.world_size:
+                raise ValueError(
+                    f"manifest model source rank out of range: rank={rank_meta.rank}, "
+                    f"entry={entry.state_key}, source_rank={entry.source_rank}"
+                )
+            if _find_artifact(manifest, kind="model", rank=entry.source_rank) is None:
+                raise ValueError(
+                    f"manifest missing model artifact for source rank={entry.source_rank} "
+                    f"(used by rank={rank_meta.rank}, entry={entry.state_key})"
+                )
 
     optimizer_artifact_ranks = {artifact.rank for artifact in manifest.artifacts if artifact.kind == "optimizer"}
     if optimizer_artifact_ranks:

@@ -455,6 +455,7 @@ class Zero3Plugin(ZeroPluginBase):
     def override_param_state_dict(self) -> tuple[dict[str, torch.Tensor], list[ParamState]] | None:
         state = {}
         metadata = []
+        rank = dist.get_rank() if dist.is_initialized() else 0
         for bucket in self.buckets:
             state_key = f"zero3_bucket_{bucket.index}"
             state[state_key] = bucket.local_param.detach().cpu().clone()
@@ -465,27 +466,10 @@ class Zero3Plugin(ZeroPluginBase):
                     logical_shapes=[tuple(shape) for shape in bucket.param_shapes],
                     physical_shape=tuple(bucket.local_param.shape),
                     dtype=str(bucket.local_param.dtype),
+                    source_rank=rank,
                 )
             )
         return state, metadata
-
-    def annotate_checkpoint_state(self, entry: ParamState) -> None:
-        bucket_by_key = {f"zero3_bucket_{bucket.index}": bucket for bucket in self.buckets}
-        bucket = bucket_by_key.get(entry.state_key)
-        if bucket is None:
-            return
-        shard_len = bucket.local_param.numel()
-        entry.set_plugin_annotation(
-            self.id.value,
-            {
-                "bucket_index": bucket.index,
-                "rank": bucket.group_context.rank,
-                "world_size": bucket.group_context.world_size,
-                "shard_offset": bucket.group_context.rank * shard_len,
-                "shard_numel": shard_len,
-                "numel": bucket.buffer_size,
-            },
-        )
 
     def load_param_state_dict(self, state: dict[str, torch.Tensor]) -> bool:
         for bucket in self.buckets:

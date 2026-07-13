@@ -15,7 +15,9 @@ import torch.nn as nn
 
 from models import ActivationCheckpointConfig, LlamaConfig, LlamaForCausalLM
 from parallel import ParallelPlan
+from parallel.specs import TpSpShardAxis
 from runtime import DefaultStepRunner, MeshConfig, ParamRole, PluginId, RuntimeCore, RuntimePhase
+from runtime.mesh import MeshAxis
 from runtime.plugins.ddp import DataParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.precision import PrecisionPlugin
@@ -388,6 +390,57 @@ def test_runtime_optimizer_checkpoint_policy() -> None:
     assert mixed_core.optimizer_checkpoint_rank(1) == 1
 
 
+def test_runtime_param_checkpoint_policy() -> None:
+    core = RuntimeCore(
+        mesh=MeshConfig(dp=2, tp=2, pp=1, cp=1, ep=1),
+        plan=ParallelPlan(),
+        model=SharedExpertModel(),
+        optimizer_factory=_sgd_factory(),
+    )
+    core.setup()
+    core.state_manager.update_param_state("shared", replicated_axes={MeshAxis.DP, MeshAxis.TP})
+    core.state_manager.update_param_state("expert", replicated_axes={MeshAxis.TP})
+    core._resolve_param_checkpoint_metadata()
+
+    assert core.param_checkpoint_rank("shared", rank_id=3) == 0
+    assert core.param_checkpoint_rank("expert", rank_id=3) == 2
+    assert core.state_manager.param_states["shared"].source_rank == 0
+    assert core.state_manager.param_states["expert"].source_rank == 0
+
+
+def test_tp_bias_layout_metadata() -> None:
+    plugin = TensorParallelPlugin()
+
+    row_linear = nn.Linear(8, 4, bias=True)
+    plugin._record_linear_rule("row", row_linear, TpSpShardAxis.PARAM_IN)
+    assert plugin._param_shard_axis["row.weight"] == TpSpShardAxis.PARAM_IN
+    assert "row.bias" not in plugin._param_shard_axis
+    assert "row.bias" in plugin._tp_replicated_params
+
+    col_linear = nn.Linear(4, 8, bias=True)
+    plugin._record_linear_rule("col", col_linear, TpSpShardAxis.PARAM_OUT)
+    assert plugin._param_shard_axis["col.weight"] == TpSpShardAxis.PARAM_OUT
+    assert plugin._param_shard_axis["col.bias"] == TpSpShardAxis.PARAM_OUT
+
+
+def test_state_manager_exports_only_owned_model_params() -> None:
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=SharedExpertModel(),
+        optimizer_factory=_sgd_factory(),
+    )
+    core.setup()
+    core.state_manager.param_states["shared"].source_rank = 0
+    core.state_manager.param_states["expert"].source_rank = 1
+
+    state, entries = core.state_manager.export_model_state()
+
+    assert set(state) == {"shared"}
+    assert [entry.state_key for entry in entries] == ["shared", "expert"]
+    assert [entry.source_rank for entry in entries] == [0, 1]
+
+
 def test_precision_plugin_metrics_and_clip() -> None:
     model = LossModel()
     core = RuntimeCore(
@@ -655,6 +708,9 @@ def main() -> None:
     test_multiple_optimizer_plugin_owners_fail()
     test_runtime_core_requires_optimizer_owner()
     test_runtime_optimizer_checkpoint_policy()
+    test_runtime_param_checkpoint_policy()
+    test_tp_bias_layout_metadata()
+    test_state_manager_exports_only_owned_model_params()
     test_precision_plugin_metrics_and_clip()
     test_runtime_collects_plugin_metrics()
     test_torch_profiler_plugin_writes_trace()

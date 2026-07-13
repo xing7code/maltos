@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from runtime.mesh import MeshAxis
 from runtime.types import StepContext
@@ -28,12 +29,7 @@ class ParamState:
     logical_shapes: list[tuple[int, ...]]
     physical_shape: tuple[int, ...]
     dtype: str
-    annotations: dict[str, object] = field(default_factory=dict)
-
-    def set_plugin_annotation(self, plugin_name: str, value: object) -> None:
-        if plugin_name in self.annotations:
-            raise ValueError(f"duplicate checkpoint annotation: {plugin_name}")
-        self.annotations[plugin_name] = value
+    source_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +122,7 @@ class StateManager:
         logical_shapes: list[tuple[int, ...]] | None = None,
         physical_shape: tuple[int, ...] | None = None,
         dtype: str | None = None,
+        source_rank: int | None = None,
         sharded_axes: set[MeshAxis] | None = None,
         replicated_axes: set[MeshAxis] | None = None,
     ) -> None:
@@ -141,6 +138,8 @@ class StateManager:
             state.physical_shape = physical_shape
         if dtype is not None:
             state.dtype = dtype
+        if source_rank is not None:
+            state.source_rank = source_rank
         attrs = self._runtime_attrs.get(fq_name)
         if attrs is not None:
             if sharded_axes is not None:
@@ -192,36 +191,43 @@ class StateManager:
         if scheduler_state is not None and scheduler is not None:
             scheduler.load_state_dict(scheduler_state)
 
-    def _export_param_states(self) -> list[ParamState]:
+    def _export_param_states(self, names: list[str] | None = None) -> list[ParamState]:
+        names = list(self.param_states) if names is None else names
         return [
             ParamState(
-                state_key=state.state_key,
-                logical_names=list(state.logical_names),
-                logical_shapes=list(state.logical_shapes),
-                physical_shape=tuple(state.physical_shape),
-                dtype=state.dtype,
-                annotations=dict(state.annotations),
+                state_key=self.param_states[name].state_key,
+                logical_names=list(self.param_states[name].logical_names),
+                logical_shapes=list(self.param_states[name].logical_shapes),
+                physical_shape=tuple(self.param_states[name].physical_shape),
+                dtype=self.param_states[name].dtype,
+                source_rank=self.param_states[name].source_rank,
             )
-            for state in self.param_states.values()
+            for name in names
         ]
 
     def export_model_state(self) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
         runtime = self.runtime
+        rank = dist.get_rank() if dist.is_initialized() else 0
         for plugin in runtime.plugins:
             override_state = plugin.override_param_state_dict()
             if override_state is not None:
                 state, entries = override_state
                 break
         else:
-            state = {}
             entries = self._export_param_states()
-            for name in self.param_states:
-                param = self.get_param_tensor(name)
-                state[name] = param.detach().cpu().clone()
+            state = {}
+            for entry in entries:
+                if entry.source_rank is None:
+                    raise RuntimeError(f"checkpoint source rank not resolved for param={entry.state_key}")
+                if entry.source_rank != rank:
+                    continue
+                param = self.get_param_tensor(entry.state_key)
+                state[entry.state_key] = param.detach().cpu().clone()
 
         for entry in entries:
-            for plugin in runtime.plugins:
-                plugin.annotate_checkpoint_state(entry)
+            if entry.source_rank is None:
+                entry.source_rank = rank
+
         return state, entries
 
     def import_model_state(self, model_state: dict[str, torch.Tensor]) -> None:

@@ -1,4 +1,4 @@
-"""Manifest test for TP checkpoint annotations."""
+"""Manifest test for TP checkpoint logical shape metadata."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from distributed_test_utils import configure_process_group_env
 from models import TinyTransformerTp
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _run_worker(rank: int, args: argparse.Namespace) -> None:
+    configure_process_group_env()
     dist.init_process_group(
         backend=args.backend,
         init_method=f"tcp://{args.master_addr}:{args.master_port}",
@@ -71,10 +73,8 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         o_proj = entries["layers.0.attn.o_proj.weight"]
         assert q_proj["physical_shape"] == [32, 64]
         assert q_proj["logical_shapes"] == [[64, 64]]
-        assert q_proj["annotations"]["tp"]["shards"][0]["axis"] == "param_out"
         assert o_proj["physical_shape"] == [64, 32]
         assert o_proj["logical_shapes"] == [[64, 64]]
-        assert o_proj["annotations"]["tp"]["shards"][0]["axis"] == "param_in"
         print("PASS")
 
     dist.destroy_process_group()

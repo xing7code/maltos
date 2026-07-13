@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import os
+import socket
 from typing import Any, Protocol
 
 import torch
@@ -9,6 +11,22 @@ import torch.distributed as dist
 from parallel.specs import TpSpShardAxis
 from runtime import MeshAxis, RuntimeCore
 from runtime.plugins.ep import _ExpertParallelMoE
+
+
+def _configure_default_gloo_socket_ifname() -> None:
+    if "GLOO_SOCKET_IFNAME" in os.environ:
+        return
+    for _, ifname in socket.if_nameindex():
+        if ifname == "lo" or ifname.startswith("lo"):
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", ifname)
+            return
+
+
+_configure_default_gloo_socket_ifname()
+
+
+def configure_process_group_env() -> None:
+    _configure_default_gloo_socket_ifname()
 
 
 class _TpSpSpecModel(Protocol):

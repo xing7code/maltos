@@ -82,6 +82,7 @@ class RuntimeCore:
         self.state_manager.register_module(self.model)
         for plugin in self.plugins:
             plugin.annotate_param_metadata()
+        self._resolve_param_checkpoint_metadata()
         self._populate_static_model_metrics()
         self._setup_optimizer_and_scheduler()
         self._step_runner = self._resolve_step_runner()
@@ -187,6 +188,22 @@ class RuntimeCore:
         if factor < 1:
             raise ValueError(f"invalid grad_norm_replica_factor={factor} for param={fq_name}")
         return factor
+
+    def param_checkpoint_rank(self, fq_name: str, *, rank_id: int) -> int:
+        attrs = self.state_manager.get_param_attrs(fq_name)
+        return self.mesh.infer_checkpoint_rank(
+            rank_id,
+            plan=self.plan,
+            replicated_axes=attrs.replicated_axes,
+        )
+
+    def _resolve_param_checkpoint_metadata(self) -> None:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        for fq_name in self.state_manager.param_states:
+            self.state_manager.update_param_state(
+                fq_name,
+                source_rank=self.param_checkpoint_rank(fq_name, rank_id=rank),
+            )
 
     # -------------------------------------
     # Optimizer / scheduler methods: begin

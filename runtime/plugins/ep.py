@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn.functional as dist_nn
+import torch.distributed._functional_collectives as funcol
 import torch.nn as nn
 
 from parallel.expert_interfaces import ExpertParallelMoEModule
@@ -127,22 +127,19 @@ class _ExpertParallelMoE(nn.Module):
         recv_weights = torch.empty((recv_total,), dtype=expert_weight.dtype, device=flat.device)
         recv_local_expert_idx = torch.empty((recv_total,), dtype=torch.int64, device=flat.device)
 
-        recv_tokens = dist_nn.all_to_all_single(
-            recv_tokens,
+        recv_tokens = funcol.all_to_all_single(
             send_tokens,
             output_split_sizes=recv_split_sizes,
             input_split_sizes=send_split_sizes,
             group=self.ep_group,
         )
-        recv_weights = dist_nn.all_to_all_single(
-            recv_weights,
+        recv_weights = funcol.all_to_all_single(
             send_weights,
             output_split_sizes=recv_split_sizes,
             input_split_sizes=send_split_sizes,
             group=self.ep_group,
         )
-        recv_local_expert_idx = dist_nn.all_to_all_single(
-            recv_local_expert_idx,
+        recv_local_expert_idx = funcol.all_to_all_single(
             send_local_expert_idx,
             output_split_sizes=recv_split_sizes,
             input_split_sizes=send_split_sizes,
@@ -158,8 +155,7 @@ class _ExpertParallelMoE(nn.Module):
             recv_outputs[mask] = expert_out.to(recv_outputs.dtype)
 
         returned_outputs = torch.empty_like(send_tokens)
-        returned_outputs = dist_nn.all_to_all_single(
-            returned_outputs,
+        returned_outputs = funcol.all_to_all_single(
             recv_outputs,
             output_split_sizes=send_split_sizes,
             input_split_sizes=recv_split_sizes,

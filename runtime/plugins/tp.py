@@ -7,9 +7,6 @@ from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
 from runtime.types import ParamRole, RuntimePhase
 from runtime.layers.tp import ColumnParallelLinear, RowParallelLinear
-from state.state import ParamState
-
-
 class TensorParallelPlugin(RuntimePlugin):
     """Draft TP plugin that cooperates with RuntimeCore instead of driving execution."""
 
@@ -17,6 +14,7 @@ class TensorParallelPlugin(RuntimePlugin):
         super().__init__(id=PluginId.TP, name="tensor_parallel")
         self._param_shard_axis: dict[str, TpSpShardAxis] = {}
         self._logical_shapes: dict[str, tuple[int, ...]] = {}
+        self._tp_replicated_params: set[str] = set()
 
     @property
     def tp_group(self):
@@ -55,46 +53,17 @@ class TensorParallelPlugin(RuntimePlugin):
         self.runtime.add_module_replacement(nn.Linear, RowParallelLinear)
         return model
 
-    def annotate_checkpoint_state(self, entry: ParamState) -> None:
-        group = self.tp_group
-        if group is None:
-            return
-        import torch.distributed as dist
-
-        rank = dist.get_rank(group)
-        world_size = dist.get_world_size(group)
-        tp_shards = []
-        for index, logical_name in enumerate(entry.logical_names):
-            shard_axis = self._param_shard_axis.get(logical_name)
-            if shard_axis is None:
-                continue
-            logical_shape = self._logical_shapes[logical_name]
-            entry.logical_shapes[index] = logical_shape
-            shard_dim = 0 if shard_axis == TpSpShardAxis.PARAM_OUT else 1
-            tp_shard = {
-                "logical_name": logical_name,
-                "axis": shard_axis.value,
-                "rank": rank,
-                "world_size": world_size,
-                "shard_dim": shard_dim,
-                "logical_shape": logical_shape,
-            }
-            if len(entry.logical_names) == 1 and len(entry.physical_shape) == len(logical_shape):
-                local_extent = entry.physical_shape[shard_dim]
-                tp_shard["shard_offset"] = rank * local_extent
-                tp_shard["shard_extent"] = local_extent
-            tp_shards.append(tp_shard)
-        if tp_shards:
-            entry.set_plugin_annotation(self.id.value, {"shards": tp_shards})
-
     def _record_linear_rule(self, module_path: str, module: nn.Linear, shard_axis: TpSpShardAxis) -> None:
         weight_name = f"{module_path}.weight"
         self._param_shard_axis[weight_name] = shard_axis
         self._logical_shapes[weight_name] = tuple(module.weight.shape)
         if module.bias is not None:
             bias_name = f"{module_path}.bias"
-            self._param_shard_axis[bias_name] = shard_axis
             self._logical_shapes[bias_name] = tuple(module.bias.shape)
+            if shard_axis == TpSpShardAxis.PARAM_OUT:
+                self._param_shard_axis[bias_name] = shard_axis
+            else:
+                self._tp_replicated_params.add(bias_name)
 
     def annotate_param_metadata(self) -> None:
         assert self.runtime is not None
@@ -118,7 +87,7 @@ class TensorParallelPlugin(RuntimePlugin):
                     sharded_axes=attrs.sharded_axes | {MeshAxis.TP},
                 )
                 continue
-            if self.runtime.get_param_role(param) == ParamRole.SHARED:
+            if fq_name in self._tp_replicated_params or self.runtime.get_param_role(param) == ParamRole.SHARED:
                 attrs = self.runtime.state_manager.get_param_attrs(fq_name)
                 self.runtime.state_manager.update_param_state(
                     fq_name,

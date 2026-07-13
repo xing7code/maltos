@@ -106,6 +106,42 @@ def test_duplicate_artifact_fails() -> None:
     )
 
 
+def test_missing_model_source_rank_fails() -> None:
+    checkpoint_dir, _ = _save_base_checkpoint()
+    manifest = _load_manifest(checkpoint_dir)
+    manifest["ranks"][0]["entries"][0]["source_rank"] = None
+    _write_manifest(checkpoint_dir, manifest)
+
+    _expect_value_error(
+        lambda: load_sharded_checkpoint(_build_core().state_manager, checkpoint_dir),
+        "manifest missing model source rank",
+    )
+
+
+def test_model_source_rank_out_of_range_fails() -> None:
+    checkpoint_dir, _ = _save_base_checkpoint()
+    manifest = _load_manifest(checkpoint_dir)
+    manifest["ranks"][0]["entries"][0]["source_rank"] = manifest["world_size"]
+    _write_manifest(checkpoint_dir, manifest)
+
+    _expect_value_error(
+        lambda: load_sharded_checkpoint(_build_core().state_manager, checkpoint_dir),
+        "manifest model source rank out of range",
+    )
+
+
+def test_missing_model_entry_in_source_artifact_fails() -> None:
+    checkpoint_dir, _ = _save_base_checkpoint()
+    manifest = _load_manifest(checkpoint_dir)
+    manifest["ranks"][0]["entries"][0]["state_key"] = "__missing_entry__"
+    _write_manifest(checkpoint_dir, manifest)
+
+    _expect_value_error(
+        lambda: load_sharded_checkpoint(_build_core().state_manager, checkpoint_dir),
+        "model state missing entry=__missing_entry__",
+    )
+
+
 def test_eval_only_manifest_load_succeeds() -> None:
     checkpoint_dir, saved_core = _save_base_checkpoint()
     manifest = _load_manifest(checkpoint_dir)
@@ -144,6 +180,9 @@ def main() -> None:
     test_world_size_mismatch_fails()
     test_optimizer_source_mapping_mismatch_fails()
     test_duplicate_artifact_fails()
+    test_missing_model_source_rank_fails()
+    test_model_source_rank_out_of_range_fails()
+    test_missing_model_entry_in_source_artifact_fails()
     test_eval_only_manifest_load_succeeds()
     test_microbatch_idx_roundtrip_succeeds()
     print("PASS")

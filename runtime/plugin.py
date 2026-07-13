@@ -13,8 +13,6 @@ from parallel.protocols import (
     PipelineParallelizableModule,
     TpSpParallelizableModule,
 )
-from state.state import ParamState
-
 if TYPE_CHECKING:
     from runtime.core import RuntimeCore
     from runtime.step_runners import StepRunner
@@ -88,9 +86,6 @@ class RuntimePlugin:
 
     def load_param_state_dict(self, state: dict[str, torch.Tensor]) -> bool:
         return False
-
-    def annotate_checkpoint_state(self, entry: ParamState) -> None:
-        pass
 
     def export_plugin_state(self) -> dict[str, object]:
         return {}
