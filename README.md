@@ -307,7 +307,13 @@ PYTHONPATH=. .venv/bin/python tools/prepare_token_shards.py \
 Or use:
 
 ```bash
-bash tools/data.sh
+bash tools/pretrain_data.sh
+```
+
+For SFT shard prep, use the preset wrapper:
+
+```bash
+sh tools/sft_data.sh olmo
 ```
 
 ## Pretraining CLI
