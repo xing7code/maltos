@@ -21,6 +21,7 @@ from distributed_test_utils import (
     rule_by_param_name as _rule_by_param_name,
     supports_bf16_autocast as _supports_bf16_autocast,
 )
+from attention_backend_utils import add_attention_backend_arg, resolve_attention_backend
 from helpers import causal_lm_batch, packed_causal_lm_batch
 from models import TinyMoETransformer, TinyMoETransformerTpSp
 from models.tiny_transformer import RmsNorm
@@ -76,14 +77,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-precision", action="store_true")
     parser.add_argument("--disable-grad-clip", action="store_true")
     parser.add_argument("--packed-batch", action="store_true")
+    add_attention_backend_arg(parser)
     return parser.parse_args()
 
 def _build_reference(
-    seed: int, batch_size: int, seq_len: int,
+    seed: int,
+    batch_size: int,
+    seq_len: int,
+    attention_backend: str,
 ) -> tuple[TinyMoETransformer, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     return (
-        TinyMoETransformer(**_MODEL_KWARGS),
+        TinyMoETransformer(**_MODEL_KWARGS, attention_backend=attention_backend),
         torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len)),
         torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len)),
     )
@@ -182,9 +187,14 @@ def _compare_params(
 
 
 def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device | None) -> None:
-    reference_model, tokens_a, tokens_b = _build_reference(args.seed, args.global_batch_size, args.seq_len)
+    reference_model, tokens_a, tokens_b = _build_reference(
+        args.seed,
+        args.global_batch_size,
+        args.seq_len,
+        args.resolved_attention_backend,
+    )
 
-    cont_model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
+    cont_model = TinyMoETransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend)
     cont_model.load_state_dict(reference_model.state_dict())
     cont_core, cont_zero = _build_runtime(cont_model, args, device)
     rest_core: RuntimeCore | None = None
@@ -209,7 +219,7 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
         cont_core.step_optimizer()
         dist.barrier()
 
-        rest_model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
+        rest_model = TinyMoETransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend)
         rest_model.load_state_dict(reference_model.state_dict())
         rest_core, rest_zero = _build_runtime(rest_model, args, device)
         load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
@@ -246,9 +256,14 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
 
 
 def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.device | None) -> None:
-    reference_model, tokens_a, tokens_b = _build_reference(args.seed, args.global_batch_size, args.seq_len)
+    reference_model, tokens_a, tokens_b = _build_reference(
+        args.seed,
+        args.global_batch_size,
+        args.seq_len,
+        args.resolved_attention_backend,
+    )
 
-    cont_model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
+    cont_model = TinyMoETransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend)
     cont_model.load_state_dict(reference_model.state_dict())
     cont_core, cont_zero = _build_runtime(cont_model, args, device)
     rest_core: RuntimeCore | None = None
@@ -276,7 +291,7 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
             raise AssertionError("EP midstep: step B boundary should step optimizer")
         cont_core.step_optimizer()
 
-        rest_model = TinyMoETransformerTpSp(**_MODEL_KWARGS)
+        rest_model = TinyMoETransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend)
         rest_model.load_state_dict(reference_model.state_dict())
         rest_core, rest_zero = _build_runtime(rest_model, args, device)
         load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
@@ -335,6 +350,13 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = None) -> None:
     _validate_args(args)
+    args.resolved_attention_backend = resolve_attention_backend(
+        args.attention_backend,
+        dist_backend=args.backend,
+        device=device,
+        require_dense_block=args.cp_size > 1 and args.cp_attn_core == "ring",
+        allow_flash=not (args.packed_batch and args.cp_size > 1 and args.cp_attn_core == "ring"),
+    )
     if not _supports_bf16_autocast():
         if rank == 0:
             print("SKIP: bf16 autocast is not supported on this runtime")

@@ -9,7 +9,7 @@ from parallel.specs import ContextParallelSpec
 from parallel.specs import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from utils.attention_backend import AttentionBackend, causal_attention, validate_attention_backend
-from utils.attention_masking import canonical_position_ids, canonical_sequence_ids
+from runtime.layers.attn_masking_utils import canonical_position_ids, canonical_sequence_ids
 from utils.constants import (
     HIDDEN_STATES_KEY,
     IGNORE_INDEX,

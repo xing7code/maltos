@@ -35,6 +35,7 @@ from distributed_test_utils import (
     normalize_param_name as _normalize_param_name,
     rule_by_param_name as _rule_by_param_name,
 )
+from attention_backend_utils import add_attention_backend_arg, resolve_attention_backend
 from helpers import causal_lm_batch, packed_causal_lm_batch
 from models import TinyTransformer, TinyTransformerTpSp
 from models.tiny_transformer import RmsNorm
@@ -87,14 +88,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--packed-batch", action="store_true")
+    add_attention_backend_arg(parser)
 
     return parser.parse_args()
 
 
-def _build_reference(seed: int, batch_size: int, seq_len: int) -> tuple[TinyTransformer, torch.Tensor]:
+def _build_reference(seed: int, batch_size: int, seq_len: int, attention_backend: str) -> tuple[TinyTransformer, torch.Tensor]:
     torch.manual_seed(seed)
     tokens = torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len))
-    model = TinyTransformer(**_MODEL_KWARGS)
+    model = TinyTransformer(**_MODEL_KWARGS, attention_backend=attention_backend)
     return model, tokens
 
 def _find_zero_plugin(core: RuntimeCore) -> Zero1Plugin | Zero2Plugin | Zero3Plugin | None:
@@ -115,7 +117,7 @@ def _make_zero_plugin(args: argparse.Namespace) -> Zero1Plugin | Zero2Plugin | Z
 
 
 def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
-    model = TinyTransformerTpSp(**_MODEL_KWARGS)
+    model = TinyTransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend)
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
@@ -138,7 +140,7 @@ def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespa
 
 
 def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
-    model = TinyTransformerTpSp(**_MODEL_KWARGS)
+    model = TinyTransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend)
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
@@ -180,7 +182,14 @@ def _make_batch(input_ids: torch.Tensor, args: argparse.Namespace) -> tuple[torc
 
 def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = None) -> None:
     _validate_args(args)
-    reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
+    args.resolved_attention_backend = resolve_attention_backend(
+        args.attention_backend,
+        dist_backend=args.backend,
+        device=device,
+        require_dense_block=args.cp_size > 1 and args.cp_attn_core == "ring",
+        allow_flash=not (args.packed_batch and args.cp_size > 1 and args.cp_attn_core == "ring"),
+    )
+    reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len, args.resolved_attention_backend)
 
     baseline_core = _make_baseline_core(reference_model, args, device)
     baseline_core.setup()

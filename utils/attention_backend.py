@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from absl import logging
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from utils.attention_masking import build_example_causal_mask
-from utils.flash_attention import (
+from runtime.layers.attn_masking_utils import build_example_causal_mask
+from runtime.layers.flash_utils import (
     flash_attn_dense,
     flash_attn_fallback_reason,
     flash_attn_varlen,

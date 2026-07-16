@@ -169,6 +169,19 @@ def _with_packed_batch(case: MatrixCase) -> MatrixCase:
     )
 
 
+def _with_cuda_attention_backend(case: MatrixCase) -> MatrixCase:
+    if case.args.get("backend") != "nccl" or int(case.args.get("cp_size", 1)) <= 1:
+        return case
+    args = dict(case.args)
+    args.setdefault("attention_backend", "auto")
+    return MatrixCase(
+        name=case.name,
+        module_key=case.module_key,
+        args=args,
+        needs_checkpoint_dir=case.needs_checkpoint_dir,
+    )
+
+
 def build_full_stack_matrix_cases(
     *,
     backend: str,
@@ -537,4 +550,4 @@ def build_full_stack_matrix_cases(
         cases = cases[:max_cases]
     if not cases:
         raise ValueError("no matrix cases selected")
-    return [_with_packed_batch(case) for case in cases]
+    return [_with_packed_batch(_with_cuda_attention_backend(case)) for case in cases]

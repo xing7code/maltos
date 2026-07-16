@@ -20,6 +20,7 @@ from models import (
     TinyMoETransformer,
     TinyTransformer,
 )
+from attention_backend_utils import resolve_attention_backend
 from parallel import ParallelPlan
 from parallel.specs import TpSpShardAxis
 from runtime import DefaultStepRunner, MeshConfig, ParamRole, PluginId, RuntimeCore, RuntimePhase
@@ -742,6 +743,7 @@ def test_llama_sdpa_auto_matches_eager_attention() -> None:
 
 def test_llama_flash_attn_backend_matches_eager_attention_for_packed_batch() -> None:
     torch.manual_seed(4321)
+    attention_backend = resolve_attention_backend("auto")
     base_config = dict(
         vocab_size=32,
         hidden_size=16,
@@ -751,7 +753,7 @@ def test_llama_flash_attn_backend_matches_eager_attention_for_packed_batch() -> 
         num_key_value_heads=4,
         max_position_embeddings=8,
     )
-    flash = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend=AttentionBackend.FLASH_ATTN))
+    flash = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend=attention_backend))
     eager = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend=AttentionBackend.EAGER))
     eager.load_state_dict(flash.state_dict())
     flash.eval()
@@ -803,6 +805,7 @@ def _packed_test_batch() -> dict[str, torch.Tensor]:
 
 def test_tiny_flash_attn_backend_matches_eager_attention_for_packed_batch() -> None:
     torch.manual_seed(2468)
+    attention_backend = resolve_attention_backend("auto")
     common_kwargs = dict(
         dim=16,
         n_heads=4,
@@ -813,7 +816,7 @@ def test_tiny_flash_attn_backend_matches_eager_attention_for_packed_batch() -> N
         vocab_size=32,
         max_seq_len=8,
     )
-    flash = TinyTransformer(**common_kwargs, attention_backend=AttentionBackend.FLASH_ATTN)
+    flash = TinyTransformer(**common_kwargs, attention_backend=attention_backend)
     eager = TinyTransformer(**common_kwargs, attention_backend=AttentionBackend.EAGER)
     eager.load_state_dict(flash.state_dict())
     flash.eval()
@@ -829,6 +832,7 @@ def test_tiny_flash_attn_backend_matches_eager_attention_for_packed_batch() -> N
 
 def test_tiny_moe_flash_attn_backend_matches_eager_attention_for_packed_batch() -> None:
     torch.manual_seed(8642)
+    attention_backend = resolve_attention_backend("auto")
     common_kwargs = dict(
         dim=16,
         n_heads=4,
@@ -840,7 +844,7 @@ def test_tiny_moe_flash_attn_backend_matches_eager_attention_for_packed_batch() 
         max_seq_len=8,
         num_experts=4,
     )
-    flash = TinyMoETransformer(**common_kwargs, attention_backend=AttentionBackend.FLASH_ATTN)
+    flash = TinyMoETransformer(**common_kwargs, attention_backend=attention_backend)
     eager = TinyMoETransformer(**common_kwargs, attention_backend=AttentionBackend.EAGER)
     eager.load_state_dict(flash.state_dict())
     flash.eval()
