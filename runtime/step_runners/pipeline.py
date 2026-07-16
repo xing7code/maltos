@@ -7,6 +7,15 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from utils.constants import (
+    HIDDEN_STATES_KEY,
+    INPUT_IDS_KEY,
+    LABELS_KEY,
+    LOSS_WEIGHT_KEY,
+    POSITION_IDS_KEY,
+    POSITION_OFFSET_KEY,
+    SEQUENCE_IDS_KEY,
+)
 
 from runtime.buffer_allocator import allocate_buffer
 from runtime.step_runners.base import DefaultStepRunner
@@ -162,15 +171,17 @@ class PipelineStepRunner:
             input_activation, recv_work = self.recv_activation_async(runtime, micro_batch)
             recv_work.wait()
             input_activation.requires_grad_(True)
-            model_input = {"hidden_states": input_activation}
-            if isinstance(micro_batch, dict) and "position_offset" in micro_batch:
-                model_input["position_offset"] = micro_batch["position_offset"]
-            if isinstance(micro_batch, dict) and "position_ids" in micro_batch:
-                model_input["position_ids"] = micro_batch["position_ids"]
+            model_input = {HIDDEN_STATES_KEY: input_activation}
+            if isinstance(micro_batch, dict) and POSITION_OFFSET_KEY in micro_batch:
+                model_input[POSITION_OFFSET_KEY] = micro_batch[POSITION_OFFSET_KEY]
+            if isinstance(micro_batch, dict) and POSITION_IDS_KEY in micro_batch:
+                model_input[POSITION_IDS_KEY] = micro_batch[POSITION_IDS_KEY]
+            if isinstance(micro_batch, dict) and SEQUENCE_IDS_KEY in micro_batch:
+                model_input[SEQUENCE_IDS_KEY] = micro_batch[SEQUENCE_IDS_KEY]
             if self.plugin.next_global_rank is None:
-                model_input["labels"] = extract_labels(micro_batch)
-                if isinstance(micro_batch, dict) and "loss_weight" in micro_batch:
-                    model_input["loss_weight"] = micro_batch["loss_weight"]
+                model_input[LABELS_KEY] = extract_labels(micro_batch)
+                if isinstance(micro_batch, dict) and LOSS_WEIGHT_KEY in micro_batch:
+                    model_input[LOSS_WEIGHT_KEY] = micro_batch[LOSS_WEIGHT_KEY]
 
         DefaultStepRunner.run_forward(runtime, model_input)
         state.input_activation = input_activation
@@ -301,7 +312,7 @@ def split_batch(batch, num_microbatches: int):
 
 def batch_size(batch) -> int:
     if isinstance(batch, dict):
-        input_ids = batch.get("input_ids")
+        input_ids = batch.get(INPUT_IDS_KEY)
         if torch.is_tensor(input_ids):
             return int(input_ids.size(0))
     if isinstance(batch, (tuple, list)) and batch and torch.is_tensor(batch[0]):
@@ -334,7 +345,7 @@ def slice_batch_item(value, start: int, length: int):
 
 def unpack_batch(batch) -> tuple[torch.Tensor, torch.Tensor | None]:
     if isinstance(batch, dict):
-        return batch["input_ids"], batch.get("labels")
+        return batch[INPUT_IDS_KEY], batch.get(LABELS_KEY)
     if isinstance(batch, (tuple, list)):
         if len(batch) != 2:
             raise ValueError(f"expected (input_ids, labels) batch tuple, got len={len(batch)}")
@@ -390,4 +401,3 @@ def cast_boundary_activation(tensor: torch.Tensor, runtime) -> torch.Tensor:
     if tensor.dtype == target_dtype:
         return tensor
     return tensor.to(dtype=target_dtype)
-

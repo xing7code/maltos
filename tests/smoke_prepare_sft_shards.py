@@ -13,7 +13,8 @@ from utils.sft_messages import (
     has_supervised_assistant_turn,
     messages_from_prompt_completion,
 )
-from utils.sft_packing import IGNORE_INDEX, PAD_SEQUENCE_ID, PackedSFTWriter, export_packing_metadata
+from utils.constants import IGNORE_INDEX, INPUT_IDS_KEY, LABELS_KEY, PAD_SEQUENCE_ID, SEQUENCE_IDS_KEY
+from utils.sft_packing import PackedSFTWriter, export_packing_metadata
 
 
 class FakeChatTokenizer:
@@ -314,13 +315,13 @@ def test_export_packing_metadata_is_structured() -> None:
         )
 
         assert metadata["layout"]["seq_len"] == 8
-        assert metadata["layout"]["fields"]["labels"]["ignore_index"] == IGNORE_INDEX
-        assert metadata["layout"]["fields"]["sequence_ids"]["pad_sequence_id"] == PAD_SEQUENCE_ID
+        assert metadata["layout"]["fields"][LABELS_KEY]["ignore_index"] == IGNORE_INDEX
+        assert metadata["layout"]["fields"][SEQUENCE_IDS_KEY]["pad_sequence_id"] == PAD_SEQUENCE_ID
         assert metadata["strategy"]["algorithm"] == "best_fit_decreasing"
         assert metadata["strategy"]["name"] == "example_aware_windowed_best_fit_decreasing"
         assert metadata["stats"]["packed_sequences"] == 1
         assert metadata["stats"]["num_shards"] == 1
-        assert metadata["shards"][0]["fields"]["input_ids"]["shape"] == [1, 8]
+        assert metadata["shards"][0]["fields"][INPUT_IDS_KEY]["shape"] == [1, 8]
 
 
 def main() -> None:

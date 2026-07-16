@@ -16,6 +16,7 @@ from runtime.plugin import FlopsEstimatableModule, PluginId, RuntimePlugin
 from runtime.step_runners import DefaultStepRunner
 from runtime.types import MetricValue, ParamRole, RuntimePhase, RuntimeState, StepContext
 from state.state import StateManager
+from utils.constants import INPUT_IDS_KEY
 
 if TYPE_CHECKING:
     from runtime.step_runners import StepRunner
@@ -403,7 +404,7 @@ class RuntimeCore:
 
 def _count_batch_tokens(batch: Any) -> int | None:
     if isinstance(batch, dict):
-        input_ids = batch.get("input_ids")
+        input_ids = batch.get(INPUT_IDS_KEY)
         if torch.is_tensor(input_ids):
             return int(input_ids.numel())
     if isinstance(batch, (tuple, list)) and batch and torch.is_tensor(batch[0]):

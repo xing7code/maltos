@@ -19,6 +19,16 @@ from runtime.mesh import MeshAxis
 from runtime.plugin import ContextParallelizableModule, PluginId, RuntimePlugin
 from runtime.plugins.zero_common import ChainedWork
 from runtime.types import ParamRole, RuntimePhase
+from utils.constants import (
+    HIDDEN_STATES_KEY,
+    IGNORE_INDEX,
+    INPUT_IDS_KEY,
+    LABELS_KEY,
+    LOSS_WEIGHT_KEY,
+    POSITION_IDS_KEY,
+    POSITION_OFFSET_KEY,
+    SEQUENCE_IDS_KEY,
+)
 
 
 class ContextParallelPlugin(RuntimePlugin):
@@ -249,47 +259,47 @@ def _shard_batch_for_cp(
     )
     if isinstance(batch, dict):
         sharded = dict(batch)
-        for key in ("input_ids", "labels", "hidden_states", "position_ids"):
+        for key in (INPUT_IDS_KEY, LABELS_KEY, HIDDEN_STATES_KEY, POSITION_IDS_KEY, SEQUENCE_IDS_KEY):
             value = sharded.get(key)
             sharded[key] = _shard_batch_item(value, local_positions, seq_len)
-        sharded["position_ids"] = _materialize_position_ids(
-            sharded.get("position_ids"),
+        sharded[POSITION_IDS_KEY] = _materialize_position_ids(
+            sharded.get(POSITION_IDS_KEY),
             positions=local_positions,
             seq_len=seq_len,
             reference=_batch_reference_tensor(sharded),
         )
-        sharded["position_offset"] = int(local_positions[0].item())
-        sharded["loss_weight"] = _loss_weight(batch.get("labels"), sharded.get("labels"))
+        sharded[POSITION_OFFSET_KEY] = int(local_positions[0].item())
+        sharded[LOSS_WEIGHT_KEY] = _loss_weight(batch.get(LABELS_KEY), sharded.get(LABELS_KEY))
         return sharded
     if isinstance(batch, tuple):
         input_ids = _shard_batch_item(batch[0], local_positions, seq_len) if len(batch) > 0 else None
         labels = _shard_batch_item(batch[1], local_positions, seq_len) if len(batch) > 1 else None
         return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "position_ids": _materialize_position_ids(
+            INPUT_IDS_KEY: input_ids,
+            LABELS_KEY: labels,
+            POSITION_IDS_KEY: _materialize_position_ids(
                 None,
                 positions=local_positions,
                 seq_len=seq_len,
                 reference=input_ids if torch.is_tensor(input_ids) else labels,
             ),
-            "position_offset": int(local_positions[0].item()),
-            "loss_weight": _loss_weight(batch[1] if len(batch) > 1 else None, labels),
+            POSITION_OFFSET_KEY: int(local_positions[0].item()),
+            LOSS_WEIGHT_KEY: _loss_weight(batch[1] if len(batch) > 1 else None, labels),
         }
     if isinstance(batch, list):
         input_ids = _shard_batch_item(batch[0], local_positions, seq_len) if len(batch) > 0 else None
         labels = _shard_batch_item(batch[1], local_positions, seq_len) if len(batch) > 1 else None
         return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "position_ids": _materialize_position_ids(
+            INPUT_IDS_KEY: input_ids,
+            LABELS_KEY: labels,
+            POSITION_IDS_KEY: _materialize_position_ids(
                 None,
                 positions=local_positions,
                 seq_len=seq_len,
                 reference=input_ids if torch.is_tensor(input_ids) else labels,
             ),
-            "position_offset": int(local_positions[0].item()),
-            "loss_weight": _loss_weight(batch[1] if len(batch) > 1 else None, labels),
+            POSITION_OFFSET_KEY: int(local_positions[0].item()),
+            LOSS_WEIGHT_KEY: _loss_weight(batch[1] if len(batch) > 1 else None, labels),
         }
     raise TypeError(f"ContextParallelPlugin v0 does not support batch type={type(batch).__name__}")
 
@@ -303,11 +313,11 @@ def _infer_seq_len(batch: Any) -> int:
 
 
 def _infer_seq_len_from_dict(batch: dict[str, Any]) -> int:
-    for key in ("input_ids", "labels", "hidden_states"):
+    for key in (INPUT_IDS_KEY, LABELS_KEY, HIDDEN_STATES_KEY, SEQUENCE_IDS_KEY):
         value = batch.get(key)
         if torch.is_tensor(value) and value.dim() >= 2:
             return int(value.size(1))
-    position_ids = batch.get("position_ids")
+    position_ids = batch.get(POSITION_IDS_KEY)
     if torch.is_tensor(position_ids):
         if position_ids.dim() >= 2:
             return int(position_ids.size(1))
@@ -357,7 +367,7 @@ def _local_position_ids(
 
 
 def _batch_reference_tensor(batch: dict[str, Any]) -> torch.Tensor | None:
-    for key in ("input_ids", "labels", "hidden_states"):
+    for key in (INPUT_IDS_KEY, LABELS_KEY, HIDDEN_STATES_KEY, SEQUENCE_IDS_KEY):
         value = batch.get(key)
         if torch.is_tensor(value) and value.dim() >= 2:
             return value
@@ -395,8 +405,8 @@ def _shard_batch_item(value: Any, positions: torch.Tensor, seq_len: int) -> Any:
 def _loss_weight(global_labels: Any, local_labels: Any) -> float | None:
     if not torch.is_tensor(global_labels) or not torch.is_tensor(local_labels):
         return None
-    global_count = int((global_labels != -100).sum().item())
-    local_count = int((local_labels != -100).sum().item())
+    global_count = int((global_labels != IGNORE_INDEX).sum().item())
+    local_count = int((local_labels != IGNORE_INDEX).sum().item())
     if global_count == 0:
         return None
     return local_count / global_count

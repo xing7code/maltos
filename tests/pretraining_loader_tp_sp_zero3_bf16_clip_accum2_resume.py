@@ -28,6 +28,7 @@ from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero3 import Zero3Plugin
 from state import load_sharded_checkpoint, save_sharded_checkpoint
+from utils.constants import INPUT_IDS_KEY, LABELS_KEY
 
 
 _MODEL_KWARGS = dict(
@@ -88,7 +89,7 @@ def _build_loader(seq_len: int, dp_idx: int, dp_size: int, seed: int) -> Pretrai
 
 
 def _batch_tuple(batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    return batch["input_ids"], batch["labels"]
+    return batch[INPUT_IDS_KEY], batch[LABELS_KEY]
 
 def _build_runtime(model: TinyTransformerTpSp, dp_size: int, tp_size: int) -> tuple[RuntimeCore, Zero3Plugin]:
     zero3 = Zero3Plugin(
@@ -159,7 +160,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         cont_loss = cont_loss.detach()
         if should_step:
             continuous_core.step_optimizer()
-        loss_pairs.append((tag, cont_loss, batch["input_ids"].detach().clone()))
+        loss_pairs.append((tag, cont_loss, batch[INPUT_IDS_KEY].detach().clone()))
 
     load_sharded_checkpoint(restored_core.state_manager, args.checkpoint_dir)
     if restored_core.state.step != 0 or restored_core.state.step_context.microbatch_idx != 1:
@@ -174,7 +175,7 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         restored_loss = restored_loss.detach()
         if should_step:
             restored_core.step_optimizer()
-        restored_loss_pairs.append((tag, restored_loss, batch["input_ids"].detach().clone()))
+        restored_loss_pairs.append((tag, restored_loss, batch[INPUT_IDS_KEY].detach().clone()))
 
     dp_group = continuous_core.get_group(MeshAxis.DP)
     reduced_loss_diffs: list[tuple[str, float]] = []

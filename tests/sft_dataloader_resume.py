@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from data.sft import PackedSFTDataset, SFTDataLoader
+from utils.constants import IGNORE_INDEX, INPUT_IDS_KEY, LABELS_KEY, POSITION_IDS_KEY, SEQUENCE_IDS_KEY, SFT_BATCH_KEYS
 from utils.sft_messages import EncodedSFTExample
 from utils.sft_packing import PackedSFTWriter, export_packing_metadata
 
@@ -72,14 +73,14 @@ def test_sft_loader_reads_all_fields() -> None:
         loader = SFTDataLoader(dataset, micro_batch_size=2)
         batch = loader.next_batch()
 
-        assert sorted(batch.keys()) == ["input_ids", "labels", "position_ids", "sequence_ids"]
-        assert batch["input_ids"].shape == (2, 4)
-        assert batch["labels"].shape == (2, 4)
-        assert batch["position_ids"].shape == (2, 4)
-        assert batch["sequence_ids"].shape == (2, 4)
-        assert batch["input_ids"].tolist() == [[10, 11, 12, 13], [20, 21, 22, 23]]
-        assert batch["labels"].tolist() == [[11, 12, 13, -100], [21, 22, 23, -100]]
-        assert batch["position_ids"].tolist() == [[0, 1, 2, 3], [0, 1, 2, 3]]
+        assert sorted(batch.keys()) == sorted(SFT_BATCH_KEYS)
+        assert batch[INPUT_IDS_KEY].shape == (2, 4)
+        assert batch[LABELS_KEY].shape == (2, 4)
+        assert batch[POSITION_IDS_KEY].shape == (2, 4)
+        assert batch[SEQUENCE_IDS_KEY].shape == (2, 4)
+        assert batch[INPUT_IDS_KEY].tolist() == [[10, 11, 12, 13], [20, 21, 22, 23]]
+        assert batch[LABELS_KEY].tolist() == [[11, 12, 13, IGNORE_INDEX], [21, 22, 23, IGNORE_INDEX]]
+        assert batch[POSITION_IDS_KEY].tolist() == [[0, 1, 2, 3], [0, 1, 2, 3]]
 
 
 def test_sft_loader_dp_partition_is_deterministic() -> None:
@@ -90,10 +91,10 @@ def test_sft_loader_dp_partition_is_deterministic() -> None:
         rank0 = SFTDataLoader(dataset, micro_batch_size=1, dp_rank=0, dp_world_size=2)
         rank1 = SFTDataLoader(dataset, micro_batch_size=1, dp_rank=1, dp_world_size=2)
 
-        rank0_first = rank0.next_batch()["input_ids"][0]
-        rank1_first = rank1.next_batch()["input_ids"][0]
-        rank0_second = rank0.next_batch()["input_ids"][0]
-        rank1_second = rank1.next_batch()["input_ids"][0]
+        rank0_first = rank0.next_batch()[INPUT_IDS_KEY][0]
+        rank1_first = rank1.next_batch()[INPUT_IDS_KEY][0]
+        rank0_second = rank0.next_batch()[INPUT_IDS_KEY][0]
+        rank1_second = rank1.next_batch()[INPUT_IDS_KEY][0]
 
         assert rank0_first.tolist() == [10, 11, 12, 13]
         assert rank1_first.tolist() == [20, 21, 22, 23]
@@ -109,7 +110,7 @@ def test_sft_loader_resume_restores_next_batch() -> None:
         continuous = SFTDataLoader(dataset, micro_batch_size=1)
 
         first_batch = continuous.next_batch()
-        assert first_batch["input_ids"][0].tolist() == [10, 11, 12, 13]
+        assert first_batch[INPUT_IDS_KEY][0].tolist() == [10, 11, 12, 13]
         saved_state = continuous.state_dict()
         continuous_second = continuous.next_batch()
 
@@ -117,10 +118,10 @@ def test_sft_loader_resume_restores_next_batch() -> None:
         restored_second = restored.next_batch()
 
         assert restored.state_dict() == continuous.state_dict()
-        assert torch.equal(continuous_second["input_ids"], restored_second["input_ids"])
-        assert torch.equal(continuous_second["labels"], restored_second["labels"])
-        assert torch.equal(continuous_second["position_ids"], restored_second["position_ids"])
-        assert torch.equal(continuous_second["sequence_ids"], restored_second["sequence_ids"])
+        assert torch.equal(continuous_second[INPUT_IDS_KEY], restored_second[INPUT_IDS_KEY])
+        assert torch.equal(continuous_second[LABELS_KEY], restored_second[LABELS_KEY])
+        assert torch.equal(continuous_second[POSITION_IDS_KEY], restored_second[POSITION_IDS_KEY])
+        assert torch.equal(continuous_second[SEQUENCE_IDS_KEY], restored_second[SEQUENCE_IDS_KEY])
 
 
 def main() -> None:

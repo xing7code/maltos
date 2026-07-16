@@ -8,6 +8,7 @@ from parallel.expert_interfaces import ExpertParallelMoEModule
 from parallel.specs import ContextParallelSpec, ExpertParallelSpec, PipelineParallelSpec
 from parallel.specs import TpSpComm, TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from models.tiny_transformer import CausalSelfAttention, RmsNorm, RoPE, MLP
+from utils.constants import HIDDEN_STATES_KEY, IGNORE_INDEX, INPUT_IDS_KEY, LABELS_KEY, LOSS_WEIGHT_KEY, POSITION_IDS_KEY, POSITION_OFFSET_KEY
 
 
 class Top1MoE(nn.Module):
@@ -95,12 +96,12 @@ class TinyMoETransformer(nn.Module):
 
     def forward(self, batch):
         if isinstance(batch, dict):
-            input_ids = batch.get("input_ids")
-            hidden_states = batch.get("hidden_states")
-            labels = batch.get("labels")
-            position_offset = int(batch.get("position_offset", 0))
-            position_ids = batch.get("position_ids")
-            loss_weight = batch.get("loss_weight")
+            input_ids = batch.get(INPUT_IDS_KEY)
+            hidden_states = batch.get(HIDDEN_STATES_KEY)
+            labels = batch.get(LABELS_KEY)
+            position_offset = int(batch.get(POSITION_OFFSET_KEY, 0))
+            position_ids = batch.get(POSITION_IDS_KEY)
+            loss_weight = batch.get(LOSS_WEIGHT_KEY)
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
             hidden_states = None
@@ -140,7 +141,7 @@ class TinyMoETransformer(nn.Module):
         loss = F.cross_entropy(
             logits.contiguous().view(-1, logits.size(-1)),
             labels.contiguous().view(-1),
-            ignore_index=-100,
+            ignore_index=IGNORE_INDEX,
         )
         if loss_weight is not None:
             loss = loss * float(loss_weight)

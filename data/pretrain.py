@@ -7,6 +7,8 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 
+from utils.constants import INPUT_IDS_KEY, LABELS_KEY
+
 
 @dataclass(frozen=True)
 class PretrainingDataState:
@@ -103,8 +105,8 @@ class PretrainingDataLoader:
         tokens = torch.from_numpy(np.stack(samples).astype(np.int64, copy=False))
         self.consumed_tokens += self.micro_batch_size * self.seq_len
         return {
-            "input_ids": tokens[:, :-1].contiguous(),
-            "labels": tokens[:, 1:].contiguous(),
+            INPUT_IDS_KEY: tokens[:, :-1].contiguous(),
+            LABELS_KEY: tokens[:, 1:].contiguous(),
         }
 
     def state_dict(self) -> PretrainingDataState:

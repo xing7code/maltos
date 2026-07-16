@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from utils.constants import INPUT_IDS_KEY, LABELS_KEY, POSITION_IDS_KEY, SEQUENCE_IDS_KEY, SFT_BATCH_KEYS
+
 
 @dataclass(frozen=True)
 class SFTDataState:
@@ -58,8 +60,6 @@ class PackedSFTDataset:
         self.seq_len = int(layout.get("seq_len", payload.get("seq_len", 0)))
         if self.seq_len < 1:
             raise ValueError(f"SFT dataset seq_len must be >= 1, got {self.seq_len}")
-        self.ignore_index = int(_nested_get(layout, ("fields", "labels", "ignore_index"), default=-100))
-        self.pad_sequence_id = int(_nested_get(layout, ("fields", "sequence_ids", "pad_sequence_id"), default=-1))
 
         self.shards: list[_SFTShardArrays] = []
         for shard_payload in shards:
@@ -131,10 +131,10 @@ class PackedSFTDataset:
                 row_offset = 0
         return (
             {
-                "input_ids": inputs,
-                "labels": labels,
-                "position_ids": positions,
-                "sequence_ids": sequences,
+                INPUT_IDS_KEY: inputs,
+                LABELS_KEY: labels,
+                POSITION_IDS_KEY: positions,
+                SEQUENCE_IDS_KEY: sequences,
             },
             shard_idx,
             row_offset,
@@ -145,10 +145,10 @@ class PackedSFTDataset:
         fields = shard_payload.get("fields")
         if not isinstance(fields, dict):
             raise ValueError(f"invalid shard fields for {path}: {type(fields)!r}")
-        input_spec = _parse_field_spec(fields.get("input_ids"))
-        label_spec = _parse_field_spec(fields.get("labels"))
-        position_spec = _parse_field_spec(fields.get("position_ids"))
-        sequence_spec = _parse_field_spec(fields.get("sequence_ids"))
+        input_spec = _parse_field_spec(fields.get(INPUT_IDS_KEY))
+        label_spec = _parse_field_spec(fields.get(LABELS_KEY))
+        position_spec = _parse_field_spec(fields.get(POSITION_IDS_KEY))
+        sequence_spec = _parse_field_spec(fields.get(SEQUENCE_IDS_KEY))
         sequences = int(shard_payload["sequences"])
         return _SFTShardArrays(
             path=path,
@@ -191,19 +191,14 @@ class SFTDataLoader:
             self.load_state_dict(asdict(start_state))
 
     def next_batch(self) -> dict[str, torch.Tensor]:
-        rows: dict[str, list[np.ndarray]] = {
-            "input_ids": [],
-            "labels": [],
-            "position_ids": [],
-            "sequence_ids": [],
-        }
+        rows: dict[str, list[np.ndarray]] = {key: [] for key in SFT_BATCH_KEYS}
         for _ in range(self.micro_batch_size):
             sample, self.shard_idx, self.row_offset = self.dataset.read_rows(
                 self.shard_idx,
                 self.row_offset,
                 1,
             )
-            for key in rows:
+            for key in SFT_BATCH_KEYS:
                 rows[key].append(sample[key][0])
             self.shard_idx, self.row_offset = self.dataset.advance(
                 self.shard_idx,

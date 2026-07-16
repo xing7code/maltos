@@ -39,6 +39,8 @@ echo "=== runtime optimizer checkpoint resume ==="
 echo "=== dataloader checkpoint resume ==="
 "${PYTHON_BIN}" tests/simple_dataloader_checkpoint_resume.py
 "${PYTHON_BIN}" tests/pretraining_dataloader_resume.py
+"${PYTHON_BIN}" tests/sft_dataloader_resume.py
+"${PYTHON_BIN}" tests/sft_runtime_fields.py
 
 echo "=== zero3 checkpoint resume/roundtrip ==="
 "${PYTHON_BIN}" tests/tiny_model_zero3_checkpoint_resume.py

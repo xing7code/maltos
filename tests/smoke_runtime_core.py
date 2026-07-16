@@ -24,6 +24,7 @@ from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.torch_profiler import TorchProfilerPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugin import RuntimePlugin
+from utils.constants import INPUT_IDS_KEY, LABELS_KEY
 
 
 class LossModel(nn.Module):
@@ -689,8 +690,8 @@ def test_llama_activation_checkpointing_train_step() -> None:
         optimizer_factory=_sgd_factory(),
     )
     batch = {
-        "input_ids": torch.randint(0, 32, (2, 8)),
-        "labels": torch.randint(0, 32, (2, 8)),
+        INPUT_IDS_KEY: torch.randint(0, 32, (2, 8)),
+        LABELS_KEY: torch.randint(0, 32, (2, 8)),
     }
 
     core.setup()

@@ -5,14 +5,13 @@ from pathlib import Path
 
 import numpy as np
 
+from utils.constants import IGNORE_INDEX, INPUT_IDS_KEY, LABELS_KEY, PAD_SEQUENCE_ID, POSITION_IDS_KEY, SEQUENCE_IDS_KEY
 from utils.sft_messages import EncodedSFTExample
 
-IGNORE_INDEX = -100
 INPUT_DTYPE = np.uint32
 LABEL_DTYPE = np.int32
 POSITION_DTYPE = np.int32
 SEQUENCE_DTYPE = np.int32
-PAD_SEQUENCE_ID = -1
 
 PACKING_ALGORITHMS = {"next_fit", "best_fit_decreasing"}
 
@@ -47,10 +46,10 @@ class PackedSFTShard:
             "path": self.path,
             "sequences": self.sequences,
             "fields": {
-                "input_ids": self.input_field.to_metadata(),
-                "labels": self.label_field.to_metadata(),
-                "position_ids": self.position_field.to_metadata(),
-                "sequence_ids": self.sequence_field.to_metadata(),
+                INPUT_IDS_KEY: self.input_field.to_metadata(),
+                LABELS_KEY: self.label_field.to_metadata(),
+                POSITION_IDS_KEY: self.position_field.to_metadata(),
+                SEQUENCE_IDS_KEY: self.sequence_field.to_metadata(),
             },
         }
 
@@ -413,10 +412,10 @@ def export_packing_metadata(
             "row_length": seq_len,
             "record_stride": seq_len,
             "fields": {
-                "input_ids": {"dtype": np.dtype(INPUT_DTYPE).name},
-                "labels": {"dtype": np.dtype(LABEL_DTYPE).name, "ignore_index": IGNORE_INDEX},
-                "position_ids": {"dtype": np.dtype(POSITION_DTYPE).name},
-                "sequence_ids": {"dtype": np.dtype(SEQUENCE_DTYPE).name, "pad_sequence_id": PAD_SEQUENCE_ID},
+                INPUT_IDS_KEY: {"dtype": np.dtype(INPUT_DTYPE).name},
+                LABELS_KEY: {"dtype": np.dtype(LABEL_DTYPE).name, "ignore_index": IGNORE_INDEX},
+                POSITION_IDS_KEY: {"dtype": np.dtype(POSITION_DTYPE).name},
+                SEQUENCE_IDS_KEY: {"dtype": np.dtype(SEQUENCE_DTYPE).name, "pad_sequence_id": PAD_SEQUENCE_ID},
             },
         },
         "strategy": {

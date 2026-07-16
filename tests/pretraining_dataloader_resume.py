@@ -12,6 +12,7 @@ from data import PretrainingDataLoader, TokenShardDataset
 from models import TinyTransformer
 from runtime import RuntimeCore
 from state import load_sharded_checkpoint, save_sharded_checkpoint
+from utils.constants import INPUT_IDS_KEY, LABELS_KEY
 
 
 _ATOL = 1e-6
@@ -49,7 +50,7 @@ def _build_core(seed: int) -> RuntimeCore:
 
 
 def _batch_tuple(batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    return batch["input_ids"], batch["labels"]
+    return batch[INPUT_IDS_KEY], batch[LABELS_KEY]
 
 
 def _max_param_diff(lhs: TinyTransformer, rhs: TinyTransformer) -> tuple[str, float]:
@@ -67,8 +68,8 @@ def _max_param_diff(lhs: TinyTransformer, rhs: TinyTransformer) -> tuple[str, fl
 def _assert_dp_stride(dataset: TokenShardDataset, seq_len: int) -> None:
     rank0 = PretrainingDataLoader(dataset, seq_len=seq_len, micro_batch_size=1, dp_rank=0, dp_world_size=2)
     rank1 = PretrainingDataLoader(dataset, seq_len=seq_len, micro_batch_size=1, dp_rank=1, dp_world_size=2)
-    rank0_batch = rank0.next_batch()["input_ids"][0]
-    rank1_batch = rank1.next_batch()["input_ids"][0]
+    rank0_batch = rank0.next_batch()[INPUT_IDS_KEY][0]
+    rank1_batch = rank1.next_batch()[INPUT_IDS_KEY][0]
     expected_rank1 = rank0_batch + (seq_len + 1)
     if not torch.equal(rank1_batch, expected_rank1):
         raise AssertionError("DP token-stream stride produced overlapping or unexpected samples")
@@ -133,7 +134,7 @@ def main() -> None:
     _, should_step = restored_core.run_step(_batch_tuple(restored_second_batch))
     restored_core.step_optimizer()
 
-    batch_diff = (continuous_second_batch["input_ids"] - restored_second_batch["input_ids"]).abs().max().item()
+    batch_diff = (continuous_second_batch[INPUT_IDS_KEY] - restored_second_batch[INPUT_IDS_KEY]).abs().max().item()
     param_name, param_diff = _max_param_diff(continuous_core.model, restored_core.model)
     print(f"Checkpoint dir    : {checkpoint_dir}")
     print(f"Batch diff        : {batch_diff:.2e}")
