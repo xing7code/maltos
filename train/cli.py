@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import sys
 from typing import Any
 
 import numpy as np
@@ -13,7 +14,11 @@ import torch
 import torch.distributed as dist
 import yaml
 
-from data import PretrainingDataLoader, TokenShardDataset
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from data import PackedSFTDataset, PretrainingDataLoader, SFTDataLoader, TokenShardDataset
 from models import (
     ActivationCheckpointConfig,
     LlamaConfig,
@@ -67,9 +72,16 @@ _ZERO3_WRAP_CLS = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LLM pretraining recipe.")
+    parser = argparse.ArgumentParser(description="LLM training recipe.")
     parser.add_argument("--config", type=str, default=None, help="YAML training recipe")
-    parser.add_argument("--data", type=str, nargs="+", default=None, help="Token shard .bin files or directories")
+    parser.add_argument(
+        "--data",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Token shard .bin files or directories, or a packed SFT dataset directory/meta.json",
+    )
+    parser.add_argument("--data-format", type=str, default="auto", choices=("auto", "pretrain", "sft"))
     parser.add_argument("--token-dtype", type=str, default="uint32", choices=("uint16", "uint32", "int64"))
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--micro-batch-size", type=int, default=1)
@@ -119,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=None)
     parser.add_argument("--disable-metrics", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--torch-profiler", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--torch-profiler-dir", type=str, default="traces/pretrain")
+    parser.add_argument("--torch-profiler-dir", type=str, default="traces/train")
     parser.add_argument("--torch-profiler-wait", type=int, default=1)
     parser.add_argument("--torch-profiler-warmup", type=int, default=1)
     parser.add_argument("--torch-profiler-active", type=int, default=3)
@@ -196,17 +208,9 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     dp_rank = rank // (args.pp_size * args.cp_size * args.tp_size)
-    data_paths = _expand_data_paths(args.data)
+    data_paths, loader, data_format = _build_dataloader(args, dp_rank=dp_rank)
     model = _build_model(args)
     initial_trainable_params = _count_trainable_params(model)
-    loader = PretrainingDataLoader(
-        TokenShardDataset(data_paths, dtype=np.dtype(args.token_dtype)),
-        seq_len=args.seq_len,
-        micro_batch_size=args.micro_batch_size,
-        dp_rank=dp_rank,
-        dp_world_size=args.dp_size,
-        seed=args.seed,
-    )
     runtime = _build_runtime(args, model, device)
     logger, checkpoint_uploader = (None, None) if args.dry_run else _build_logging(args, rank)
     trainer = Trainer(
@@ -231,6 +235,7 @@ def main() -> None:
         runtime=runtime,
         initial_trainable_params=initial_trainable_params,
         data_paths=data_paths,
+        data_format=data_format,
         device=device,
         world_size=world_size,
         rank=rank,
@@ -241,6 +246,7 @@ def main() -> None:
             runtime=runtime,
             initial_trainable_params=initial_trainable_params,
             data_paths=data_paths,
+            data_format=data_format,
             device=device,
             world_size=world_size,
             rank=rank,
@@ -585,6 +591,7 @@ def _print_run_summary(
     runtime: RuntimeCore,
     initial_trainable_params: int,
     data_paths: list[Path],
+    data_format: str,
     device: torch.device,
     world_size: int,
     rank: int,
@@ -596,7 +603,7 @@ def _print_run_summary(
     total_train_tokens = global_batch_tokens * args.max_steps
     plugin_names = [plugin.name for plugin in runtime.plugins]
     flops_per_token = runtime.state.static_metrics.get("perf/flops_per_token")
-    print("=== pretrain run ===")
+    print("=== train run ===")
     print(f"config={args.config}")
     print(f"model={args.model} initial_trainable_params={initial_trainable_params:,}")
     print(f"runtime_local_trainable_params={local_trainable_params:,}")
@@ -629,7 +636,7 @@ def _print_run_summary(
         "performance="
         f"flops_per_token={_format_optional_number(flops_per_token)}"
     )
-    print(f"data_shards={len(data_paths)} first_data={data_paths[0]}")
+    print(f"data_format={data_format} data_shards={len(data_paths)} first_data={data_paths[0]}")
     print(
         "logging="
         f"log_every={args.log_every} jsonl={args.metrics_jsonl} "
@@ -659,6 +666,7 @@ def _write_run_manifest(
     runtime: RuntimeCore,
     initial_trainable_params: int,
     data_paths: list[Path],
+    data_format: str,
     device: torch.device,
     world_size: int,
     rank: int,
@@ -672,6 +680,7 @@ def _write_run_manifest(
         runtime=runtime,
         initial_trainable_params=initial_trainable_params,
         data_paths=data_paths,
+        data_format=data_format,
         device=device,
         world_size=world_size,
     )
@@ -686,6 +695,7 @@ def _build_run_manifest(
     runtime: RuntimeCore,
     initial_trainable_params: int,
     data_paths: list[Path],
+    data_format: str,
     device: torch.device,
     world_size: int,
 ) -> dict[str, Any]:
@@ -754,6 +764,7 @@ def _build_run_manifest(
                 "grad_clip": args.grad_clip,
             },
             "data": {
+                "format": data_format,
                 "num_shards": len(data_paths),
                 "paths": [str(path) for path in data_paths],
             },
@@ -842,6 +853,59 @@ def _expand_data_paths(items: list[str]) -> list[Path]:
     if not paths:
         raise ValueError("no token shard paths found")
     return paths
+
+
+def _build_dataloader(args: argparse.Namespace, *, dp_rank: int):
+    data_format = _infer_data_format(args.data, explicit=args.data_format)
+    if data_format == "pretrain":
+        data_paths = _expand_data_paths(args.data)
+        loader = PretrainingDataLoader(
+            TokenShardDataset(data_paths, dtype=np.dtype(args.token_dtype)),
+            seq_len=args.seq_len,
+            micro_batch_size=args.micro_batch_size,
+            dp_rank=dp_rank,
+            dp_world_size=args.dp_size,
+            seed=args.seed,
+        )
+        return data_paths, loader, data_format
+
+    data_source = _resolve_sft_data_source(args.data)
+    dataset = PackedSFTDataset(data_source)
+    if args.seq_len != dataset.seq_len:
+        raise ValueError(
+            f"SFT dataset seq_len={dataset.seq_len} must match --seq-len={args.seq_len}"
+        )
+    loader = SFTDataLoader(
+        dataset,
+        micro_batch_size=args.micro_batch_size,
+        dp_rank=dp_rank,
+        dp_world_size=args.dp_size,
+        seed=args.seed,
+    )
+    return list(dataset.shard_paths), loader, data_format
+
+
+def _infer_data_format(items: list[str], *, explicit: str) -> str:
+    if explicit != "auto":
+        return explicit
+    if len(items) != 1:
+        return "pretrain"
+    candidate = Path(items[0])
+    meta_path = candidate / "meta.json" if candidate.is_dir() else candidate
+    if meta_path.is_file() and meta_path.name == "meta.json":
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "pretrain"
+        if payload.get("format") == "maltos_sft_packed":
+            return "sft"
+    return "pretrain"
+
+
+def _resolve_sft_data_source(items: list[str]) -> Path:
+    if len(items) != 1:
+        raise ValueError("--data-format sft expects a single SFT dataset directory or meta.json path")
+    return Path(items[0])
 
 
 def _maybe_init_distributed(args: argparse.Namespace) -> None:

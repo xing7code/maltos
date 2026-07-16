@@ -35,14 +35,14 @@ Experiment tracking: [W&B report](https://api.wandb.ai/links/xing7-org/f2s88x30)
 - Sharded checkpoint save/load for model, optimizer, trainer, plugin, RNG, and dataloader state.
 - Metric collection from runtime/plugins, interval aggregation, and console/jsonl/W&B logging.
 - PyTorch profiler trace export for rank-local timeline debugging.
-- YAML-driven pretraining CLI with dry-run, resume, checkpoint upload, and run manifest output.
+- YAML-driven training CLI with dry-run, resume, checkpoint upload, and run manifest output.
 
 This repo is intentionally small enough to read, but the core control flow
-mirrors larger pretraining systems: Megatron-style TP/SP, ZeRO/FSDP-style
+mirrors larger training systems: Megatron-style TP/SP, ZeRO/FSDP-style
 optimizer ownership, explicit process mesh axes, and checkpoint metadata that
-describes local shards. Long term, MALTOS is meant to grow from pretraining
-into a modular training stack for SFT, preference training, RL, and fast
-research workflows.
+describes local shards. Long term, MALTOS is meant to grow from language-model
+pretraining into a modular training stack for SFT, preference training, RL,
+and fast research workflows.
 
 ## Validation Snapshot
 
@@ -51,7 +51,7 @@ research workflows.
 - Core smokes pass:
   - `tests/smoke_runtime_core.py`
   - `tests/smoke_trainer_loop.py`
-  - `tests/smoke_pretrain_cli.py`
+  - `tests/smoke_train_cli.py`
 - Distributed CI runs smoke tests, focused checkpoint/dataloader regressions, and a smaller matrix subset covering TP, PP, CP, and EP+ZeRO resume.
 - Real runs have been exercised on Vast.ai at 1 GPU, 2 GPU, and 4 GPU scale.
 - A 4x4090 50M-token run used `DP=2, TP=2, SP, ZeRO-3, bf16, grad clip` and reached:
@@ -62,10 +62,10 @@ research workflows.
 
 ## Support Matrix
 
-The table below separates runtime capability from what the current pretraining
+The table below separates runtime capability from what the current training
 CLI exposes directly.
 
-| Area | Runtime / tests | `tools/pretrain.py` |
+| Area | Runtime / tests | `tools/train.py` |
 |---|---|---|
 | Single-process training | Supported | Supported |
 | Sync / async / bucketed DDP | Supported | Supported |
@@ -205,7 +205,7 @@ runtime/    RuntimeCore, MeshConfig/group management, plugin API, plugins
 state/      StateManager and sharded checkpoint IO
 train/      Trainer loop
 utils/      Logging, distributed helpers, and metric aggregation
-tools/      Dataset prep, pretraining entrypoints, checkpoint upload helpers
+tools/      Dataset prep, training entrypoints, checkpoint upload helpers
 tests/      Equivalence, checkpoint, integration, and resume tests
 docs/       Architecture notes and experiment playbooks
 ```
@@ -220,10 +220,10 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Run a tiny single-process pretraining smoke using committed token shards:
+Run a tiny single-process training smoke using committed token shards:
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/pretrain.py \
+PYTHONPATH=. .venv/bin/python tools/train.py \
   --model tiny \
   --data tests/testdata \
   --vocab-size 256 \
@@ -242,7 +242,7 @@ Run the core smoke tests:
 ```bash
 PYTHONPATH=. .venv/bin/python tests/smoke_runtime_core.py
 PYTHONPATH=. .venv/bin/python tests/smoke_trainer_loop.py
-PYTHONPATH=. .venv/bin/python tests/smoke_pretrain_cli.py
+PYTHONPATH=. .venv/bin/python tests/smoke_train_cli.py
 ```
 
 Run the focused non-matrix regression suite:
@@ -316,12 +316,14 @@ For SFT shard prep, use the preset wrapper:
 sh tools/sft_data.sh olmo
 ```
 
-## Pretraining CLI
+## Training CLI
+
+`tools/train.py` is the training entrypoint for built-in recipes and packed SFT datasets.
 
 Single-process LLaMA smoke:
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/pretrain.py \
+PYTHONPATH=. .venv/bin/python tools/train.py \
   --model llama \
   --data tests/testdata \
   --vocab-size 256 \
@@ -338,7 +340,7 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
 YAML recipes are supported for real runs:
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/pretrain.py \
+PYTHONPATH=. .venv/bin/python tools/train.py \
   --config configs/llama_10m.yaml \
   --data datasets/fineweb_10m \
   --dp-size 1 \
@@ -352,7 +354,7 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
 Distributed example with TP/SP/ZeRO-3:
 
 ```bash
-PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/train.py \
   --config configs/llama_50m.yaml \
   --data datasets/fineweb_50m
 ```
@@ -365,7 +367,7 @@ Use `--dry-run` to validate a recipe without entering the training loop or
 initializing W&B:
 
 ```bash
-PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/train.py \
   --config configs/llama_50m.yaml \
   --data datasets/fineweb_50m \
   --dry-run
@@ -376,7 +378,7 @@ CLI args, and git metadata. This works for both dry-runs and normal training
 runs:
 
 ```bash
-PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/train.py \
   --config configs/llama_50m.yaml \
   --data datasets/fineweb_50m \
   --dry-run \
@@ -395,7 +397,7 @@ and a declared hardware peak.
 Use PyTorch profiler for trace-based performance debugging:
 
 ```bash
-PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/train.py \
   --config configs/llama_50m.yaml \
   --data datasets/fineweb_50m \
   --max-steps 20 \
@@ -429,7 +431,7 @@ training:
 The LLaMA path supports block-level activation checkpointing:
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/pretrain.py \
+PYTHONPATH=. .venv/bin/python tools/train.py \
   --config configs/llama_50m.yaml \
   --attention-backend sdpa_auto \
   --activation-checkpointing \
@@ -439,7 +441,7 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
 To continue logging into an existing W&B run, pass its run id:
 
 ```bash
-PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/train.py \
   --config configs/llama_50m.yaml \
   --data datasets/fineweb_50m \
   --resume-from checkpoints/llama_50m/step_00002500 \
@@ -498,7 +500,7 @@ than requested, training raises instead of writing a partial checkpoint.
 Resume:
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/pretrain.py \
+PYTHONPATH=. .venv/bin/python tools/train.py \
   --data datasets/fineweb_500m \
   --resume-from checkpoints/tiny/step_00000100 \
   --max-steps 200
@@ -516,7 +518,7 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
 
 ## Current Boundaries
 
-- The runtime supports PP/CP/EP, but the current pretraining CLI only exposes PP and CP. EP is exercised through tests, not recipe flags yet.
+- The runtime supports PP/CP/EP, but the current training CLI only exposes PP and CP. EP is exercised through tests, not recipe flags yet.
 - PP support is currently focused on decoder-only TinyTransformer/LLaMA partitioning and the maintained schedules in the test matrix.
 - CP is currently a v0 implementation with sequence-length divisibility requirements, and some gradient-sync logic is still coupled to the current ZeRO implementations.
 - Activation checkpointing is implemented for the LLaMA path; tiny models keep the simpler eager path.

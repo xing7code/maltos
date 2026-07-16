@@ -7,7 +7,7 @@ train it with MALTOS?
 
 The short answer is:
 
-- If you want to train one of the built-in recipe models, use `tools/pretrain.py`.
+- If you want to train one of the built-in recipe models, use `tools/train.py`.
 - If you want to train your own model today, use `RuntimeCore + Trainer` directly.
 - If you want TP/SP/PP/CP/EP support for your own model, you need to expose the
   corresponding model-side specs that MALTOS plugins consume.
@@ -16,12 +16,12 @@ The short answer is:
 
 MALTOS currently has two user-facing entry paths.
 
-### Path A: Use the built-in pretraining CLI
+### Path A: Use the built-in training CLI
 
-Use `tools/pretrain.py` when:
+Use `tools/train.py` when:
 
 - your model is one of the built-in types
-- you want the current token-shard pretraining flow
+- you want the current token-shard or packed-SFT training flow
 - you want YAML config, dry-run, checkpointing, and W&B without writing code
 
 Today the CLI only builds:
@@ -503,7 +503,7 @@ plugin. The built-in `TinyMoETransformer` is the reference pattern here.
 Current status:
 
 - EP is exercised in tests
-- EP is not yet exposed through `tools/pretrain.py`
+- EP is not yet exposed through `tools/train.py`
 
 So today EP integration is a code-path feature, not a CLI feature.
 
@@ -561,7 +561,7 @@ You can pass:
 
 Built-in loggers live in `utils.metrics`.
 
-The pretraining CLI already wires:
+The training CLI already wires:
 
 - console logging
 - JSONL logging
@@ -574,9 +574,9 @@ directly.
 
 This is important to understand before you try to force everything through YAML.
 
-`tools/pretrain.py` today is:
+`tools/train.py` today is:
 
-- a real pretraining app
+- a real training app
 - good for built-in LLaMA and tiny recipes
 - not yet a generic plugin registry + external model loader
 
@@ -621,7 +621,7 @@ If you are wiring your own model, read these first.
   - more realistic pretraining model with activation checkpointing and SDPA
 - `models/tiny_moe_transformer.py`
   - reference for EP-style MoE structure
-- `tools/pretrain.py`
+- `tools/train.py`
   - reference app wiring for a complete training recipe
 
 ## 20. Practical Takeaways

@@ -65,7 +65,7 @@ PYTHONPATH=. python tools/prepare_token_shards.py \
 Validate the recipe before burning GPU time:
 
 ```bash
-PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/train.py \
   --config configs/llama_50m.yaml \
   --data datasets/fineweb_50m \
   --dry-run \
@@ -92,7 +92,7 @@ Override the distributed defaults from `configs/llama_10m.yaml` and run a short
 single-GPU smoke:
 
 ```bash
-PYTHONPATH=. python tools/pretrain.py \
+PYTHONPATH=. python tools/train.py \
   --config configs/llama_10m.yaml \
   --data datasets/fineweb_10m \
   --dp-size 1 \
@@ -111,7 +111,7 @@ PYTHONPATH=. python tools/pretrain.py \
 Verify checkpoint restore before scaling up:
 
 ```bash
-PYTHONPATH=. python tools/pretrain.py \
+PYTHONPATH=. python tools/train.py \
   --config configs/llama_10m.yaml \
   --data datasets/fineweb_10m \
   --dp-size 1 \
@@ -130,7 +130,7 @@ PYTHONPATH=. python tools/pretrain.py \
 Run the maintained 4-GPU TP/SP/ZeRO-3 recipe:
 
 ```bash
-PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/train.py \
   --config configs/llama_50m.yaml \
   --data datasets/fineweb_50m \
   --checkpoint-dir checkpoints/llama_50m \
@@ -156,7 +156,7 @@ override them on the CLI.
 Use PyTorch profiler only for short debugging runs:
 
 ```bash
-PYTHONPATH=. torchrun --nproc_per_node=4 tools/pretrain.py \
+PYTHONPATH=. torchrun --nproc_per_node=4 tools/train.py \
   --config configs/llama_50m.yaml \
   --data datasets/fineweb_50m \
   --max-steps 20 \

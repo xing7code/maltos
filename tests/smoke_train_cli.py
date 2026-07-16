@@ -1,4 +1,4 @@
-"""Smoke tests for pretrain CLI config plumbing."""
+"""Smoke tests for train CLI config plumbing."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from tools.pretrain import _build_optimizer_factory, _load_config_defaults
+from tools.train import _build_optimizer_factory, _load_config_defaults
 
 
 def _optimizer_args(*, fused_adamw: bool) -> argparse.Namespace:
@@ -58,7 +58,7 @@ def main() -> None:
     test_fused_adamw_config_alias()
     test_adamw_factory_enables_fused_backend()
     test_adamw_factory_keeps_default_backend()
-    print("pretrain cli smoke ok")
+    print("train cli smoke ok")
 
 
 if __name__ == "__main__":

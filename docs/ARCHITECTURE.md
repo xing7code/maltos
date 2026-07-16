@@ -159,14 +159,14 @@ Current practical boundaries:
 
 - PP is intentionally focused on decoder-only TinyTransformer/LLaMA partitioning.
 - CP is a v0 implementation with sequence divisibility constraints and some ZeRO coupling in gradient sync paths.
-- EP is exercised in tests, but not exposed through the current pretraining CLI.
+- EP is exercised in tests, but not exposed through the current training CLI.
 - The codebase prioritizes clarity and explicit control flow over peak-throughput micro-optimization.
 
 ## Verification
 
 The maintained verification story is:
 
-- smoke tests for runtime core, trainer loop, and pretrain CLI
+- smoke tests for runtime core, trainer loop, and train CLI
 - focused unit-style regressions for ZeRO, grad clipping, checkpointing, and dataloaders
 - a maintained full-stack matrix for TP / PP / CP / EP / ZeRO combinations
 - checkpoint/resume tests, including mid-step resume under gradient accumulation
