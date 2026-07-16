@@ -16,7 +16,7 @@ from distributed_test_utils import (
     reduce_loss as _reduce_loss,
     rule_by_param_name as _rule_by_param_name,
 )
-from helpers import causal_lm_batch
+from helpers import causal_lm_batch, packed_causal_lm_batch
 from models import TinyMoETransformer, TinyMoETransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ContextParallelAttentionCoreType, ParallelPlan
@@ -83,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--packed-batch", action="store_true")
     return parser.parse_args()
 
 
@@ -158,6 +159,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("seq_len must be divisible by cp size")
 
 
+def _make_batch(input_ids: torch.Tensor, args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor] | dict[str, torch.Tensor]:
+    if args.packed_batch:
+        return packed_causal_lm_batch(input_ids)
+    return causal_lm_batch(input_ids)
+
+
 def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = None) -> None:
     _validate_args(args)
     reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len)
@@ -174,10 +181,10 @@ def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = 
         local_batch_size = args.batch_size // args.dp_size
         local_tokens = tokens.narrow(0, dp_idx * local_batch_size, local_batch_size).contiguous()
 
-        baseline_loss, should_step = baseline_core.run_step(causal_lm_batch(local_tokens))
+        baseline_loss, should_step = baseline_core.run_step(_make_batch(local_tokens, args))
         if not should_step:
             raise AssertionError("baseline EP full stack expected should_step=True")
-        runtime_loss, should_step = runtime_core.run_step(causal_lm_batch(local_tokens))
+        runtime_loss, should_step = runtime_core.run_step(_make_batch(local_tokens, args))
         if not should_step:
             raise AssertionError("runtime EP full stack expected should_step=True")
 

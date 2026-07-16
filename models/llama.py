@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from absl import logging
 
 import torch
 import torch.nn as nn
@@ -12,7 +13,17 @@ from models.activation_checkpointing import ActivationCheckpointConfig
 from parallel.specs import ContextParallelSpec
 from parallel.specs import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
-from utils.constants import HIDDEN_STATES_KEY, IGNORE_INDEX, INPUT_IDS_KEY, LABELS_KEY, LOSS_WEIGHT_KEY, POSITION_IDS_KEY, POSITION_OFFSET_KEY
+from utils.attention_masking import build_example_causal_mask, canonical_position_ids, canonical_sequence_ids
+from utils.constants import (
+    HIDDEN_STATES_KEY,
+    IGNORE_INDEX,
+    INPUT_IDS_KEY,
+    LABELS_KEY,
+    LOSS_WEIGHT_KEY,
+    POSITION_IDS_KEY,
+    POSITION_OFFSET_KEY,
+    SEQUENCE_IDS_KEY,
+)
 
 
 @dataclass(frozen=True)
@@ -92,12 +103,19 @@ def _repeat_kv(x: torch.Tensor, repeats: int) -> torch.Tensor:
 
 
 
-def _eager_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def _eager_causal_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     scale = q.size(-1) ** -0.5
     scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-    seq_len = q.size(-2)
-    causal_mask = torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool).tril()
-    scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
+    if mask is None:
+        seq_len = q.size(-2)
+        mask = torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool).tril().unsqueeze(0).unsqueeze(0)
+    scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
     probs = scores.softmax(dim=-1)
     return torch.matmul(probs, v)
 
@@ -131,6 +149,7 @@ class LlamaAttention(nn.Module):
         *,
         position_offset: int = 0,
         position_ids: torch.Tensor | None = None,
+        sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
         if position_ids is None:
@@ -147,7 +166,7 @@ class LlamaAttention(nn.Module):
         repeats = q.size(1) // k.size(1)
         k = _repeat_kv(k, repeats)
         v = _repeat_kv(v, repeats)
-        vo = self.attn_core(q, k, v, position_offset, position_ids)
+        vo = self.attn_core(q, k, v, position_offset, position_ids, sequence_ids)
         out = vo.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(out)
 
@@ -156,6 +175,7 @@ class _LlamaAttentionCore(nn.Module):
     def __init__(self, attention_backend: str) -> None:
         super().__init__()
         self.attention_backend = attention_backend
+        self._warned_flash_mask_fallback = False
 
     def forward(
         self,
@@ -164,13 +184,46 @@ class _LlamaAttentionCore(nn.Module):
         v: torch.Tensor,
         position_offset: int,
         position_ids: torch.Tensor | None = None,
+        sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del position_offset, position_ids
+        mask = None
+        if position_ids is not None or sequence_ids is not None:
+            positions = canonical_position_ids(
+                position_ids,
+                batch_size=q.size(0),
+                seq_len=q.size(-2),
+                position_offset=position_offset,
+                device=q.device,
+            )
+            sequences = canonical_sequence_ids(
+                sequence_ids,
+                batch_size=q.size(0),
+                seq_len=q.size(-2),
+                device=q.device,
+            )
+            mask = build_example_causal_mask(
+                q_positions=positions,
+                k_positions=positions,
+                q_sequence_ids=sequences,
+                k_sequence_ids=sequences,
+            ).unsqueeze(1)
         if self.attention_backend == "sdpa_auto":
+            if mask is not None:
+                return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
             return F.scaled_dot_product_attention(q, k, v, is_causal=True)
         if self.attention_backend == "sdpa_flash":
+            if mask is not None:
+                if not self._warned_flash_mask_fallback:
+                    logging.warning(
+                        "LlamaAttention sdpa_flash received example-aware attention mask; "
+                        "falling back to regular SDPA for correctness"
+                    )
+                    self._warned_flash_mask_fallback = True
+                return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if mask is not None:
+            return _eager_causal_attention(q, k, v, mask=mask)
         return _eager_causal_attention(q, k, v)
 
 
@@ -198,8 +251,14 @@ class LlamaDecoderLayer(nn.Module):
         x: torch.Tensor,
         position_offset: int = 0,
         position_ids: torch.Tensor | None = None,
+        sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), position_offset=position_offset, position_ids=position_ids)
+        x = x + self.self_attn(
+            self.input_layernorm(x),
+            position_offset=position_offset,
+            position_ids=position_ids,
+            sequence_ids=sequence_ids,
+        )
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -222,18 +281,21 @@ class LlamaForCausalLM(nn.Module):
             labels = batch.get(LABELS_KEY)
             position_offset = int(batch.get(POSITION_OFFSET_KEY, 0))
             position_ids = batch.get(POSITION_IDS_KEY)
+            sequence_ids = batch.get(SEQUENCE_IDS_KEY)
             loss_weight = batch.get(LOSS_WEIGHT_KEY)
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
             hidden_states = None
             position_offset = 0
             position_ids = None
+            sequence_ids = None
             loss_weight = None
         else:
             input_ids, labels = batch, None
             hidden_states = None
             position_offset = 0
             position_ids = None
+            sequence_ids = None
             loss_weight = None
 
         if hidden_states is not None:
@@ -247,12 +309,17 @@ class LlamaForCausalLM(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             if self.training and self.config.activation_checkpointing.should_checkpoint_layer(layer_idx):
                 x = checkpoint(
-                    lambda y: layer(y, position_offset=position_offset, position_ids=position_ids),
+                    lambda y: layer(
+                        y,
+                        position_offset=position_offset,
+                        position_ids=position_ids,
+                        sequence_ids=sequence_ids,
+                    ),
                     x,
                     use_reentrant=False,
                 )
             else:
-                x = layer(x, position_offset=position_offset, position_ids=position_ids)
+                x = layer(x, position_offset=position_offset, position_ids=position_ids, sequence_ids=sequence_ids)
         if self.norm is None or self.lm_head is None:
             return x
         logits = self.lm_head(self.norm(x))

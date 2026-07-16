@@ -9,7 +9,17 @@ import torch.distributed as dist
 from parallel.specs import ContextParallelSpec
 from parallel.specs import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
-from utils.constants import HIDDEN_STATES_KEY, IGNORE_INDEX, INPUT_IDS_KEY, LABELS_KEY, LOSS_WEIGHT_KEY, POSITION_IDS_KEY, POSITION_OFFSET_KEY
+from utils.attention_masking import build_example_causal_mask, canonical_position_ids, canonical_sequence_ids
+from utils.constants import (
+    HIDDEN_STATES_KEY,
+    IGNORE_INDEX,
+    INPUT_IDS_KEY,
+    LABELS_KEY,
+    LOSS_WEIGHT_KEY,
+    POSITION_IDS_KEY,
+    POSITION_OFFSET_KEY,
+    SEQUENCE_IDS_KEY,
+)
 from utils.logging import debug_log
 
 
@@ -25,7 +35,15 @@ class CausalSelfAttention(nn.Module):
         self.o_proj = nn.Linear(dim, dim, bias=False)
         self.attn_core = _LocalCausalAttentionCore()
 
-    def forward(self, x, cos=None, sin=None, position_offset: int = 0, position_ids: torch.Tensor | None = None):
+    def forward(
+        self,
+        x,
+        cos=None,
+        sin=None,
+        position_offset: int = 0,
+        position_ids: torch.Tensor | None = None,
+        sequence_ids: torch.Tensor | None = None,
+    ):
         debug_log(3, f"layer: {self._get_name()} input shape={x.size()}")
         b, s, d = x.size()
         # use -1 for n_heads, n_kv_heads, this dim can be sharded for TP.
@@ -35,7 +53,7 @@ class CausalSelfAttention(nn.Module):
         if self.n_heads != self.n_kv_heads:
             k = k.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1)
             v = v.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1)
-        vo = self.attn_core(q, k, v, position_offset, position_ids)
+        vo = self.attn_core(q, k, v, position_offset, position_ids, sequence_ids)
         # use -1 for last dim, it can be different than d for TP.
         out = vo.transpose(1, 2).contiguous().view(b, s, -1)
         output = self.o_proj(out)
@@ -51,12 +69,34 @@ class _LocalCausalAttentionCore(nn.Module):
         v: torch.Tensor,
         position_offset: int,
         position_ids: torch.Tensor | None = None,
+        sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del position_offset, position_ids
         logits = (q @ k.transpose(-1, -2)) / q.size(-1) ** 0.5
         seq_len = q.size(-2)
-        mask = torch.ones(seq_len, seq_len, device=q.device).triu(1).bool()
-        logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0), torch.finfo(logits.dtype).min)
+        if position_ids is None and sequence_ids is None:
+            causal_mask = torch.ones(seq_len, seq_len, device=q.device).tril().bool()
+            mask = causal_mask.unsqueeze(0).unsqueeze(0)
+        else:
+            positions = canonical_position_ids(
+                position_ids,
+                batch_size=q.size(0),
+                seq_len=seq_len,
+                position_offset=position_offset,
+                device=q.device,
+            )
+            sequences = canonical_sequence_ids(
+                sequence_ids,
+                batch_size=q.size(0),
+                seq_len=seq_len,
+                device=q.device,
+            )
+            mask = build_example_causal_mask(
+                q_positions=positions,
+                k_positions=positions,
+                q_sequence_ids=sequences,
+                k_sequence_ids=sequences,
+            ).unsqueeze(1)
+        logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
         scores = F.softmax(logits, dim=-1)
         return scores @ v
 
@@ -96,8 +136,23 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(dim, hidden_size)
         self.norm2 = RmsNorm(dim, eps)
     
-    def forward(self, x, cos=None, sin=None, position_offset: int = 0, position_ids: torch.Tensor | None = None):
-        x = self.attn(self.norm1(x), cos, sin, position_offset=position_offset, position_ids=position_ids) + x
+    def forward(
+        self,
+        x,
+        cos=None,
+        sin=None,
+        position_offset: int = 0,
+        position_ids: torch.Tensor | None = None,
+        sequence_ids: torch.Tensor | None = None,
+    ):
+        x = self.attn(
+            self.norm1(x),
+            cos,
+            sin,
+            position_offset=position_offset,
+            position_ids=position_ids,
+            sequence_ids=sequence_ids,
+        ) + x
         x = self.mlp(self.norm2(x)) + x
         return x
 
@@ -148,18 +203,21 @@ class TinyTransformer(nn.Module):
             labels = batch.get(LABELS_KEY)
             position_offset = int(batch.get(POSITION_OFFSET_KEY, 0))
             position_ids = batch.get(POSITION_IDS_KEY)
+            sequence_ids = batch.get(SEQUENCE_IDS_KEY)
             loss_weight = batch.get(LOSS_WEIGHT_KEY)
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
             hidden_states = None
             position_offset = 0
             position_ids = None
+            sequence_ids = None
             loss_weight = None
         else:
             input_ids, labels = batch, None
             hidden_states = None
             position_offset = 0
             position_ids = None
+            sequence_ids = None
             loss_weight = None
 
         if hidden_states is not None:
@@ -176,7 +234,14 @@ class TinyTransformer(nn.Module):
         else:
             cos, sin = self.rope(position_ids=position_ids)
         for layer in self.layers:
-            x = layer(x, cos, sin, position_offset=position_offset, position_ids=position_ids)
+            x = layer(
+                x,
+                cos,
+                sin,
+                position_offset=position_offset,
+                position_ids=position_ids,
+                sequence_ids=sequence_ids,
+            )
         if self.norm is None or self.lm_head is None:
             return x
         x = self.norm(x)

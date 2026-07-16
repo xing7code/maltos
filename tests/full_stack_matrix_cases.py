@@ -35,6 +35,10 @@ class MatrixCase:
                 if value is True:
                     args.append("--disable-grad-clip")
                 continue
+            if key == "packed_batch":
+                if value is True:
+                    args.append("--packed-batch")
+                continue
             flag = f"--{key.replace('_', '-')}"
             args.extend([flag, str(value)])
         return args
@@ -45,6 +49,12 @@ MODULE_SCRIPTS = {
     "full_resume": "tests/tiny_transformer_full_stack_resume.py",
     "ep_full_eq": "tests/tiny_transformer_ep_full_stack_equivalence.py",
     "ep_full_resume": "tests/tiny_transformer_ep_full_stack_resume.py",
+}
+
+_PACKED_BATCH_CASE_NAMES = {
+    "A/full_eq/z3",
+    "B/full_resume/z3_afab_acc2",
+    "F/ep_topology_tp_lt_ep_le_tp_cp/ep_full_eq_z3",
 }
 
 
@@ -144,6 +154,19 @@ def _case(
     args = dict(_BASE_ARGS[module_key])
     args.update(overrides)
     return MatrixCase(name=name, module_key=module_key, args=args, needs_checkpoint_dir=needs_checkpoint_dir)
+
+
+def _with_packed_batch(case: MatrixCase) -> MatrixCase:
+    if case.name not in _PACKED_BATCH_CASE_NAMES:
+        return case
+    args = dict(case.args)
+    args["packed_batch"] = True
+    return MatrixCase(
+        name=case.name,
+        module_key=case.module_key,
+        args=args,
+        needs_checkpoint_dir=case.needs_checkpoint_dir,
+    )
 
 
 def build_full_stack_matrix_cases(
@@ -514,4 +537,4 @@ def build_full_stack_matrix_cases(
         cases = cases[:max_cases]
     if not cases:
         raise ValueError("no matrix cases selected")
-    return cases
+    return [_with_packed_batch(case) for case in cases]

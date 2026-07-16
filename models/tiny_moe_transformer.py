@@ -8,7 +8,16 @@ from parallel.expert_interfaces import ExpertParallelMoEModule
 from parallel.specs import ContextParallelSpec, ExpertParallelSpec, PipelineParallelSpec
 from parallel.specs import TpSpComm, TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from models.tiny_transformer import CausalSelfAttention, RmsNorm, RoPE, MLP
-from utils.constants import HIDDEN_STATES_KEY, IGNORE_INDEX, INPUT_IDS_KEY, LABELS_KEY, LOSS_WEIGHT_KEY, POSITION_IDS_KEY, POSITION_OFFSET_KEY
+from utils.constants import (
+    HIDDEN_STATES_KEY,
+    IGNORE_INDEX,
+    INPUT_IDS_KEY,
+    LABELS_KEY,
+    LOSS_WEIGHT_KEY,
+    POSITION_IDS_KEY,
+    POSITION_OFFSET_KEY,
+    SEQUENCE_IDS_KEY,
+)
 
 
 class Top1MoE(nn.Module):
@@ -63,8 +72,16 @@ class MoETransformerBlock(nn.Module):
         sin=None,
         position_offset: int = 0,
         position_ids: torch.Tensor | None = None,
+        sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = self.attn(self.norm1(x), cos, sin, position_offset=position_offset, position_ids=position_ids) + x
+        x = self.attn(
+            self.norm1(x),
+            cos,
+            sin,
+            position_offset=position_offset,
+            position_ids=position_ids,
+            sequence_ids=sequence_ids,
+        ) + x
         x = self.moe(self.norm2(x)) + x
         return x
 
@@ -101,18 +118,21 @@ class TinyMoETransformer(nn.Module):
             labels = batch.get(LABELS_KEY)
             position_offset = int(batch.get(POSITION_OFFSET_KEY, 0))
             position_ids = batch.get(POSITION_IDS_KEY)
+            sequence_ids = batch.get(SEQUENCE_IDS_KEY)
             loss_weight = batch.get(LOSS_WEIGHT_KEY)
         elif isinstance(batch, (tuple, list)):
             input_ids, labels = batch
             hidden_states = None
             position_offset = 0
             position_ids = None
+            sequence_ids = None
             loss_weight = None
         else:
             input_ids, labels = batch, None
             hidden_states = None
             position_offset = 0
             position_ids = None
+            sequence_ids = None
             loss_weight = None
 
         if hidden_states is not None:
@@ -130,7 +150,14 @@ class TinyMoETransformer(nn.Module):
         else:
             cos, sin = self.rope(position_ids=position_ids)
         for layer in self.layers:
-            x = layer(x, cos, sin, position_offset=position_offset, position_ids=position_ids)
+            x = layer(
+                x,
+                cos,
+                sin,
+                position_offset=position_offset,
+                position_ids=position_ids,
+                sequence_ids=sequence_ids,
+            )
         if self.norm is None or self.lm_head is None:
             return x
         logits = self.lm_head(self.norm(x))

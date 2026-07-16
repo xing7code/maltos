@@ -22,7 +22,7 @@ from distributed_test_utils import (
     rule_by_param_name as _rule_by_param_name,
     supports_bf16_autocast as _supports_bf16_autocast,
 )
-from helpers import causal_lm_batch
+from helpers import causal_lm_batch, packed_causal_lm_batch
 from models import TinyTransformer, TinyTransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ContextParallelAttentionCoreType, ParallelPlan
@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zero-stage", type=int, choices=(0, 1, 2, 3), default=3)
     parser.add_argument("--disable-precision", action="store_true")
     parser.add_argument("--disable-grad-clip", action="store_true")
+    parser.add_argument("--packed-batch", action="store_true")
     return parser.parse_args()
 
 
@@ -91,6 +92,12 @@ def _check_bf16_metadata(cont: RuntimeCore, rest: RuntimeCore) -> None:
         raise AssertionError("bf16 path should keep overflow=False")
     if rest.state.metadata.get("overflow") is not False:
         raise AssertionError("bf16 resume path should keep overflow=False")
+
+
+def _make_batch(input_ids: torch.Tensor, args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor] | dict[str, torch.Tensor]:
+    if args.packed_batch:
+        return packed_causal_lm_batch(input_ids)
+    return causal_lm_batch(input_ids)
 
 
 def _build_runtime(
@@ -150,14 +157,14 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
         local_a = tokens_a.narrow(0, dp_idx * local_bs, local_bs).contiguous()
         local_b = tokens_b.narrow(0, dp_idx * local_bs, local_bs).contiguous()
 
-        _, should_step = cont_core.run_step(causal_lm_batch(local_a))
+        _, should_step = cont_core.run_step(_make_batch(local_a, args))
         if not should_step:
             raise AssertionError("step-resume: expected should_step=True for grad_accum_steps=1")
         cont_core.step_optimizer()
         dist.barrier()
         save_sharded_checkpoint(cont_core.state_manager, args.checkpoint_dir)
         dist.barrier()
-        cont_loss, should_step = cont_core.run_step(causal_lm_batch(local_b))
+        cont_loss, should_step = cont_core.run_step(_make_batch(local_b, args))
         if not should_step:
             raise AssertionError("step-resume: second step should step optimizer")
         cont_core.step_optimizer()
@@ -168,7 +175,7 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
         rest_core, rest_zero = _build_runtime(rest_model, args, device)
         load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
         dist.barrier()
-        rest_loss, should_step = rest_core.run_step(causal_lm_batch(local_b))
+        rest_loss, should_step = rest_core.run_step(_make_batch(local_b, args))
         if not should_step:
             raise AssertionError("step-resume: restored second step should step optimizer")
         rest_core.step_optimizer()
@@ -219,18 +226,18 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
         if local_a.size(0) != 4 or local_b.size(0) != 4:
             raise ValueError("mid-step resume expects local_batch_size == grad_accum_steps * pp_microbatches == 4")
 
-        _, should_step = cont_core.run_step(causal_lm_batch(local_a[0:2]))
+        _, should_step = cont_core.run_step(_make_batch(local_a[0:2], args))
         if cont_core.state.step != 0 or cont_core.state.step_context.microbatch_idx != 1:
             raise AssertionError("continuous core must be at mid-step state before checkpoint")
         if should_step is not False:
             raise AssertionError("midstep: first microbatch should not step optimizer")
         save_sharded_checkpoint(cont_core.state_manager, args.checkpoint_dir)
-        la1_cont, should_step = cont_core.run_step(causal_lm_batch(local_a[2:4]))
+        la1_cont, should_step = cont_core.run_step(_make_batch(local_a[2:4], args))
         if should_step is not True:
             raise AssertionError("midstep: second microbatch should step optimizer")
         cont_core.step_optimizer()
-        lb0_cont, _ = cont_core.run_step(causal_lm_batch(local_b[0:2]))
-        lb1_cont, should_step = cont_core.run_step(causal_lm_batch(local_b[2:4]))
+        lb0_cont, _ = cont_core.run_step(_make_batch(local_b[0:2], args))
+        lb1_cont, should_step = cont_core.run_step(_make_batch(local_b[2:4], args))
         if should_step is not True:
             raise AssertionError("midstep: step B boundary should step optimizer")
         cont_core.step_optimizer()
@@ -241,14 +248,14 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
         load_sharded_checkpoint(rest_core.state_manager, args.checkpoint_dir)
         if rest_core.state.step != 0 or rest_core.state.step_context.microbatch_idx != 1:
             raise AssertionError("restored core must recover mid-step state")
-        la1_rest, should_step = rest_core.run_step(causal_lm_batch(local_a[2:4]))
+        la1_rest, should_step = rest_core.run_step(_make_batch(local_a[2:4], args))
         if should_step is not True:
             raise AssertionError("midstep: restored step A boundary should step optimizer")
         rest_core.step_optimizer()
-        lb0_rest, should_step = rest_core.run_step(causal_lm_batch(local_b[0:2]))
+        lb0_rest, should_step = rest_core.run_step(_make_batch(local_b[0:2], args))
         if should_step is not False:
             raise AssertionError("midstep: restored step B first microbatch should not step optimizer")
-        lb1_rest, should_step = rest_core.run_step(causal_lm_batch(local_b[2:4]))
+        lb1_rest, should_step = rest_core.run_step(_make_batch(local_b[2:4], args))
         if should_step is not True:
             raise AssertionError("midstep: restored step B boundary should step optimizer")
         rest_core.step_optimizer()
