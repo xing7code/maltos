@@ -52,6 +52,7 @@ from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
 from train import Trainer, TrainerConfig
+from utils.attention_backend import ATTENTION_BACKEND_CHOICES, AttentionBackend
 from utils.metrics import (
     ConsoleMetricLogger,
     JsonlMetricLogger,
@@ -108,7 +109,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument("--eps", type=float, default=1e-5)
-    parser.add_argument("--attention-backend", type=str, default="sdpa_auto", choices=("eager", "sdpa_auto", "sdpa_flash"))
+    parser.add_argument(
+        "--attention-backend",
+        type=str,
+        default=AttentionBackend.SDPA_AUTO,
+        choices=ATTENTION_BACKEND_CHOICES,
+    )
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--activation-checkpoint-every-n-layers", type=int, default=1)
 
@@ -297,6 +303,7 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
             vocab_size=args.vocab_size,
             max_seq_len=args.seq_len,
             num_experts=args.num_experts,
+            attention_backend=args.attention_backend,
         )
     cls = TinyTransformerTpSp if args.use_sp else TinyTransformerTp if args.tp_size > 1 else TinyTransformer
     return cls(
@@ -308,6 +315,7 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
         n_layers=args.n_layers,
         vocab_size=args.vocab_size,
         max_seq_len=args.seq_len,
+        attention_backend=args.attention_backend,
     )
 
 

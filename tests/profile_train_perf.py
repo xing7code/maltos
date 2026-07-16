@@ -46,6 +46,7 @@ from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
+from utils.attention_backend import AttentionBackend
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero3 import Zero3Plugin
 
@@ -61,7 +62,7 @@ _LLAMA_1B = LlamaConfig(
     num_attention_heads=16,
     num_key_value_heads=4,
     max_position_embeddings=8192,
-    attention_backend="sdpa_flash",
+    attention_backend=AttentionBackend.SDPA_FLASH,
     activation_checkpointing=ActivationCheckpointConfig(enabled=True, every_n_layers=1),
 )
 
@@ -74,7 +75,7 @@ _LLAMA_350M = LlamaConfig(
     num_attention_heads=16,
     num_key_value_heads=4,
     max_position_embeddings=8192,
-    attention_backend="sdpa_flash",
+    attention_backend=AttentionBackend.SDPA_FLASH,
     activation_checkpointing=ActivationCheckpointConfig(enabled=True, every_n_layers=1),
 )
 

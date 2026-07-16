@@ -19,6 +19,7 @@ from runtime.mesh import MeshAxis
 from runtime.plugin import ContextParallelizableModule, PluginId, RuntimePlugin
 from runtime.plugins.zero_common import ChainedWork
 from runtime.types import ParamRole, RuntimePhase
+from utils.attention_backend import AttentionBackend
 from utils.constants import (
     HIDDEN_STATES_KEY,
     IGNORE_INDEX,
@@ -87,10 +88,12 @@ class ContextParallelPlugin(RuntimePlugin):
             except AttributeError:
                 raise
             _validate_supported_attention_module(module)
+            attention_backend = getattr(module.attn_core, "attention_backend", AttentionBackend.EAGER)
             module.attn_core = _build_cp_attention_core(
                 self.cp_group,
                 self.runtime.plan.cp_attn_core,
                 step_context=self.runtime.state.step_context,
+                attention_backend=attention_backend,
             )
         return model
 
@@ -224,11 +227,12 @@ def _build_cp_attention_core(
     group: dist.ProcessGroup,
     attention_core_type: ContextParallelAttentionCoreType,
     step_context: "StepContext | None" = None,
+    attention_backend: str = AttentionBackend.EAGER,
 ) -> ContextParallelAttentionCore:
     if attention_core_type == ContextParallelAttentionCoreType.ALL_GATHER_KV:
-        return AllGatherKvAttentionCore(group)
+        return AllGatherKvAttentionCore(group, attention_backend=attention_backend)
     if attention_core_type == ContextParallelAttentionCoreType.RING:
-        return RingAttentionCore(group, step_context=step_context)
+        return RingAttentionCore(group, step_context=step_context, attention_backend=attention_backend)
     raise ValueError(f"unsupported CP attention_core={attention_core_type!r}")
 
 

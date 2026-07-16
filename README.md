@@ -522,5 +522,5 @@ PYTHONPATH=. .venv/bin/python tools/train.py \
 - PP support is currently focused on decoder-only TinyTransformer/LLaMA partitioning and the maintained schedules in the test matrix.
 - CP is currently a v0 implementation with sequence-length divisibility requirements, and some gradient-sync logic is still coupled to the current ZeRO implementations.
 - Activation checkpointing is implemented for the LLaMA path; tiny models keep the simpler eager path.
-- The LLaMA path supports `eager`, `sdpa_auto`, and `sdpa_flash` attention backends through PyTorch SDPA dispatch. Custom FlashAttention kernels are not implemented yet.
+- The LLaMA path supports `eager`, `sdpa_auto`, `sdpa_flash`, and `flash_attn` backends. `flash_attn` uses Dao-AILab FlashAttention when available, including var-len packed attention for `sequence_ids`, and otherwise falls back to regular attention with a warning.
 - The current implementation prioritizes clarity and correctness over Megatron-level throughput optimization.

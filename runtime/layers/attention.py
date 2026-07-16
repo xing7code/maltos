@@ -5,9 +5,9 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 
 from runtime.layers.functional import all_gather, ring_shift
+from utils.attention_backend import AttentionBackend, causal_attention, validate_attention_backend
 from utils.attention_masking import build_example_causal_mask, canonical_position_ids, canonical_sequence_ids
 
 if TYPE_CHECKING:
@@ -15,9 +15,10 @@ if TYPE_CHECKING:
 
 
 class AllGatherKvAttentionCore(nn.Module):
-    def __init__(self, group: dist.ProcessGroup) -> None:
+    def __init__(self, group: dist.ProcessGroup, attention_backend: str = AttentionBackend.EAGER) -> None:
         super().__init__()
         self.group = group
+        self.attention_backend = validate_attention_backend(attention_backend)
 
     def forward(
         self,
@@ -61,22 +62,33 @@ class AllGatherKvAttentionCore(nn.Module):
         if local_sequence_ids is not None:
             gathered_sequence_ids = [torch.empty_like(local_sequence_ids) for _ in range(dist.get_world_size(self.group))]
             dist.all_gather(gathered_sequence_ids, local_sequence_ids.contiguous(), group=self.group)
-        return _eager_cp_causal_attention(
+        gathered_positions_cat = torch.cat(gathered_positions, dim=1)
+        gathered_sequence_ids_cat = None if gathered_sequence_ids is None else torch.cat(gathered_sequence_ids, dim=1)
+        return causal_attention(
             q,
             gathered_k,
             gathered_v,
+            attention_backend=self.attention_backend,
+            warning_prefix="AllGatherKvAttentionCore",
             q_positions=local_positions,
-            k_positions=torch.cat(gathered_positions, dim=1),
+            k_positions=gathered_positions_cat,
             q_sequence_ids=local_sequence_ids,
-            k_sequence_ids=None if gathered_sequence_ids is None else torch.cat(gathered_sequence_ids, dim=1),
+            k_sequence_ids=gathered_sequence_ids_cat,
+            flash_varlen_mode="prefix",
         )
 
 
 class RingAttentionCore(nn.Module):
-    def __init__(self, group: dist.ProcessGroup, step_context: "StepContext | None" = None) -> None:
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        step_context: "StepContext | None" = None,
+        attention_backend: str = AttentionBackend.EAGER,
+    ) -> None:
         super().__init__()
         self.group = group
         self._step_context = step_context
+        self.attention_backend = validate_attention_backend(attention_backend)
 
     def forward(
         self,
@@ -218,17 +230,18 @@ def _eager_cp_causal_attention(
     q_sequence_ids: torch.Tensor | None = None,
     k_sequence_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    scale = q.size(-1) ** -0.5
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-    causal_mask = build_example_causal_mask(
+    return causal_attention(
+        q,
+        k,
+        v,
+        attention_backend=AttentionBackend.EAGER,
+        warning_prefix="AllGatherKvAttentionCore",
         q_positions=q_positions,
         k_positions=k_positions,
         q_sequence_ids=q_sequence_ids,
         k_sequence_ids=k_sequence_ids,
+        flash_varlen_mode="prefix",
     )
-    scores = scores.masked_fill(~causal_mask.unsqueeze(1), torch.finfo(scores.dtype).min)
-    probs = F.softmax(scores, dim=-1)
-    return torch.matmul(probs, v)
 
 
 def _ring_exchange_tensor(

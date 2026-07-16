@@ -13,7 +13,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from models import ActivationCheckpointConfig, LlamaConfig, LlamaForCausalLM
+from models import (
+    ActivationCheckpointConfig,
+    LlamaConfig,
+    LlamaForCausalLM,
+    TinyMoETransformer,
+    TinyTransformer,
+)
 from parallel import ParallelPlan
 from parallel.specs import TpSpShardAxis
 from runtime import DefaultStepRunner, MeshConfig, ParamRole, PluginId, RuntimeCore, RuntimePhase
@@ -24,7 +30,8 @@ from runtime.plugins.precision import PrecisionPlugin
 from runtime.plugins.torch_profiler import TorchProfilerPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugin import RuntimePlugin
-from utils.constants import INPUT_IDS_KEY, LABELS_KEY
+from utils.attention_backend import AttentionBackend
+from utils.constants import INPUT_IDS_KEY, LABELS_KEY, POSITION_IDS_KEY, SEQUENCE_IDS_KEY
 
 
 class LossModel(nn.Module):
@@ -719,8 +726,8 @@ def test_llama_sdpa_auto_matches_eager_attention() -> None:
         num_key_value_heads=4,
         max_position_embeddings=8,
     )
-    sdpa = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend="sdpa_auto"))
-    eager = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend="eager"))
+    sdpa = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend=AttentionBackend.SDPA_AUTO))
+    eager = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend=AttentionBackend.EAGER))
     eager.load_state_dict(sdpa.state_dict())
     sdpa.eval()
     eager.eval()
@@ -731,6 +738,120 @@ def test_llama_sdpa_auto_matches_eager_attention() -> None:
         eager_logits = eager(input_ids)
 
     torch.testing.assert_close(sdpa_logits, eager_logits, atol=1e-5, rtol=1e-5)
+
+
+def test_llama_flash_attn_backend_matches_eager_attention_for_packed_batch() -> None:
+    torch.manual_seed(4321)
+    base_config = dict(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=8,
+    )
+    flash = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend=AttentionBackend.FLASH_ATTN))
+    eager = LlamaForCausalLM(LlamaConfig(**base_config, attention_backend=AttentionBackend.EAGER))
+    eager.load_state_dict(flash.state_dict())
+    flash.eval()
+    eager.eval()
+    batch = {
+        INPUT_IDS_KEY: torch.randint(0, 32, (2, 8)),
+        POSITION_IDS_KEY: torch.tensor(
+            [
+                [0, 1, 2, 3, 0, 1, 2, 3],
+                [0, 1, 2, 3, 0, 1, 2, 3],
+            ],
+            dtype=torch.long,
+        ),
+        SEQUENCE_IDS_KEY: torch.tensor(
+            [
+                [0, 0, 0, 0, 1, 1, 1, 1],
+                [2, 2, 2, 2, 3, 3, 3, 3],
+            ],
+            dtype=torch.long,
+        ),
+    }
+
+    with torch.no_grad():
+        flash_logits = flash(batch)
+        eager_logits = eager(batch)
+
+    torch.testing.assert_close(flash_logits, eager_logits, atol=1e-4, rtol=1e-4)
+
+
+def _packed_test_batch() -> dict[str, torch.Tensor]:
+    return {
+        INPUT_IDS_KEY: torch.randint(0, 32, (2, 8)),
+        POSITION_IDS_KEY: torch.tensor(
+            [
+                [0, 1, 2, 3, 0, 1, 2, 3],
+                [0, 1, 2, 3, 0, 1, 2, 3],
+            ],
+            dtype=torch.long,
+        ),
+        SEQUENCE_IDS_KEY: torch.tensor(
+            [
+                [0, 0, 0, 0, 1, 1, 1, 1],
+                [2, 2, 2, 2, 3, 3, 3, 3],
+            ],
+            dtype=torch.long,
+        ),
+    }
+
+
+def test_tiny_flash_attn_backend_matches_eager_attention_for_packed_batch() -> None:
+    torch.manual_seed(2468)
+    common_kwargs = dict(
+        dim=16,
+        n_heads=4,
+        n_kv_heads=4,
+        hidden_size=32,
+        eps=1e-5,
+        n_layers=2,
+        vocab_size=32,
+        max_seq_len=8,
+    )
+    flash = TinyTransformer(**common_kwargs, attention_backend=AttentionBackend.FLASH_ATTN)
+    eager = TinyTransformer(**common_kwargs, attention_backend=AttentionBackend.EAGER)
+    eager.load_state_dict(flash.state_dict())
+    flash.eval()
+    eager.eval()
+    batch = _packed_test_batch()
+
+    with torch.no_grad():
+        flash_logits = flash(batch)
+        eager_logits = eager(batch)
+
+    torch.testing.assert_close(flash_logits, eager_logits, atol=1e-4, rtol=1e-4)
+
+
+def test_tiny_moe_flash_attn_backend_matches_eager_attention_for_packed_batch() -> None:
+    torch.manual_seed(8642)
+    common_kwargs = dict(
+        dim=16,
+        n_heads=4,
+        n_kv_heads=4,
+        hidden_size=32,
+        eps=1e-5,
+        n_layers=2,
+        vocab_size=32,
+        max_seq_len=8,
+        num_experts=4,
+    )
+    flash = TinyMoETransformer(**common_kwargs, attention_backend=AttentionBackend.FLASH_ATTN)
+    eager = TinyMoETransformer(**common_kwargs, attention_backend=AttentionBackend.EAGER)
+    eager.load_state_dict(flash.state_dict())
+    flash.eval()
+    eager.eval()
+    batch = _packed_test_batch()
+
+    with torch.no_grad():
+        flash_logits = flash(batch)
+        eager_logits = eager(batch)
+
+    torch.testing.assert_close(flash_logits, eager_logits, atol=1e-4, rtol=1e-4)
 
 
 def main() -> None:
@@ -755,6 +876,9 @@ def main() -> None:
     test_grad_accumulation_resume_boundary_cadence()
     test_llama_activation_checkpointing_train_step()
     test_llama_sdpa_auto_matches_eager_attention()
+    test_llama_flash_attn_backend_matches_eager_attention_for_packed_batch()
+    test_tiny_flash_attn_backend_matches_eager_attention_for_packed_batch()
+    test_tiny_moe_flash_attn_backend_matches_eager_attention_for_packed_batch()
     print("runtime core smoke ok")
 
 

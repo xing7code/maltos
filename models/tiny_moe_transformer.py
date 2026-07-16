@@ -8,6 +8,7 @@ from parallel.expert_interfaces import ExpertParallelMoEModule
 from parallel.specs import ContextParallelSpec, ExpertParallelSpec, PipelineParallelSpec
 from parallel.specs import TpSpComm, TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from models.tiny_transformer import CausalSelfAttention, RmsNorm, RoPE, MLP
+from utils.attention_backend import AttentionBackend
 from utils.constants import (
     HIDDEN_STATES_KEY,
     IGNORE_INDEX,
@@ -58,9 +59,18 @@ class Top1MoE(nn.Module):
 
 
 class MoETransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, n_kv_heads: int, hidden_size: int, eps: float, num_experts: int):
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        hidden_size: int,
+        eps: float,
+        num_experts: int,
+        attention_backend: str = AttentionBackend.EAGER,
+    ):
         super().__init__()
-        self.attn = CausalSelfAttention(dim, n_heads, n_kv_heads)
+        self.attn = CausalSelfAttention(dim, n_heads, n_kv_heads, attention_backend=attention_backend)
         self.norm1 = RmsNorm(dim, eps)
         self.moe = Top1MoE(dim, hidden_size, num_experts)
         self.norm2 = RmsNorm(dim, eps)
@@ -98,13 +108,22 @@ class TinyMoETransformer(nn.Module):
         vocab_size: int,
         max_seq_len: int,
         num_experts: int,
+        attention_backend: str = AttentionBackend.EAGER,
     ) -> None:
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.rope = RoPE(dim // n_heads, max_seq_len)
         self.layers = nn.ModuleList(
             [
-                MoETransformerBlock(dim, n_heads, n_kv_heads, hidden_size, eps, num_experts)
+                MoETransformerBlock(
+                    dim,
+                    n_heads,
+                    n_kv_heads,
+                    hidden_size,
+                    eps,
+                    num_experts,
+                    attention_backend=attention_backend,
+                )
                 for _ in range(n_layers)
             ]
         )

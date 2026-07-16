@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from absl import logging
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from models.activation_checkpointing import ActivationCheckpointConfig
 from parallel.specs import ContextParallelSpec
 from parallel.specs import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
-from utils.attention_masking import build_example_causal_mask, canonical_position_ids, canonical_sequence_ids
+from utils.attention_backend import AttentionBackend, causal_attention, validate_attention_backend
+from utils.attention_masking import canonical_position_ids, canonical_sequence_ids
 from utils.constants import (
     HIDDEN_STATES_KEY,
     IGNORE_INDEX,
@@ -38,13 +37,11 @@ class LlamaConfig:
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     tie_word_embeddings: bool = False
-    attention_backend: str = "sdpa_auto"
+    attention_backend: str = AttentionBackend.SDPA_AUTO
     activation_checkpointing: ActivationCheckpointConfig = field(default_factory=ActivationCheckpointConfig)
 
     def __post_init__(self) -> None:
-        valid_backends = {"eager", "sdpa_auto", "sdpa_flash"}
-        if self.attention_backend not in valid_backends:
-            raise ValueError(f"attention_backend must be one of {sorted(valid_backends)}, got {self.attention_backend!r}")
+        validate_attention_backend(self.attention_backend)
 
 
 class LlamaRMSNorm(nn.Module):
@@ -100,26 +97,6 @@ def _repeat_kv(x: torch.Tensor, repeats: int) -> torch.Tensor:
         return x
     return x.repeat_interleave(repeats, dim=1)
 
-
-
-
-def _eager_causal_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    scale = q.size(-1) ** -0.5
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-    if mask is None:
-        seq_len = q.size(-2)
-        mask = torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool).tril().unsqueeze(0).unsqueeze(0)
-    scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-    probs = scores.softmax(dim=-1)
-    return torch.matmul(probs, v)
-
-
 class LlamaAttention(nn.Module):
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
@@ -174,8 +151,7 @@ class LlamaAttention(nn.Module):
 class _LlamaAttentionCore(nn.Module):
     def __init__(self, attention_backend: str) -> None:
         super().__init__()
-        self.attention_backend = attention_backend
-        self._warned_flash_mask_fallback = False
+        self.attention_backend = validate_attention_backend(attention_backend)
 
     def forward(
         self,
@@ -186,7 +162,8 @@ class _LlamaAttentionCore(nn.Module):
         position_ids: torch.Tensor | None = None,
         sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        mask = None
+        positions = None
+        sequences = None
         if position_ids is not None or sequence_ids is not None:
             positions = canonical_position_ids(
                 position_ids,
@@ -201,30 +178,18 @@ class _LlamaAttentionCore(nn.Module):
                 seq_len=q.size(-2),
                 device=q.device,
             )
-            mask = build_example_causal_mask(
-                q_positions=positions,
-                k_positions=positions,
-                q_sequence_ids=sequences,
-                k_sequence_ids=sequences,
-            ).unsqueeze(1)
-        if self.attention_backend == "sdpa_auto":
-            if mask is not None:
-                return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
-            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        if self.attention_backend == "sdpa_flash":
-            if mask is not None:
-                if not self._warned_flash_mask_fallback:
-                    logging.warning(
-                        "LlamaAttention sdpa_flash received example-aware attention mask; "
-                        "falling back to regular SDPA for correctness"
-                    )
-                    self._warned_flash_mask_fallback = True
-                return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
-            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                return F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        if mask is not None:
-            return _eager_causal_attention(q, k, v, mask=mask)
-        return _eager_causal_attention(q, k, v)
+        return causal_attention(
+            q,
+            k,
+            v,
+            attention_backend=self.attention_backend,
+            warning_prefix="LlamaAttention",
+            q_positions=positions,
+            k_positions=positions,
+            q_sequence_ids=sequences,
+            k_sequence_ids=sequences,
+            flash_varlen_mode="same_length",
+        )
 
 
 class LlamaMLP(nn.Module):

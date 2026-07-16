@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from absl import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +8,8 @@ import torch.distributed as dist
 from parallel.specs import ContextParallelSpec
 from parallel.specs import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
-from utils.attention_masking import build_example_causal_mask, canonical_position_ids, canonical_sequence_ids
+from utils.attention_backend import AttentionBackend, causal_attention, validate_attention_backend
+from utils.attention_masking import canonical_position_ids, canonical_sequence_ids
 from utils.constants import (
     HIDDEN_STATES_KEY,
     IGNORE_INDEX,
@@ -24,7 +24,7 @@ from utils.logging import debug_log
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim, n_heads, n_kv_heads):
+    def __init__(self, dim, n_heads, n_kv_heads, attention_backend: str = AttentionBackend.EAGER):
         super().__init__()
         self.head_dim = dim//n_heads
         self.n_heads = n_heads
@@ -33,7 +33,7 @@ class CausalSelfAttention(nn.Module):
         self.k_proj = nn.Linear(dim, self.head_dim*self.n_kv_heads, bias=False)
         self.v_proj = nn.Linear(dim, self.head_dim*self.n_kv_heads, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
-        self.attn_core = _LocalCausalAttentionCore()
+        self.attn_core = _LocalCausalAttentionCore(attention_backend)
 
     def forward(
         self,
@@ -62,6 +62,10 @@ class CausalSelfAttention(nn.Module):
 
 
 class _LocalCausalAttentionCore(nn.Module):
+    def __init__(self, attention_backend: str = AttentionBackend.EAGER) -> None:
+        super().__init__()
+        self.attention_backend = validate_attention_backend(attention_backend)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -71,12 +75,10 @@ class _LocalCausalAttentionCore(nn.Module):
         position_ids: torch.Tensor | None = None,
         sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        logits = (q @ k.transpose(-1, -2)) / q.size(-1) ** 0.5
-        seq_len = q.size(-2)
-        if position_ids is None and sequence_ids is None:
-            causal_mask = torch.ones(seq_len, seq_len, device=q.device).tril().bool()
-            mask = causal_mask.unsqueeze(0).unsqueeze(0)
-        else:
+        positions = None
+        sequences = None
+        if position_ids is not None or sequence_ids is not None:
+            seq_len = q.size(-2)
             positions = canonical_position_ids(
                 position_ids,
                 batch_size=q.size(0),
@@ -90,15 +92,18 @@ class _LocalCausalAttentionCore(nn.Module):
                 seq_len=seq_len,
                 device=q.device,
             )
-            mask = build_example_causal_mask(
-                q_positions=positions,
-                k_positions=positions,
-                q_sequence_ids=sequences,
-                k_sequence_ids=sequences,
-            ).unsqueeze(1)
-        logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
-        scores = F.softmax(logits, dim=-1)
-        return scores @ v
+        return causal_attention(
+            q,
+            k,
+            v,
+            attention_backend=self.attention_backend,
+            warning_prefix="TinyTransformer",
+            q_positions=positions,
+            k_positions=positions,
+            q_sequence_ids=sequences,
+            k_sequence_ids=sequences,
+            flash_varlen_mode="same_length",
+        )
 
 
 class MLP(nn.Module):
@@ -129,9 +134,9 @@ class RmsNorm(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, n_kv_heads, hidden_size, eps):
+    def __init__(self, dim, n_heads, n_kv_heads, hidden_size, eps, attention_backend: str = AttentionBackend.EAGER):
         super().__init__()
-        self.attn = CausalSelfAttention(dim, n_heads, n_kv_heads)
+        self.attn = CausalSelfAttention(dim, n_heads, n_kv_heads, attention_backend=attention_backend)
         self.norm1 = RmsNorm(dim, eps)
         self.mlp = MLP(dim, hidden_size)
         self.norm2 = RmsNorm(dim, eps)
@@ -186,12 +191,31 @@ class RoPE(nn.Module):
 
 
 class TinyTransformer(nn.Module):
-    def __init__(self, dim, n_heads, n_kv_heads, hidden_size, eps, n_layers, vocab_size, max_seq_len):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        n_kv_heads,
+        hidden_size,
+        eps,
+        n_layers,
+        vocab_size,
+        max_seq_len,
+        attention_backend: str = AttentionBackend.EAGER,
+    ):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.rope = RoPE(dim//n_heads, max_seq_len)
         self.layers = nn.ModuleList([
-            TransformerBlock(dim, n_heads, n_kv_heads, hidden_size, eps) for _ in range(n_layers)
+            TransformerBlock(
+                dim,
+                n_heads,
+                n_kv_heads,
+                hidden_size,
+                eps,
+                attention_backend=attention_backend,
+            )
+            for _ in range(n_layers)
         ])
         self.norm = RmsNorm(dim, eps)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
