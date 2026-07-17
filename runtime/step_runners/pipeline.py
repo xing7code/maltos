@@ -17,7 +17,7 @@ from utils.constants import (
     SEQUENCE_IDS_KEY,
 )
 
-from runtime.buffer_allocator import allocate_buffer
+from runtime.buffer_allocator import BufferPolicy, acquire_buffer
 from runtime.step_runners.base import DefaultStepRunner
 from runtime.types import PpStatus
 from utils.distributed import all_reduce_tensor, irecv_tensor_async, isend_tensor_async
@@ -264,12 +264,13 @@ class PipelineStepRunner:
             self.plugin.hidden_size,
             sequence_parallel_world_size=self.plugin.sequence_parallel_world_size,
         )
-        buffer = allocate_buffer(
-            key=f"pp.recv_activation.mb{microbatch_idx}",
+        buffer = acquire_buffer(
             shape=shape,
             dtype=dtype,
             device=device,
-        )
+            policy=BufferPolicy.PINNED,
+            key=f"pp.recv_activation.mb{microbatch_idx}",
+        ).tensor
         work = irecv_tensor_async(buffer, self.plugin.prev_global_rank, group=self.plugin.pp_group)
         return buffer, work
 
@@ -282,12 +283,13 @@ class PipelineStepRunner:
     def recv_grad_async(self, runtime, output_activation: torch.Tensor) -> tuple[torch.Tensor, object]:
         assert self.plugin.next_global_rank is not None
         microbatch_idx = runtime.state.step_context.pp_cur_microbatch_idx
-        grad = allocate_buffer(
-            key=f"pp.recv_grad.mb{microbatch_idx}",
+        grad = acquire_buffer(
             shape=tuple(output_activation.shape),
             dtype=output_activation.dtype,
             device=output_activation.device,
-        )
+            policy=BufferPolicy.PINNED,
+            key=f"pp.recv_grad.mb{microbatch_idx}",
+        ).tensor
         work = irecv_tensor_async(grad, self.plugin.next_global_rank, group=self.plugin.pp_group)
         return grad, work
 

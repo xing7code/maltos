@@ -3,7 +3,7 @@ seed: 42
 data:
   format: sft
   seq_len: 4096
-  micro_batch_size: 1
+  micro_batch_size: 2
 
 model:
   type: olmo2
@@ -26,7 +26,7 @@ parallel:
 
 training:
   max_steps: 1000
-  grad_accum_steps: 8
+  grad_accum_steps: 16
   lr: 5.0e-6
   weight_decay: 0.0
   adam_beta1: 0.9

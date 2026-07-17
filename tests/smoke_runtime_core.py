@@ -26,6 +26,7 @@ from attention_backend_utils import resolve_attention_backend
 from parallel import ParallelPlan
 from parallel.specs import TpSpShardAxis
 from runtime import DefaultStepRunner, MeshConfig, ParamRole, PluginId, RuntimeCore, RuntimePhase
+from runtime.buffer_allocator import BufferPolicy, acquire_buffer, clear_buffer_pool, release_buffer
 from runtime.mesh import MeshAxis
 from runtime.plugins.ddp import DataParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
@@ -191,6 +192,55 @@ def test_runtime_device_is_canonicalized_on_setup() -> None:
     core.setup()
     assert isinstance(core.device, torch.device)
     assert core.device == torch.device("cpu")
+
+
+def test_buffer_pool_borrows_views_from_contiguous_slab_and_reuses_returns() -> None:
+    clear_buffer_pool()
+    device = torch.device("cpu")
+    first = acquire_buffer(shape=(8,), dtype=torch.float32, device=device, policy=BufferPolicy.CACHEABLE)
+    second = acquire_buffer(shape=(8,), dtype=torch.float32, device=device, policy=BufferPolicy.CACHEABLE)
+
+    assert first.tensor.untyped_storage().data_ptr() == second.tensor.untyped_storage().data_ptr()
+    assert first.tensor.data_ptr() != second.tensor.data_ptr()
+
+    first_ptr = first.tensor.data_ptr()
+    release_buffer(first)
+    release_buffer(second)
+
+    reused = acquire_buffer(shape=(8,), dtype=torch.float32, device=device, policy=BufferPolicy.CACHEABLE)
+    assert reused.tensor.data_ptr() == first_ptr
+    release_buffer(reused)
+    clear_buffer_pool()
+
+
+def test_buffer_pool_pinned_buffers_share_policy_arena_storage() -> None:
+    clear_buffer_pool()
+    device = torch.device("cpu")
+    first = acquire_buffer(
+        shape=(8,),
+        dtype=torch.float32,
+        device=device,
+        policy=BufferPolicy.PINNED,
+        key="smoke.pinned.first",
+    )
+    second = acquire_buffer(
+        shape=(8,),
+        dtype=torch.float32,
+        device=device,
+        policy=BufferPolicy.PINNED,
+        key="smoke.pinned.second",
+    )
+    first_again = acquire_buffer(
+        shape=(8,),
+        dtype=torch.float32,
+        device=device,
+        policy=BufferPolicy.PINNED,
+        key="smoke.pinned.first",
+    )
+
+    assert first.tensor.untyped_storage().data_ptr() != second.tensor.untyped_storage().data_ptr()
+    assert first_again.tensor.data_ptr() == first.tensor.data_ptr()
+    clear_buffer_pool()
 
 
 def test_optimizer_factory_runs_after_model_transform() -> None:
@@ -1017,6 +1067,8 @@ def test_tiny_moe_flash_attn_backend_matches_eager_attention_for_packed_batch() 
 
 def main() -> None:
     test_plugin_ordering()
+    test_buffer_pool_borrows_views_from_contiguous_slab_and_reuses_returns()
+    test_buffer_pool_pinned_buffers_share_policy_arena_storage()
     test_optimizer_factory_runs_after_model_transform()
     test_scheduler_factory_supports_plugin_owned_optimizer()
     test_missing_required_plugin_fails()

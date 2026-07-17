@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from runtime.buffer_allocator import allocate_buffer
+from runtime.buffer_allocator import BufferHandle, BufferPolicy, acquire_buffer, release_buffer
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId
 from runtime.plugins.zero_common import (
@@ -47,9 +47,11 @@ class _Bucket:
 
 @dataclass
 class _BucketExecState:
-    data_buffer: torch.Tensor
-    grad_buffer: torch.Tensor
-    shard_buffer: torch.Tensor
+    data_buffer: torch.Tensor | None = None
+    grad_buffer: torch.Tensor | None = None
+    grad_buffer_handle: BufferHandle | None = None
+    shard_buffer: torch.Tensor | None = None
+    shard_buffer_handle: BufferHandle | None = None
     fwd_handle: dist.Work | CompletedWork | None = None
     bwd_handle: dist.Work | CompletedWork | None = None
     grad_work: ChainedWork | None = None
@@ -73,7 +75,7 @@ class Zero3Plugin(ZeroPluginBase):
         )
         self.wrap_cls = set(wrap_cls or {nn.Linear})
         self.buckets: list[_Bucket] = []
-        self._materialized_buffers: list[torch.Tensor] = []
+        self._materialized_buffer_handles: list[BufferHandle] = []
         self.bucket_order_checked = False
         self._observed_forward_order: list[_Bucket] = []
         self._observed_forward_set: set[int] = set()
@@ -210,16 +212,8 @@ class Zero3Plugin(ZeroPluginBase):
         shard_start = group_context.rank * shard_len
         shard_end = (group_context.rank + 1) * shard_len
         local_param = nn.Parameter(full_param[shard_start:shard_end].clone())
-        shard_buffer = torch.empty(shard_len, dtype=dtype, device=device)
         exec_state_count = self.runtime.plan.pp_schedule.microbatches
-        exec_states = [
-            _BucketExecState(
-                data_buffer=torch.empty(buffer_size, dtype=dtype, device=device),
-                grad_buffer=torch.empty(buffer_size, dtype=dtype, device=device),
-                shard_buffer=shard_buffer.clone(),
-            )
-            for _ in range(exec_state_count)
-        ]
+        exec_states = [_BucketExecState() for _ in range(exec_state_count)]
         return _Bucket(
             module=module,
             params=params,
@@ -259,9 +253,11 @@ class Zero3Plugin(ZeroPluginBase):
 
     def _make_free_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs, outputs) -> None:
+            state = self._exec_state(bucket)
             self._register_backward_output_hooks(bucket, outputs)
             self._free_full_params(bucket)
-            self._exec_state(bucket).fwd_handle = None
+            self._release_data_buffer(state)
+            state.fwd_handle = None
 
         return hook
 
@@ -269,9 +265,10 @@ class Zero3Plugin(ZeroPluginBase):
         def hook(grad: torch.Tensor) -> torch.Tensor:
             state = self._exec_state(bucket)
             if not state.attached:
+                grad_buffer = self._ensure_grad_buffer(bucket, state)
                 offset = 0
                 for param, numel, shape in zip(bucket.params, bucket.param_numels, bucket.param_shapes):
-                    param.grad = state.grad_buffer[offset : offset + numel].view(shape)
+                    param.grad = grad_buffer[offset : offset + numel].view(shape)
                     offset += numel
                 state.attached = True
             return grad
@@ -287,15 +284,18 @@ class Zero3Plugin(ZeroPluginBase):
                     bucket.local_param.grad = torch.empty_like(bucket.local_param.data)
                 state.grad_work = self._new_state_grad_work(bucket, state)
                 state.grad_work.fire()
+                self._free_full_params(bucket)
+                self._release_data_buffer(state)
                 bucket.pending_exec_reductions -= 1
 
         return hook
 
     def _prefetch_bucket(self, bucket: _Bucket, direction: _ExecDirection) -> None:
         state = self._exec_state(bucket)
+        data_buffer = self._ensure_data_buffer(bucket, state)
         is_fwd = direction == _ExecDirection.FORWARD
         if bucket.group_context.group is None or bucket.group_context.world_size == 1:
-            state.data_buffer.copy_(bucket.local_param.detach())
+            data_buffer.copy_(bucket.local_param.detach())
             if is_fwd:
                 state.fwd_handle = CompletedWork()
             else:
@@ -308,7 +308,7 @@ class Zero3Plugin(ZeroPluginBase):
             if state.bwd_handle is not None:
                 return
         handle = all_gather_single(
-            state.data_buffer,
+            data_buffer,
             bucket.local_param.detach().contiguous(),
             group=bucket.group_context.group,
             async_op=True,
@@ -371,15 +371,18 @@ class Zero3Plugin(ZeroPluginBase):
             state.fwd_handle = None
         else:
             state.bwd_handle = None
+        if state.data_buffer is None:
+            raise RuntimeError("Zero3 materialized params require an allocated data buffer")
         self._bind_full_params(bucket, state.data_buffer)
 
     def _materialize_full_params_sync(self, bucket: _Bucket) -> None:
-        buffer = allocate_buffer(
-            key=f"zero3.materialize_sync.bucket{bucket.index}",
+        handle = acquire_buffer(
             shape=(bucket.buffer_size,),
             dtype=bucket.local_param.dtype,
             device=bucket.local_param.device,
+            policy=BufferPolicy.CACHEABLE,
         )
+        buffer = handle.tensor
         if bucket.group_context.group is None or bucket.group_context.world_size == 1:
             buffer.copy_(bucket.local_param.detach())
         else:
@@ -388,7 +391,7 @@ class Zero3Plugin(ZeroPluginBase):
                 bucket.local_param.detach().contiguous(),
                 group=bucket.group_context.group,
             )
-        self._materialized_buffers.append(buffer)
+        self._materialized_buffer_handles.append(handle)
         self._bind_full_params(bucket, buffer)
 
     def _bind_full_params(self, bucket: _Bucket, buffer: torch.Tensor) -> None:
@@ -407,11 +410,13 @@ class Zero3Plugin(ZeroPluginBase):
     def _reduce_scatter_avg_functor(self, bucket: _Bucket, state: _BucketExecState):
         assert self.runtime is not None
         assert bucket.local_param.grad is not None
+        grad_buffer = self._ensure_grad_buffer(bucket, state)
+        shard_buffer = self._ensure_shard_buffer(bucket, state)
 
         def functor() -> dist.Work:
             if bucket.group_context.group is None or bucket.group_context.world_size == 1:
-                shard = state.grad_buffer[: bucket.local_param.numel()]
-                state.shard_buffer.copy_(
+                shard = grad_buffer[: bucket.local_param.numel()]
+                shard_buffer.copy_(
                     shard
                     if bucket.group_context.correction == 1.0
                     else shard * bucket.group_context.correction
@@ -422,19 +427,19 @@ class Zero3Plugin(ZeroPluginBase):
                 # the 1/world_size averaging factor AVG would otherwise apply.
                 gloo_correction = bucket.group_context.correction / bucket.group_context.world_size
                 if gloo_correction != 1.0:
-                    state.grad_buffer.mul_(gloo_correction)
-                work = dist.all_reduce(state.grad_buffer, op=dist.ReduceOp.SUM, group=bucket.group_context.group, async_op=True)
+                    grad_buffer.mul_(gloo_correction)
+                work = dist.all_reduce(grad_buffer, op=dist.ReduceOp.SUM, group=bucket.group_context.group, async_op=True)
                 shard_len = bucket.local_param.numel()
                 shard_start = bucket.group_context.rank * shard_len
                 shard_end = (bucket.group_context.rank + 1) * shard_len
                 return NarrowShardWork(
-                    work, state.grad_buffer, state.shard_buffer, shard_start, shard_end
+                    work, grad_buffer, shard_buffer, shard_start, shard_end
                 )
             if bucket.group_context.correction != 1.0:
-                state.grad_buffer.mul_(bucket.group_context.correction)
+                grad_buffer.mul_(bucket.group_context.correction)
             work = reduce_scatter_single(
-                state.shard_buffer,
-                state.grad_buffer,
+                shard_buffer,
+                grad_buffer,
                 op=dist.ReduceOp.AVG,
                 group=bucket.group_context.group,
                 async_op=True,
@@ -444,14 +449,16 @@ class Zero3Plugin(ZeroPluginBase):
         return functor
 
     def materialize_model(self) -> None:
-        self._materialized_buffers.clear()
+        for bucket in self.buckets:
+            self._free_full_params(bucket)
+        self._release_materialized_buffers()
         for bucket in self.buckets:
             self._materialize_full_params_sync(bucket)
 
     def reshard_model(self) -> None:
         for bucket in self.buckets:
             self._free_full_params(bucket)
-        self._materialized_buffers.clear()
+        self._release_materialized_buffers()
 
     def override_param_state_dict(self) -> tuple[dict[str, torch.Tensor], list[ParamState]] | None:
         state = {}
@@ -517,6 +524,7 @@ class Zero3Plugin(ZeroPluginBase):
                 self._wait_state_grad_work(bucket, state)
                 state.grad_work = None
             self._free_full_params(bucket)
+            self._release_bucket_data_buffers(bucket)
 
     def _flush_partial_grad_state_for_checkpoint(self) -> None:
         for bucket in self.buckets:
@@ -531,9 +539,11 @@ class Zero3Plugin(ZeroPluginBase):
                     state.fwd_handle.wait()
                     state.fwd_handle = None
             self._free_full_params(bucket)
+            for state in bucket.exec_states:
+                self._release_data_buffer(state)
 
     def _reset_buckets(self, *, grad_accum_start: bool, backward_start: bool = True) -> None:
-        self._materialized_buffers.clear()
+        self._release_materialized_buffers()
         for bucket in self.buckets:
             if grad_accum_start:
                 if bucket.local_param.grad is None:
@@ -553,8 +563,8 @@ class Zero3Plugin(ZeroPluginBase):
                 self._wait_state_grad_work(bucket, backward_state)
                 backward_state.grad_work = None
             backward_state.bwd_handle = None
-            backward_state.grad_buffer.zero_()
-            backward_state.shard_buffer.zero_()
+            self._ensure_grad_buffer(bucket, backward_state).zero_()
+            self._ensure_shard_buffer(bucket, backward_state).zero_()
             backward_state.pending = len(bucket.params)
             backward_state.attached = False
             backward_state.backward_materialized = False
@@ -570,8 +580,8 @@ class Zero3Plugin(ZeroPluginBase):
         # exec_state[1] (first backward) may still have torch.empty garbage when its hook does
         # not fire (e.g. EP expert not selected in that microbatch). Without this zero_(), the
         # uninitialized buffer propagates NaN through the reduce-scatter.
-        state.grad_buffer.zero_()
-        state.shard_buffer.zero_()
+        self._ensure_grad_buffer(bucket, state).zero_()
+        self._ensure_shard_buffer(bucket, state).zero_()
         state.grad_work = self._new_state_grad_work(bucket, state)
         state.grad_work.fire()
 
@@ -593,7 +603,13 @@ class Zero3Plugin(ZeroPluginBase):
         assert state.grad_work is not None
         assert bucket.local_param.grad is not None
         state.grad_work.wait()
+        if state.shard_buffer is None:
+            raise RuntimeError("Zero3 grad sync completed without an allocated shard buffer")
         bucket.local_param.grad.add_(state.shard_buffer)
+        for param in bucket.params:
+            param.grad = None
+        state.attached = False
+        self._release_grad_buffers(state)
 
 
     def _exec_state(self, bucket: _Bucket) -> _BucketExecState:
@@ -602,6 +618,61 @@ class Zero3Plugin(ZeroPluginBase):
         assert self.runtime is not None
         context = self.runtime.state.step_context
         return bucket.exec_states[context.pp_cur_microbatch_idx]
+
+    def _ensure_data_buffer(self, bucket: _Bucket, state: _BucketExecState) -> torch.Tensor:
+        if state.data_buffer is None:
+            state.data_buffer = torch.empty(
+                bucket.buffer_size,
+                dtype=bucket.local_param.dtype,
+                device=bucket.local_param.device,
+            )
+        return state.data_buffer
+
+    def _ensure_grad_buffer(self, bucket: _Bucket, state: _BucketExecState) -> torch.Tensor:
+        if state.grad_buffer is None:
+            handle = acquire_buffer(
+                shape=(bucket.buffer_size,),
+                dtype=bucket.local_param.dtype,
+                device=bucket.local_param.device,
+                policy=BufferPolicy.CACHEABLE,
+            )
+            state.grad_buffer_handle = handle
+            state.grad_buffer = handle.tensor
+        return state.grad_buffer
+
+    def _ensure_shard_buffer(self, bucket: _Bucket, state: _BucketExecState) -> torch.Tensor:
+        if state.shard_buffer is None:
+            handle = acquire_buffer(
+                shape=tuple(bucket.local_param.shape),
+                dtype=bucket.local_param.dtype,
+                device=bucket.local_param.device,
+                policy=BufferPolicy.CACHEABLE,
+            )
+            state.shard_buffer_handle = handle
+            state.shard_buffer = handle.tensor
+        return state.shard_buffer
+
+    def _release_data_buffer(self, state: _BucketExecState) -> None:
+        state.data_buffer = None
+
+    def _release_grad_buffers(self, state: _BucketExecState) -> None:
+        if state.grad_buffer_handle is not None:
+            release_buffer(state.grad_buffer_handle)
+            state.grad_buffer_handle = None
+        if state.shard_buffer_handle is not None:
+            release_buffer(state.shard_buffer_handle)
+            state.shard_buffer_handle = None
+        state.grad_buffer = None
+        state.shard_buffer = None
+
+    def _release_bucket_data_buffers(self, bucket: _Bucket) -> None:
+        for state in bucket.exec_states:
+            self._release_data_buffer(state)
+
+    def _release_materialized_buffers(self) -> None:
+        for handle in self._materialized_buffer_handles:
+            release_buffer(handle)
+        self._materialized_buffer_handles.clear()
 
 
 def _iter_tensors(obj):

@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from runtime.buffer_allocator import BufferPolicy, acquire_buffer
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId
 from runtime.plugins.zero_common import (
@@ -112,7 +113,14 @@ class Zero2Plugin(ZeroPluginBase):
             for bucket_params in param_buckets:
                 padded_size = self._padded_len(sum(param.numel() for param in bucket_params), group_context.world_size)
                 flat_specs.append((group_context, bucket_params, padded_size, role))
-        self.data_buffer = torch.zeros(sum(padded_size for _, _, padded_size, _ in flat_specs), dtype=dtype, device=device)
+        self.data_buffer = acquire_buffer(
+            shape=(sum(padded_size for _, _, padded_size, _ in flat_specs),),
+            dtype=dtype,
+            device=device,
+            policy=BufferPolicy.PINNED,
+            key="zero2.data_buffer",
+        ).tensor
+        self.data_buffer.zero_()
 
         offset = 0
         for group_context, bucket_params, padded_size, role in flat_specs:
@@ -139,10 +147,22 @@ class Zero2Plugin(ZeroPluginBase):
                     local_param=nn.Parameter(self.data_buffer[shard_start:shard_end].clone()),
                     exec_states=[
                         _BucketExecState(
-                            grad_buffer=torch.zeros(padded_size, dtype=dtype, device=device),
-                            shard_buffer=torch.zeros(per_rank_size, dtype=dtype, device=device),
+                            grad_buffer=self._make_exec_grad_buffer(
+                                bucket_index=len(self.buckets),
+                                state_index=state_index,
+                                padded_size=padded_size,
+                                dtype=dtype,
+                                device=device,
+                            ),
+                            shard_buffer=self._make_exec_shard_buffer(
+                                bucket_index=len(self.buckets),
+                                state_index=state_index,
+                                per_rank_size=per_rank_size,
+                                dtype=dtype,
+                                device=device,
+                            ),
                         )
-                        for _ in range(self.runtime.plan.pp_schedule.microbatches)
+                        for state_index in range(self.runtime.plan.pp_schedule.microbatches)
                     ],
                 )
             )
@@ -166,6 +186,44 @@ class Zero2Plugin(ZeroPluginBase):
             return grad
 
         return hook
+
+    def _make_exec_grad_buffer(
+        self,
+        *,
+        bucket_index: int,
+        state_index: int,
+        padded_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        buffer = acquire_buffer(
+            shape=(padded_size,),
+            dtype=dtype,
+            device=device,
+            policy=BufferPolicy.PINNED,
+            key=f"zero2.bucket.{bucket_index}.state.{state_index}.grad_buffer",
+        ).tensor
+        buffer.zero_()
+        return buffer
+
+    def _make_exec_shard_buffer(
+        self,
+        *,
+        bucket_index: int,
+        state_index: int,
+        per_rank_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        buffer = acquire_buffer(
+            shape=(per_rank_size,),
+            dtype=dtype,
+            device=device,
+            policy=BufferPolicy.PINNED,
+            key=f"zero2.bucket.{bucket_index}.state.{state_index}.shard_buffer",
+        ).tensor
+        buffer.zero_()
+        return buffer
 
     def _attach_bucket_grad_buffer(self, bucket: _Bucket, state: _BucketExecState) -> None:
         offset = 0

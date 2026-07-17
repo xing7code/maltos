@@ -1,4 +1,4 @@
-from .buffer_allocator import allocate_buffer
+from .buffer_allocator import BufferHandle, BufferPolicy, acquire_buffer, clear_buffer_pool, global_buffer_pool, release_buffer
 from .core import (
     RuntimeCore,
 )
@@ -15,7 +15,10 @@ from .step_runners import DefaultStepRunner, PipelineScheduleKind, PipelineStepR
 from .types import MetricValue, ParamRole, PpStatus, RuntimePhase, RuntimeState, StepContext
 
 __all__ = [
-    "allocate_buffer",
+    "acquire_buffer",
+    "BufferHandle",
+    "BufferPolicy",
+    "clear_buffer_pool",
     "DefaultStepRunner",
     "MetricValue",
     "MeshAxis",
@@ -36,4 +39,6 @@ __all__ = [
     "StepContext",
     "StepRunner",
     "TpSpParallelizableModule",
+    "global_buffer_pool",
+    "release_buffer",
 ]

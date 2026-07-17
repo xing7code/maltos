@@ -12,6 +12,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from parallel.expert_interfaces import ExpertParallelMoEModule
+from runtime.buffer_allocator import BufferPolicy, acquire_buffer
 from runtime.layers.moe import ExpertParallelMoE
 from runtime.mesh import MeshAxis
 from runtime.plugin import ExpertParallelizableModule, PluginId, RuntimePlugin
@@ -151,8 +152,15 @@ class ExpertParallelPlugin(RuntimePlugin):
         dtype, device = expert_params[0].dtype, expert_params[0].device
         edp_group = self.edp_group
         edp_blocks_by_stream = edp_group is None or dist.get_backend(edp_group) != "gloo"
-        for bucket_params in build_param_buckets(expert_params, self.bucket_byte_size):
-            grad_buffer = torch.zeros(sum(p.numel() for p in bucket_params), dtype=dtype, device=device)
+        for bucket_index, bucket_params in enumerate(build_param_buckets(expert_params, self.bucket_byte_size)):
+            grad_buffer = acquire_buffer(
+                shape=(sum(p.numel() for p in bucket_params),),
+                dtype=dtype,
+                device=device,
+                policy=BufferPolicy.PINNED,
+                key=f"ep.bucket.{bucket_index}.grad_buffer",
+            ).tensor
+            grad_buffer.zero_()
             offset = 0
             for param in bucket_params:
                 param.grad = grad_buffer[offset : offset + param.numel()].view_as(param)

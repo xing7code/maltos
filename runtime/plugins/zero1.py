@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from runtime.buffer_allocator import BufferPolicy, acquire_buffer
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId
 from runtime.plugins.zero_common import (
@@ -104,8 +105,22 @@ class Zero1Plugin(ZeroPluginBase):
                 padded_size = self._padded_len(sum(param.numel() for param in bucket_params), group_context.world_size)
                 flat_specs.append((group_context, bucket_params, padded_size, role))
         total_padded = sum(padded_size for _, _, padded_size, _ in flat_specs)
-        self.data_buffer = torch.zeros(total_padded, dtype=dtype, device=device)
-        self.grad_buffer = torch.zeros(total_padded, dtype=dtype, device=device)
+        self.data_buffer = acquire_buffer(
+            shape=(total_padded,),
+            dtype=dtype,
+            device=device,
+            policy=BufferPolicy.PINNED,
+            key="zero1.data_buffer",
+        ).tensor
+        self.grad_buffer = acquire_buffer(
+            shape=(total_padded,),
+            dtype=dtype,
+            device=device,
+            policy=BufferPolicy.PINNED,
+            key="zero1.grad_buffer",
+        ).tensor
+        self.data_buffer.zero_()
+        self.grad_buffer.zero_()
 
         offset = 0
         for group_context, bucket_params, padded_size, role in flat_specs:

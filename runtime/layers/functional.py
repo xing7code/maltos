@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from runtime.buffer_allocator import allocate_buffer
+from runtime.buffer_allocator import BufferPolicy, acquire_buffer
 from runtime.layers.flash_utils import flash_attn_dense_backward, flash_attn_dense_with_lse
 from utils.distributed import all_gather_single, all_reduce_tensor, pairwise_send_recv_async, reduce_scatter_single
 
@@ -40,12 +40,13 @@ class AllGather(torch.autograd.Function):
 
         x_t = x.transpose(0, comm_dim).contiguous()
         out_shape = (ctx.world_size * x_t.shape[0], *x_t.shape[1:])
-        out_t = allocate_buffer(
-            key=f"{alloc_key}.forward",
+        out_t = acquire_buffer(
             shape=out_shape,
             dtype=x.dtype,
             device=x.device,
-        )
+            policy=BufferPolicy.PINNED,
+            key=f"{alloc_key}.forward",
+        ).tensor
         all_gather_single(out_t, x_t, group=group)
         return out_t.transpose(0, comm_dim).contiguous()
 
@@ -72,12 +73,13 @@ class ReduceScatter(torch.autograd.Function):
         x_t = x.transpose(0, comm_dim).contiguous()
         shape = list(x_t.size())
         shape[0] //= ctx.world_size
-        out = allocate_buffer(
-            key=f"{alloc_key}.forward",
+        out = acquire_buffer(
             shape=tuple(shape),
             dtype=x.dtype,
             device=x.device,
-        )
+            policy=BufferPolicy.PINNED,
+            key=f"{alloc_key}.forward",
+        ).tensor
         reduce_scatter_single(out, x_t, group=ctx.group, op=reduce_op)
         return out.transpose(0, comm_dim).contiguous()
 
@@ -85,12 +87,13 @@ class ReduceScatter(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         grad_output_t = grad_output.transpose(0, ctx.comm_dim).contiguous()
         out_shape = (ctx.world_size * grad_output_t.shape[0], *grad_output_t.shape[1:])
-        out_t = allocate_buffer(
-            key=f"{ctx.alloc_key}.backward",
+        out_t = acquire_buffer(
             shape=out_shape,
             dtype=grad_output.dtype,
             device=grad_output.device,
-        )
+            policy=BufferPolicy.PINNED,
+            key=f"{ctx.alloc_key}.backward",
+        ).tensor
         all_gather_single(out_t, grad_output_t, group=ctx.group)
         return out_t.transpose(0, ctx.comm_dim).contiguous(), None, None, None, None
 
@@ -141,12 +144,13 @@ class _RowParallelReduceScatterAsync(torch.autograd.Function):
 
         grad_output_t = grad_output.transpose(0, 1).contiguous()
         gathered_shape = (ctx.world_size * grad_output_t.shape[0], *grad_output_t.shape[1:])
-        gathered_grad_output_t = allocate_buffer(
-            key=f"{ctx.alloc_key}.backward.all_gather",
+        gathered_grad_output_t = acquire_buffer(
             shape=gathered_shape,
             dtype=grad_output.dtype,
             device=grad_output.device,
-        )
+            policy=BufferPolicy.PINNED,
+            key=f"{ctx.alloc_key}.backward.all_gather",
+        ).tensor
         handle = all_gather_single(
             gathered_grad_output_t,
             grad_output_t,
@@ -193,12 +197,13 @@ class _RingShift(torch.autograd.Function):
         ctx.alloc_key = alloc_key
         if dist.get_world_size(group) == 1:
             return x
-        out = allocate_buffer(
-            key=f"{alloc_key}.forward",
+        out = acquire_buffer(
             shape=tuple(x.shape),
             dtype=x.dtype,
             device=x.device,
-        )
+            policy=BufferPolicy.PINNED,
+            key=f"{alloc_key}.forward",
+        ).tensor
         send_global_rank = dist.get_global_rank(group, send_to)
         recv_global_rank = dist.get_global_rank(group, recv_from)
         _pairwise_send_recv(
@@ -214,12 +219,13 @@ class _RingShift(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         if dist.get_world_size(ctx.group) == 1:
             return grad_output, None, None, None, None
-        grad_input = allocate_buffer(
-            key=f"{ctx.alloc_key}.backward",
+        grad_input = acquire_buffer(
             shape=tuple(grad_output.shape),
             dtype=grad_output.dtype,
             device=grad_output.device,
-        )
+            policy=BufferPolicy.PINNED,
+            key=f"{ctx.alloc_key}.backward",
+        ).tensor
         send_global_rank = dist.get_global_rank(ctx.group, ctx.recv_from)
         recv_global_rank = dist.get_global_rank(ctx.group, ctx.send_to)
         _pairwise_send_recv(
@@ -336,12 +342,13 @@ def _ring_exchange_tensor_async(
     if dist.get_world_size(group) == 1:
         return _AsyncRingExchange(send_tensor=x, recv_tensor=x, works=[])
     send_tensor = x.contiguous()
-    recv_tensor = allocate_buffer(
-        key=f"{alloc_key}.async",
+    recv_tensor = acquire_buffer(
         shape=tuple(x.shape),
         dtype=x.dtype,
         device=x.device,
-    )
+        policy=BufferPolicy.PINNED,
+        key=f"{alloc_key}.async",
+    ).tensor
     send_global_rank = dist.get_global_rank(group, send_to)
     recv_global_rank = dist.get_global_rank(group, recv_from)
     works = _pairwise_send_recv_async(

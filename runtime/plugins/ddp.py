@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
+from runtime.buffer_allocator import BufferPolicy, acquire_buffer
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
 from runtime.types import ParamRole, RuntimePhase
@@ -84,7 +85,14 @@ class _Bucket:
     def finalize(self) -> None:
         total_numel = sum(param.numel() for param in self.params)
         dtype, device = self.params[0].dtype, self.params[0].device
-        self.flat_buffer = torch.zeros(total_numel, dtype=dtype, device=device)
+        self.flat_buffer = acquire_buffer(
+            shape=(total_numel,),
+            dtype=dtype,
+            device=device,
+            policy=BufferPolicy.PINNED,
+            key=f"ddp.bucket.{id(self)}.flat",
+        ).tensor
+        self.flat_buffer.zero_()
         offset = 0
         for param in self.params:
             view = self.flat_buffer[offset : offset + param.numel()].view_as(param)
