@@ -519,6 +519,39 @@ def build_full_stack_matrix_cases(
         )
     )
 
+    # I: OLMo TP/SP + PP + ZeRO coverage.
+    add(
+        _case(
+            "I/olmo2_tp/full_eq/z3",
+            "full_eq",
+            backend=backend,
+            world_size=world_size,
+            dp_size=2,
+            pp_size=2,
+            cp_size=1,
+            tp_size=2,
+            zero_stage=3,
+            model="olmo2",
+        )
+    )
+    add(
+        _case(
+            "I/olmo2_tp/full_resume/z3_afab_acc1",
+            "full_resume",
+            needs_checkpoint_dir=True,
+            backend=backend,
+            world_size=world_size,
+            dp_size=2,
+            pp_size=2,
+            cp_size=1,
+            tp_size=2,
+            zero_stage=3,
+            pp_schedule="afab",
+            grad_accum_steps=1,
+            model="olmo2",
+        )
+    )
+
     if case_names:
         ordered_names: list[str] = []
         seen: set[str] = set()

@@ -27,6 +27,7 @@ import os
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn as nn
 
 from distributed_test_utils import (
     max_diff as _max_diff,
@@ -37,10 +38,11 @@ from distributed_test_utils import (
 )
 from attention_backend_utils import add_attention_backend_arg, resolve_attention_backend
 from helpers import causal_lm_batch, packed_causal_lm_batch
-from models import TinyTransformer, TinyTransformerTpSp
+from models import OlmoConfig, OlmoForCausalLM, OlmoForCausalLMTpSp, OlmoRMSNorm, TinyTransformer, TinyTransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ContextParallelAttentionCoreType, ParallelPlan
 from parallel.plan import PipelineScheduleConfig
+from runtime.layers.distributed_rmsnorm import DistributedRMSNorm
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.types import RuntimePhase
 from runtime.plugins.cp import ContextParallelPlugin
@@ -52,7 +54,7 @@ from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
 
 
-_MODEL_KWARGS = dict(
+_TINY_MODEL_KWARGS = dict(
     dim=64,
     n_heads=4,
     n_kv_heads=4,
@@ -62,8 +64,17 @@ _MODEL_KWARGS = dict(
     vocab_size=256,
     max_seq_len=64,
 )
+_OLMO_MODEL_KWARGS = dict(
+    hidden_size=64,
+    num_attention_heads=4,
+    num_key_value_heads=4,
+    intermediate_size=128,
+    num_hidden_layers=4,
+    vocab_size=256,
+    max_position_embeddings=64,
+    rms_norm_eps=1e-6,
+)
 
-_ZERO3_WRAP_CLS = {torch.nn.Linear, torch.nn.Embedding, RmsNorm}
 _LOSS_ATOL = 1e-3
 _GRAD_ATOL = 1e-5
 _STEP_ATOL = 1e-5
@@ -88,15 +99,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--packed-batch", action="store_true")
+    parser.add_argument("--model", choices=("tiny", "olmo2"), default="tiny")
     add_attention_backend_arg(parser)
 
     return parser.parse_args()
 
 
-def _build_reference(seed: int, batch_size: int, seq_len: int, attention_backend: str) -> tuple[TinyTransformer, torch.Tensor]:
+def _model_vocab_size(model_name: str) -> int:
+    if model_name == "tiny":
+        return int(_TINY_MODEL_KWARGS["vocab_size"])
+    return int(_OLMO_MODEL_KWARGS["vocab_size"])
+
+
+def _build_model(model_name: str, attention_backend: str, *, parallelized: bool) -> nn.Module:
+    if model_name == "tiny":
+        cls = TinyTransformerTpSp if parallelized else TinyTransformer
+        return cls(**_TINY_MODEL_KWARGS, attention_backend=attention_backend)
+    config = OlmoConfig(**_OLMO_MODEL_KWARGS, attention_backend=attention_backend)
+    cls = OlmoForCausalLMTpSp if parallelized else OlmoForCausalLM
+    return cls(config)
+
+
+def _zero3_wrap_cls(model_name: str) -> set[type[nn.Module]]:
+    if model_name == "tiny":
+        return {nn.Linear, nn.Embedding, RmsNorm}
+    return {nn.Linear, nn.Embedding, OlmoRMSNorm, DistributedRMSNorm}
+
+
+def _build_reference(
+    seed: int,
+    batch_size: int,
+    seq_len: int,
+    attention_backend: str,
+    model_name: str,
+) -> tuple[nn.Module, torch.Tensor]:
     torch.manual_seed(seed)
-    tokens = torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len))
-    model = TinyTransformer(**_MODEL_KWARGS, attention_backend=attention_backend)
+    tokens = torch.randint(0, _model_vocab_size(model_name), (batch_size, seq_len))
+    model = _build_model(model_name, attention_backend, parallelized=False)
     return model, tokens
 
 def _find_zero_plugin(core: RuntimeCore) -> Zero1Plugin | Zero2Plugin | Zero3Plugin | None:
@@ -113,11 +152,11 @@ def _make_zero_plugin(args: argparse.Namespace) -> Zero1Plugin | Zero2Plugin | Z
         return Zero1Plugin(bucket_mb_size=0)
     if args.zero_stage == 2:
         return Zero2Plugin(bucket_mb_size=0)
-    return Zero3Plugin(wrap_cls=_ZERO3_WRAP_CLS)
+    return Zero3Plugin(wrap_cls=_zero3_wrap_cls(args.model))
 
 
-def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
-    model = TinyTransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend)
+def _make_baseline_core(reference_model: nn.Module, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
+    model = _build_model(args.model, args.resolved_attention_backend, parallelized=True)
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
@@ -139,8 +178,8 @@ def _make_baseline_core(reference_model: TinyTransformer, args: argparse.Namespa
     )
 
 
-def _make_runtime_core(reference_model: TinyTransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
-    model = TinyTransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend)
+def _make_runtime_core(reference_model: nn.Module, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
+    model = _build_model(args.model, args.resolved_attention_backend, parallelized=True)
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
@@ -189,7 +228,13 @@ def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = 
         require_dense_block=args.cp_size > 1 and args.cp_attn_core == "ring",
         allow_flash=not (args.packed_batch and args.cp_size > 1 and args.cp_attn_core == "ring"),
     )
-    reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len, args.resolved_attention_backend)
+    reference_model, tokens = _build_reference(
+        args.seed,
+        args.batch_size,
+        args.seq_len,
+        args.resolved_attention_backend,
+        args.model,
+    )
 
     baseline_core = _make_baseline_core(reference_model, args, device)
     baseline_core.setup()

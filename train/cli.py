@@ -25,6 +25,11 @@ from models import (
     LlamaForCausalLM,
     LlamaForCausalLMTp,
     LlamaForCausalLMTpSp,
+    OlmoConfig,
+    OlmoForCausalLM,
+    OlmoForCausalLMTp,
+    OlmoForCausalLMTpSp,
+    OlmoRMSNorm,
     TinyMoETransformer,
     TinyMoETransformerTp,
     TinyMoETransformerTpSp,
@@ -38,6 +43,7 @@ from parallel import ParallelPlan
 from parallel.context_interfaces import ContextParallelAttentionCoreType
 from parallel.plan import PipelineScheduleConfig
 from runtime import MeshConfig, RuntimeCore
+from runtime.layers.distributed_rmsnorm import DistributedRMSNorm
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin
@@ -69,8 +75,9 @@ _ZERO3_WRAP_CLS = {
     torch.nn.LayerNorm,
     RmsNorm,
     LlamaRMSNorm,
+    OlmoRMSNorm,
+    DistributedRMSNorm,
 }
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LLM training recipe.")
@@ -100,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--model", type=str, default="tiny", choices=("tiny", "tiny_moe", "llama"))
+    parser.add_argument("--model", type=str, default="tiny", choices=("tiny", "tiny_moe", "llama", "olmo", "olmo2"))
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--n-kv-heads", type=int, default=None)
@@ -276,6 +283,25 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
         cls = LlamaForCausalLMTpSp if args.use_sp else LlamaForCausalLMTp if args.tp_size > 1 else LlamaForCausalLM
         return cls(
             LlamaConfig(
+                vocab_size=args.vocab_size,
+                hidden_size=args.dim,
+                intermediate_size=args.hidden_size,
+                num_hidden_layers=args.n_layers,
+                num_attention_heads=args.n_heads,
+                num_key_value_heads=args.n_kv_heads or args.n_heads,
+                max_position_embeddings=args.seq_len,
+                rms_norm_eps=args.eps,
+                attention_backend=args.attention_backend,
+                activation_checkpointing=ActivationCheckpointConfig(
+                    enabled=args.activation_checkpointing,
+                    every_n_layers=args.activation_checkpoint_every_n_layers,
+                ),
+            )
+        )
+    if args.model in {"olmo", "olmo2"}:
+        cls = OlmoForCausalLMTpSp if args.use_sp else OlmoForCausalLMTp if args.tp_size > 1 else OlmoForCausalLM
+        return cls(
+            OlmoConfig(
                 vocab_size=args.vocab_size,
                 hidden_size=args.dim,
                 intermediate_size=args.hidden_size,
@@ -503,6 +529,7 @@ def _load_config_defaults(path: str) -> dict[str, Any]:
 def _config_key_to_arg_dest(section: str, key: str) -> str:
     aliases = {
         ("data", "paths"): "data",
+        ("data", "format"): "data_format",
         ("data", "seq_len"): "seq_len",
         ("data", "micro_batch_size"): "micro_batch_size",
         ("model", "type"): "model",

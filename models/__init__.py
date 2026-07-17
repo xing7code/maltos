@@ -5,6 +5,13 @@ from .llama import (
     LlamaForCausalLMTp,
     LlamaForCausalLMTpSp,
 )
+from .olmo import (
+    OlmoConfig,
+    OlmoForCausalLM,
+    OlmoForCausalLMTp,
+    OlmoForCausalLMTpSp,
+    OlmoRMSNorm,
+)
 from .tiny_model import TinyModel
 from .tiny_transformer import (
     CausalSelfAttention,
@@ -27,6 +34,11 @@ __all__ = [
     "LlamaForCausalLM",
     "LlamaForCausalLMTp",
     "LlamaForCausalLMTpSp",
+    "OlmoConfig",
+    "OlmoForCausalLM",
+    "OlmoForCausalLMTp",
+    "OlmoForCausalLMTpSp",
+    "OlmoRMSNorm",
     "TinyTransformer",
     "TinyTransformerTp",
     "TinyTransformerTpSp",

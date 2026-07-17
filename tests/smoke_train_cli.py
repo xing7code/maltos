@@ -37,6 +37,21 @@ training:
     assert defaults["fused_adamw"] is True
 
 
+def test_data_format_config_alias() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "recipe.yaml"
+        path.write_text(
+            """
+data:
+  format: sft
+""".lstrip(),
+            encoding="utf-8",
+        )
+        defaults = _load_config_defaults(str(path))
+
+    assert defaults["data_format"] == "sft"
+
+
 def test_adamw_factory_enables_fused_backend() -> None:
     param = torch.nn.Parameter(torch.ones(2))
     optimizer = _build_optimizer_factory(_optimizer_args(fused_adamw=True))([param])
@@ -56,6 +71,7 @@ def test_adamw_factory_keeps_default_backend() -> None:
 
 def main() -> None:
     test_fused_adamw_config_alias()
+    test_data_format_config_alias()
     test_adamw_factory_enables_fused_backend()
     test_adamw_factory_keeps_default_backend()
     print("train cli smoke ok")

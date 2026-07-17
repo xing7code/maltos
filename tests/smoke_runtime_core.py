@@ -17,6 +17,8 @@ from models import (
     ActivationCheckpointConfig,
     LlamaConfig,
     LlamaForCausalLM,
+    OlmoConfig,
+    OlmoForCausalLM,
     TinyMoETransformer,
     TinyTransformer,
 )
@@ -783,6 +785,71 @@ def test_llama_flash_attn_backend_matches_eager_attention_for_packed_batch() -> 
     torch.testing.assert_close(flash_logits, eager_logits, atol=1e-4, rtol=1e-4)
 
 
+def test_olmo_activation_checkpointing_train_step() -> None:
+    torch.manual_seed(9876)
+    model = OlmoForCausalLM(
+        OlmoConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            max_position_embeddings=8,
+            activation_checkpointing=ActivationCheckpointConfig(enabled=True, every_n_layers=2),
+        )
+    )
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=model,
+        optimizer_factory=_sgd_factory(),
+    )
+    batch = {
+        INPUT_IDS_KEY: torch.randint(0, 32, (2, 8)),
+        LABELS_KEY: torch.randint(0, 32, (2, 8)),
+    }
+
+    core.setup()
+    before = {name: param.detach().clone() for name, param in core.model.named_parameters()}
+    loss, _ = core.run_step(batch)
+    core.step_optimizer()
+
+    assert loss.ndim == 0
+    assert core.state.step == 1
+    assert any(
+        not torch.equal(before[name], param.detach())
+        for name, param in core.model.named_parameters()
+        if param.requires_grad
+    )
+
+
+def test_olmo_flash_attn_backend_matches_eager_attention_for_packed_batch() -> None:
+    torch.manual_seed(6543)
+    attention_backend = resolve_attention_backend("auto")
+    base_config = dict(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=8,
+    )
+    flash = OlmoForCausalLM(OlmoConfig(**base_config, attention_backend=attention_backend))
+    eager = OlmoForCausalLM(OlmoConfig(**base_config, attention_backend=AttentionBackend.EAGER))
+    eager.load_state_dict(flash.state_dict())
+    flash.eval()
+    eager.eval()
+    batch = _packed_test_batch()
+
+    with torch.no_grad():
+        flash_logits = flash(batch)
+        eager_logits = eager(batch)
+
+    torch.testing.assert_close(flash_logits, eager_logits, atol=1e-4, rtol=1e-4)
+
+
 def _packed_test_batch() -> dict[str, torch.Tensor]:
     return {
         INPUT_IDS_KEY: torch.randint(0, 32, (2, 8)),
@@ -881,6 +948,8 @@ def main() -> None:
     test_llama_activation_checkpointing_train_step()
     test_llama_sdpa_auto_matches_eager_attention()
     test_llama_flash_attn_backend_matches_eager_attention_for_packed_batch()
+    test_olmo_activation_checkpointing_train_step()
+    test_olmo_flash_attn_backend_matches_eager_attention_for_packed_batch()
     test_tiny_flash_attn_backend_matches_eager_attention_for_packed_batch()
     test_tiny_moe_flash_attn_backend_matches_eager_attention_for_packed_batch()
     print("runtime core smoke ok")

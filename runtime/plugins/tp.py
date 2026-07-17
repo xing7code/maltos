@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from parallel.specs import TpSpShardAxis
 from runtime.mesh import MeshAxis
+from runtime.layers.distributed_rmsnorm import DistributedRMSNorm
 from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
 from runtime.types import ParamRole, RuntimePhase
 from runtime.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -32,27 +33,35 @@ class TensorParallelPlugin(RuntimePlugin):
             if self.runtime.is_module_path_omitted(rule.module_path):
                 continue
             module = model.get_submodule(rule.module_path)
-            if not isinstance(module, nn.Linear):
+            if isinstance(module, nn.Linear):
+                if rule.shard_axis == TpSpShardAxis.PARAM_OUT:
+                    self._record_linear_rule(rule.module_path, module, rule.shard_axis)
+                    new_col = ColumnParallelLinear.from_linear(
+                        module,
+                        self.tp_group,
+                        gather_output=(rule.post_comm == "all_gather"),
+                    )
+                    model.set_submodule(rule.module_path, new_col)
+                elif rule.shard_axis == TpSpShardAxis.PARAM_IN:
+                    self._record_linear_rule(rule.module_path, module, rule.shard_axis)
+                    new_row = RowParallelLinear.from_linear(
+                        module,
+                        self.tp_group,
+                        rule.post_comm,
+                        rule.comm_dim,
+                    )
+                    model.set_submodule(rule.module_path, new_row)
                 continue
-            if rule.shard_axis == TpSpShardAxis.PARAM_OUT:
-                self._record_linear_rule(rule.module_path, module, rule.shard_axis)
-                new_col = ColumnParallelLinear.from_linear(
-                    module,
-                    self.tp_group,
-                    gather_output=(rule.post_comm == "all_gather"),
-                )
-                model.set_submodule(rule.module_path, new_col)
-            elif rule.shard_axis == TpSpShardAxis.PARAM_IN:
-                self._record_linear_rule(rule.module_path, module, rule.shard_axis)
-                new_row = RowParallelLinear.from_linear(
-                    module,
-                    self.tp_group,
-                    rule.post_comm,
-                    rule.comm_dim,
-                )
-                model.set_submodule(rule.module_path, new_row)
+            if isinstance(module, DistributedRMSNorm):
+                if rule.shard_axis != TpSpShardAxis.PARAM_OUT:
+                    raise ValueError(
+                        f"DistributedRMSNorm only supports PARAM_OUT sharding, got {rule.shard_axis} for {rule.module_path}"
+                    )
+                self._record_norm_rule(rule.module_path, module, rule.shard_axis)
+                model.set_submodule(rule.module_path, DistributedRMSNorm.from_module(module, self.tp_group))
         self.runtime.add_module_replacement(nn.Linear, ColumnParallelLinear)
         self.runtime.add_module_replacement(nn.Linear, RowParallelLinear)
+        self.runtime.add_module_replacement(DistributedRMSNorm, DistributedRMSNorm)
         return model
 
     def _record_linear_rule(self, module_path: str, module: nn.Linear, shard_axis: TpSpShardAxis) -> None:
@@ -66,6 +75,11 @@ class TensorParallelPlugin(RuntimePlugin):
                 self._param_shard_axis[bias_name] = shard_axis
             else:
                 self._tp_replicated_params.add(bias_name)
+
+    def _record_norm_rule(self, module_path: str, module: DistributedRMSNorm, shard_axis: TpSpShardAxis) -> None:
+        weight_name = f"{module_path}.weight"
+        self._param_shard_axis[weight_name] = shard_axis
+        self._logical_shapes[weight_name] = (module.logical_hidden_size,)
 
     def annotate_param_metadata(self) -> None:
         assert self.runtime is not None

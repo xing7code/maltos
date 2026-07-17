@@ -1,0 +1,60 @@
+seed: 42
+
+data:
+  format: sft
+  seq_len: 4096
+  micro_batch_size: 1
+
+model:
+  type: olmo2
+  vocab_size: 100352
+  hidden_size: 5120
+  intermediate_size: 13824
+  num_layers: 40
+  num_heads: 40
+  num_kv_heads: 40
+  rms_norm_eps: 1.0e-6
+  attention_backend: sdpa_auto
+  activation_checkpointing: true
+  activation_checkpoint_every_n_layers: 1
+
+parallel:
+  dp_size: 4
+  tp_size: 2
+  use_sp: true
+  zero_stage: 3
+
+training:
+  max_steps: 1000
+  grad_accum_steps: 8
+  lr: 5.0e-6
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  fused_adamw: true
+  lr_schedule: constant
+  warmup_steps: 50
+  min_lr: 0.0
+  precision: bf16
+  grad_clip: 1.0
+
+logging:
+  log_every: 1
+  metrics_jsonl: logs/olmo2_13b_sft.jsonl
+  wandb_project: maltos
+  wandb_run_name: olmo2-13b-sft-dp4-tp2-sp-zero3
+  wandb_run_id: null
+  wandb_tags:
+    - olmo2
+    - 13b
+    - sft
+  wandb_checkpoint_every: null
+
+checkpoint:
+  dir: checkpoints/olmo2_13b_sft
+  every: 100
+  keep_last: 2
+  keep_every_n_steps: 500
+  min_free_gb: 20
+  resume_from: null

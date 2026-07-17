@@ -34,7 +34,7 @@ jobs:
         env:
           PYTHONPATH: .
         run: |
-          python tools/pretrain.py \
+          python tools/train.py \
             --model tiny \
             --data tests/testdata \
             --vocab-size 256 \
