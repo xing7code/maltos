@@ -43,7 +43,7 @@ from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
-from runtime.plugins.precision import PrecisionPlugin
+from runtime.plugins.fp16 import Fp16Plugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from utils.attention_backend import AttentionBackend
@@ -214,7 +214,9 @@ def _build_core(cfg: PerfCase, device: torch.device) -> RuntimeCore:
         plugins += [Zero1Plugin(bucket_mb_size=32)]
     elif cfg.zero_stage == 3:
         plugins += [Zero3Plugin(wrap_cls=_ZERO3_WRAP)]
-    plugins += [PrecisionPlugin(compute_dtype=_compute_dtype_for_name(_ACTIVE_PRECISION))]
+    runtime_dtype = _compute_dtype_for_name(_ACTIVE_PRECISION)
+    if runtime_dtype == torch.float16:
+        plugins += [Fp16Plugin()]
 
     return RuntimeCore(
         mesh=MeshConfig(dp=cfg.dp, tp=cfg.tp, pp=cfg.pp, cp=cfg.cp, ep=cfg.ep),
@@ -227,6 +229,7 @@ def _build_core(cfg: PerfCase, device: torch.device) -> RuntimeCore:
         plugins=plugins,
         grad_clip_max_norm=cfg.grad_clip,
         device=device,
+        dtype=runtime_dtype,
     )
 
 

@@ -6,14 +6,14 @@ import torch.nn.functional as F
 
 from runtime.buffer_allocator import allocate_buffer
 from runtime.layers.flash_utils import flash_attn_dense_backward, flash_attn_dense_with_lse
-from utils.distributed import all_gather_single, reduce_scatter_single
+from utils.distributed import all_gather_single, all_reduce_tensor, pairwise_send_recv_async, reduce_scatter_single
 
 
 @dataclass
 class _AsyncRingExchange:
     send_tensor: torch.Tensor
     recv_tensor: torch.Tensor
-    works: list[dist.Work]
+    works: list[object]
 
     def wait(self) -> torch.Tensor:
         for work in self.works:
@@ -55,7 +55,7 @@ class AllGather(torch.autograd.Function):
         per_rank_dim = grad_output.shape[dim] // ctx.world_size
         grad = grad_output.narrow(dim, ctx.rank * per_rank_dim, per_rank_dim).contiguous()
         if ctx.backward_reduce_op is not None:
-            dist.all_reduce(grad, op=ctx.backward_reduce_op, group=ctx.group)
+            all_reduce_tensor(grad, op=ctx.backward_reduce_op, group=ctx.group)
         return grad, None, None, None, None
 
 
@@ -102,7 +102,7 @@ class AllReduce(torch.autograd.Function):
         ctx.group = group
         ctx.reduce_op = reduce_op
         out = x.contiguous().clone()
-        dist.all_reduce(out, op=reduce_op, group=group)
+        all_reduce_tensor(out, op=reduce_op, group=group)
         return out
 
     @staticmethod
@@ -315,12 +315,14 @@ def _pairwise_send_recv_async(
     send_rank: int,
     recv_rank: int,
     group: dist.ProcessGroup,
-) -> list[dist.Work]:
-    ops = [
-        dist.P2POp(dist.isend, send_tensor, send_rank, group),
-        dist.P2POp(dist.irecv, recv_tensor, recv_rank, group),
-    ]
-    return list(dist.batch_isend_irecv(ops))
+) -> list[object]:
+    return pairwise_send_recv_async(
+        send_tensor,
+        recv_tensor,
+        send_rank=send_rank,
+        recv_rank=recv_rank,
+        group=group,
+    )
 
 
 def _ring_exchange_tensor_async(

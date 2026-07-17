@@ -13,7 +13,7 @@ class MetricPlugin(RuntimePlugin):
         super().__init__(
             id=PluginId.METRICS,
             name="metrics",
-            runs_after={PluginId.PRECISION, PluginId.GRAD_CLIP},
+            runs_after={PluginId.FP16, PluginId.GRAD_CLIP},
         )
         self.include_cuda_memory = include_cuda_memory
         self._step_start: float | None = None

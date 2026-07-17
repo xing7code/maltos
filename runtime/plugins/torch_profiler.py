@@ -29,7 +29,7 @@ class TorchProfilerPlugin(RuntimePlugin):
         super().__init__(
             id=PluginId.TORCH_PROFILER,
             name="torch_profiler",
-            runs_after={PluginId.PRECISION},
+            runs_after={PluginId.FP16},
         )
         if wait < 0:
             raise ValueError(f"wait must be >= 0, got {wait}")

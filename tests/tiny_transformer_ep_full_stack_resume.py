@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import tempfile
+import traceback
 
 import torch
 import torch.distributed as dist
@@ -32,7 +33,7 @@ from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
-from runtime.plugins.precision import PrecisionPlugin
+from runtime.plugins.fp16 import Fp16Plugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
@@ -131,8 +132,7 @@ def _build_runtime(
     plugins.append(ExpertParallelPlugin())
     if zero_plugin is not None:
         plugins.append(zero_plugin)
-    if not args.disable_precision:
-        plugins.append(PrecisionPlugin(compute_dtype=torch.bfloat16))
+    runtime_dtype = None if args.disable_precision else torch.bfloat16
     if not args.disable_grad_clip:
         if args.zero_stage == 0:
             plugins.append(GradClipPlugin(max_norm=1.0))
@@ -150,6 +150,7 @@ def _build_runtime(
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=plugins,
         device=device,
+        dtype=runtime_dtype,
     )
     core.setup()
     return core, zero_plugin
@@ -382,6 +383,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     )
     try:
         run_case(rank, args, device)
+    except BaseException:
+        print(f"[rank {rank}] uncaught exception in ep_full_stack_resume worker", flush=True)
+        traceback.print_exc()
+        raise
     finally:
         dist.destroy_process_group()
 

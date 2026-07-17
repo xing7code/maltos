@@ -29,7 +29,7 @@ from runtime import DefaultStepRunner, MeshConfig, ParamRole, PluginId, RuntimeC
 from runtime.mesh import MeshAxis
 from runtime.plugins.ddp import DataParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
-from runtime.plugins.precision import PrecisionPlugin
+from runtime.plugins.fp16 import Fp16Plugin
 from runtime.plugins.torch_profiler import TorchProfilerPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugin import RuntimePlugin
@@ -155,6 +155,10 @@ class ReplaceLinearPlugin(RuntimePlugin):
 
 def _sgd_factory(lr: float = 0.01):
     return lambda params: torch.optim.SGD(params, lr=lr)
+
+
+def _adamw_factory(lr: float = 1e-3):
+    return lambda params: torch.optim.AdamW(params, lr=lr)
 
 
 def test_plugin_ordering() -> None:
@@ -469,7 +473,7 @@ def test_precision_plugin_metrics_and_clip() -> None:
         plan=ParallelPlan(),
         model=model,
         optimizer_factory=_sgd_factory(),
-        plugins=[PrecisionPlugin(compute_dtype=None), GradClipPlugin(max_norm=1.0)],
+        plugins=[Fp16Plugin(), GradClipPlugin(max_norm=1.0)],
     )
     core.setup()
     _, _ = core.run_step(torch.ones(2, 4))
@@ -482,33 +486,118 @@ def test_precision_plugin_metrics_and_clip() -> None:
     assert metrics["step"] == 1
     assert metrics["loss"] == float(core.state.loss.detach().float().item())
     assert metrics["lr"] == 0.01
-    assert metrics["precision/loss_scale"] is None
-    assert metrics["precision/overflow"] is False
+    assert metrics["fp16/loss_scale"] is None
+    assert metrics["fp16/overflow"] is False
     assert "grad_clip/grad_norm" in metrics
     assert metrics["grad_clip/max_norm"] == 1.0
+
+
+def test_precision_plugin_bf16_uses_fp32_master_weights() -> None:
+    torch.manual_seed(0)
+    model = LossModel()
+    bf16_batch = torch.ones(2, 4, dtype=torch.bfloat16)
+    core = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=model,
+        dtype=torch.bfloat16,
+        optimizer_factory=_adamw_factory(),
+        plugins=[GradClipPlugin(max_norm=1.0)],
+    )
+    core.setup()
+
+    assert model.proj.weight.dtype == torch.bfloat16
+    assert model.proj.bias.dtype == torch.bfloat16
+
+    optimizer, _ = core.get_optimizer_and_scheduler()
+    assert optimizer is not None
+    master_params = [param for group in optimizer.param_groups for param in group["params"]]
+    assert master_params
+    assert all(param.dtype == torch.float32 for param in master_params)
+
+    _, should_step = core.run_step(bf16_batch)
+    assert should_step is True
+    core.step_optimizer()
+
+    state_dict = optimizer.state_dict()
+    assert "master_params" in state_dict
+    assert all(tensor.dtype == torch.float32 for tensor in state_dict["master_params"])
+    inner_state = state_dict["inner_optimizer"]["state"]
+    assert inner_state
+    adam_state = next(iter(inner_state.values()))
+    assert adam_state["exp_avg"].dtype == torch.float32
+    assert adam_state["exp_avg_sq"].dtype == torch.float32
+    assert model.proj.weight.dtype == torch.bfloat16
+
+
+def test_precision_plugin_bf16_optimizer_state_roundtrip() -> None:
+    torch.manual_seed(0)
+    bf16_batch = torch.ones(2, 4, dtype=torch.bfloat16)
+    source = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=LossModel(),
+        dtype=torch.bfloat16,
+        optimizer_factory=_adamw_factory(),
+    )
+    source.setup()
+    _, should_step = source.run_step(bf16_batch)
+    assert should_step is True
+    source.step_optimizer()
+    model_state, _ = source.state_manager.export_model_state()
+    optimizer_state = source.state_manager.export_optimizer_state()
+    assert optimizer_state is not None
+
+    torch.manual_seed(1)
+    target = RuntimeCore(
+        mesh=MeshConfig(),
+        plan=ParallelPlan(),
+        model=LossModel(),
+        dtype=torch.bfloat16,
+        optimizer_factory=_adamw_factory(),
+    )
+    target.setup()
+    target.state_manager.import_model_state(model_state)
+    target.state_manager.import_optimizer_state(optimizer_state)
+
+    source_optimizer, _ = source.get_optimizer_and_scheduler()
+    target_optimizer, _ = target.get_optimizer_and_scheduler()
+    assert source_optimizer is not None
+    assert target_optimizer is not None
+
+    assert torch.allclose(source.model.proj.weight.float(), target.model.proj.weight.float())
+    assert torch.allclose(source.model.proj.bias.float(), target.model.proj.bias.float())
+
+    source_state = source_optimizer.state_dict()
+    target_state = target_optimizer.state_dict()
+    assert len(source_state["master_params"]) == len(target_state["master_params"])
+    for source_tensor, target_tensor in zip(
+        source_state["master_params"], target_state["master_params"], strict=True
+    ):
+        assert torch.allclose(source_tensor, target_tensor)
 
 
 def test_post_forward_runs_when_model_forward_raises() -> None:
     events: list[str] = []
     plugin = RecordingPlugin(PluginId.METRICS, events, name="recorder")
-    precision = PrecisionPlugin(compute_dtype=torch.bfloat16)
+    bf16_batch = torch.ones(2, 4, dtype=torch.bfloat16)
     core = RuntimeCore(
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=FailingModel(),
+        dtype=torch.bfloat16,
         optimizer_factory=_sgd_factory(),
-        plugins=[plugin, precision],
+        plugins=[plugin, Fp16Plugin()],
     )
     core.setup()
     try:
-        core.run_step(torch.ones(2, 4))
+        core.run_step(bf16_batch)
     except RuntimeError as exc:
         assert str(exc) == "boom"
     else:
         raise AssertionError("FailingModel forward should raise")
     assert "recorder:pre_forward" in events
     assert "recorder:post_forward" in events
-    assert precision._autocast_context is None
 
 
 def test_runtime_collects_plugin_metrics() -> None:
@@ -566,15 +655,16 @@ def test_precision_plugin_fp16_requires_cuda() -> None:
         mesh=MeshConfig(),
         plan=ParallelPlan(),
         model=model,
+        dtype=torch.float16,
         optimizer_factory=_sgd_factory(),
-        plugins=[PrecisionPlugin(compute_dtype=torch.float16)],
+        plugins=[Fp16Plugin()],
     )
     try:
         core.setup()
     except ValueError as exc:
         assert "requires CUDA model parameters" in str(exc)
     else:
-        raise AssertionError("PrecisionPlugin(fp16) should fail on CPU model parameters")
+        raise AssertionError("Fp16Plugin should fail on CPU model parameters")
 
 
 def test_trainer_state_plugin_states_roundtrip() -> None:

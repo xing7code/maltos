@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 from runtime.types import MetricValue
 
 class PluginId(str, Enum):
-    PRECISION = "precision"
+    FP16 = "fp16"
     GRAD_CLIP = "grad_clip"
     TP = "tp"
     SP = "sp"

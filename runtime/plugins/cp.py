@@ -31,6 +31,7 @@ from utils.constants import (
     POSITION_OFFSET_KEY,
     SEQUENCE_IDS_KEY,
 )
+from utils.distributed import all_reduce_tensor
 
 
 class ContextParallelPlugin(RuntimePlugin):
@@ -40,7 +41,7 @@ class ContextParallelPlugin(RuntimePlugin):
             name="context_parallel",
             runs_after={PluginId.TP, PluginId.SP, PluginId.DP},
         )
-        self._grad_sync_handles: list[dist.Work] = []
+        self._grad_sync_handles: list[object] = []
         self._use_param_hook_sync = False
 
     @property
@@ -151,7 +152,7 @@ class ContextParallelPlugin(RuntimePlugin):
         reducer.wrap_chained_work(
             lambda work, grad_buffer: ChainedWork(
                 work,
-                lambda: dist.all_reduce(
+                lambda: all_reduce_tensor(
                     grad_buffer,
                     op=dist.ReduceOp.SUM,
                     group=self.cp_group,
@@ -190,7 +191,7 @@ class ContextParallelPlugin(RuntimePlugin):
             if param.grad is None:
                 raise RuntimeError("ContextParallelPlugin expected param.grad before CP sync hook")
             self._grad_sync_handles.append(
-                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=self.cp_group, async_op=True)
+                all_reduce_tensor(param.grad, op=dist.ReduceOp.SUM, group=self.cp_group, async_op=True)
             )
 
         return hook
@@ -210,7 +211,7 @@ class ContextParallelPlugin(RuntimePlugin):
             if param.grad is None:
                 continue
             self._grad_sync_handles.append(
-                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=self.cp_group, async_op=True)
+                all_reduce_tensor(param.grad, op=dist.ReduceOp.SUM, group=self.cp_group, async_op=True)
             )
 
     def _wait_grad_sync(self) -> None:

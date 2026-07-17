@@ -23,7 +23,7 @@ from models import TinyTransformer, TinyTransformerTpSp
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
 from runtime import MeshAxis, MeshConfig, RuntimeCore
-from runtime.plugins.precision import PrecisionPlugin
+from runtime.plugins.fp16 import Fp16Plugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero3 import Zero3Plugin
@@ -106,8 +106,8 @@ def _build_runtime(model: TinyTransformerTpSp, dp_size: int, tp_size: int) -> tu
             TensorParallelPlugin(),
             SequenceParallelPlugin(),
             zero3,
-            PrecisionPlugin(compute_dtype=torch.bfloat16),
         ],
+        dtype=torch.bfloat16,
     )
     core.setup()
     return core, zero3

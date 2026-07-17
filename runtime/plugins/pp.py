@@ -28,7 +28,7 @@ class PipelineParallelPlugin(RuntimePlugin):
                 PluginId.TP,
                 PluginId.SP,
                 PluginId.EP,
-                PluginId.PRECISION,
+                PluginId.FP16,
             },
         )
         self.stage_index = 0

@@ -20,6 +20,7 @@ from utils.constants import (
 from runtime.buffer_allocator import allocate_buffer
 from runtime.step_runners.base import DefaultStepRunner
 from runtime.types import PpStatus
+from utils.distributed import all_reduce_tensor, irecv_tensor_async, isend_tensor_async
 
 if TYPE_CHECKING:
     from runtime.plugins.pp import PipelineParallelPlugin
@@ -31,9 +32,9 @@ class PipelineMicroState:
     output_activation: torch.Tensor | None = None
     raw_loss: torch.Tensor | None = None
     activation_send_buffer: torch.Tensor | None = None
-    activation_send_work: dist.Work | None = None
+    activation_send_work: object | None = None
     grad_send_buffer: torch.Tensor | None = None
-    grad_send_work: dist.Work | None = None
+    grad_send_work: object | None = None
 
 
 class PipelineScheduleKind(str, Enum):
@@ -250,10 +251,10 @@ class PipelineStepRunner:
         else:
             loss = torch.zeros((), device=device, dtype=dtype)
         if self.plugin.pp_group is not None and self.plugin.stage_count > 1:
-            dist.all_reduce(loss, op=dist.ReduceOp.SUM, group=self.plugin.pp_group)
+            all_reduce_tensor(loss, op=dist.ReduceOp.SUM, group=self.plugin.pp_group)
         return loss
 
-    def recv_activation_async(self, runtime, batch) -> tuple[torch.Tensor, dist.Work]:
+    def recv_activation_async(self, runtime, batch) -> tuple[torch.Tensor, object]:
         assert self.plugin.prev_global_rank is not None
         microbatch_idx = runtime.state.step_context.pp_cur_microbatch_idx
         device = model_device(runtime.model)
@@ -269,16 +270,16 @@ class PipelineStepRunner:
             dtype=dtype,
             device=device,
         )
-        works = dist.batch_isend_irecv([dist.P2POp(dist.irecv, buffer, self.plugin.prev_global_rank, self.plugin.pp_group)])
-        return buffer, works[0]
+        work = irecv_tensor_async(buffer, self.plugin.prev_global_rank, group=self.plugin.pp_group)
+        return buffer, work
 
-    def send_activation_async(self, tensor: torch.Tensor) -> tuple[torch.Tensor, dist.Work]:
+    def send_activation_async(self, tensor: torch.Tensor) -> tuple[torch.Tensor, object]:
         assert self.plugin.next_global_rank is not None
         buffer = tensor.contiguous()
-        works = dist.batch_isend_irecv([dist.P2POp(dist.isend, buffer, self.plugin.next_global_rank, self.plugin.pp_group)])
-        return buffer, works[0]
+        work = isend_tensor_async(buffer, self.plugin.next_global_rank, group=self.plugin.pp_group)
+        return buffer, work
 
-    def recv_grad_async(self, runtime, output_activation: torch.Tensor) -> tuple[torch.Tensor, dist.Work]:
+    def recv_grad_async(self, runtime, output_activation: torch.Tensor) -> tuple[torch.Tensor, object]:
         assert self.plugin.next_global_rank is not None
         microbatch_idx = runtime.state.step_context.pp_cur_microbatch_idx
         grad = allocate_buffer(
@@ -287,14 +288,14 @@ class PipelineStepRunner:
             dtype=output_activation.dtype,
             device=output_activation.device,
         )
-        works = dist.batch_isend_irecv([dist.P2POp(dist.irecv, grad, self.plugin.next_global_rank, self.plugin.pp_group)])
-        return grad, works[0]
+        work = irecv_tensor_async(grad, self.plugin.next_global_rank, group=self.plugin.pp_group)
+        return grad, work
 
-    def send_grad_async(self, tensor: torch.Tensor) -> tuple[torch.Tensor, dist.Work]:
+    def send_grad_async(self, tensor: torch.Tensor) -> tuple[torch.Tensor, object]:
         assert self.plugin.prev_global_rank is not None
         buffer = tensor.contiguous()
-        works = dist.batch_isend_irecv([dist.P2POp(dist.isend, buffer, self.plugin.prev_global_rank, self.plugin.pp_group)])
-        return buffer, works[0]
+        work = isend_tensor_async(buffer, self.plugin.prev_global_rank, group=self.plugin.pp_group)
+        return buffer, work
 
 
 def split_batch(batch, num_microbatches: int):
@@ -386,10 +387,8 @@ def model_device(model: nn.Module) -> torch.device:
 
 
 def activation_dtype(runtime) -> torch.dtype:
-    for plugin in runtime.plugins:
-        compute_dtype = getattr(plugin, "compute_dtype", None)
-        if compute_dtype is not None:
-            return compute_dtype
+    if runtime.dtype is not None:
+        return runtime.dtype
     first_param = next(runtime.model.parameters(), None)
     if first_param is None:
         raise ValueError("PP model must have parameters")

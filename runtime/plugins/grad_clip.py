@@ -15,7 +15,7 @@ class GradClipPlugin(RuntimePlugin):
             # Must run after ZeRO variants: their PRE_STEP calls _wait_grad_sync(),
             # which joins the async reduction thread and populates local_param.grad.
             # Without this ordering, we'd read stale / unset gradients on nccl.
-            runs_after={PluginId.PRECISION, PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3},
+            runs_after={PluginId.FP16, PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3},
         )
         self.max_norm = max_norm
 
@@ -34,6 +34,10 @@ class GradClipPlugin(RuntimePlugin):
         if optimizer is None:
             return
 
+        copy_master_params = getattr(optimizer, "copy_master_params", None)
+        if callable(copy_master_params):
+            copy_master_params()
+
         scaler = self.runtime.state.scaler
         if scaler is not None:
             scaler.unscale_(optimizer)
@@ -47,7 +51,7 @@ class GradClipPlugin(RuntimePlugin):
         if not grad_params:
             return
 
-        global_norm = self._global_grad_norm(grad_params)
+        global_norm = self._global_grad_norm(optimizer, grad_params)
         clip_coef = float(self.max_norm) / (global_norm + 1e-6)
         if clip_coef < 1.0:
             for param in grad_params:
@@ -55,14 +59,16 @@ class GradClipPlugin(RuntimePlugin):
 
         self.runtime.state.metadata["grad_norm"] = global_norm
 
-    def _global_grad_norm(self, params: list) -> float:
+    def _global_grad_norm(self, optimizer: torch.optim.Optimizer, params: list[torch.nn.Parameter]) -> float:
         assert self.runtime is not None
         device = params[0].grad.device
         local_sq = torch.zeros((), dtype=torch.float32, device=device)
+        model_param_for = getattr(optimizer, "model_param_for", None)
         for p in params:
             if p.grad is None:
                 continue
-            replica_factor = float(self.runtime.grad_norm_replica_factor(p))
+            logical_param = model_param_for(p) if callable(model_param_for) else p
+            replica_factor = float(self.runtime.grad_norm_replica_factor(logical_param))
             local_sq.add_(p.grad.detach().float().pow(2).sum() / replica_factor)
 
         if dist.is_initialized() and dist.get_world_size() > 1:

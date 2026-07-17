@@ -50,7 +50,7 @@ from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.metrics import MetricPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
-from runtime.plugins.precision import PrecisionPlugin
+from runtime.plugins.fp16 import Fp16Plugin
 from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.torch_profiler import TorchProfilerPlugin
 from runtime.plugins.tp import TensorParallelPlugin
@@ -373,9 +373,9 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
                 wrap_cls=_ZERO3_WRAP_CLS,
             )
         )
-    compute_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
-    if compute_dtype is not None:
-        plugins.append(PrecisionPlugin(compute_dtype=compute_dtype))
+    runtime_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
+    if runtime_dtype == torch.float16:
+        plugins.append(Fp16Plugin())
     if args.grad_clip is not None:
         if args.zero_stage == 0:
             plugins.append(GradClipPlugin(max_norm=args.grad_clip))
@@ -406,12 +406,13 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
         ),
         device=device,
+        dtype=runtime_dtype,
         model=model,
         grad_clip_max_norm=grad_clip_max_norm,
         optimizer_factory=optimizer_factory,
         scheduler_factory=scheduler_factory,
         plugins=plugins,
-            )
+    )
 
 
 def _build_ddp(mode: str) -> DataParallelPlugin | BucketDataParallelPlugin:

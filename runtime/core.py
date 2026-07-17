@@ -12,6 +12,7 @@ import torch.distributed as dist
 
 from parallel.plan import ParallelPlan
 from runtime.mesh import MeshAxis, MeshConfig, ProcessGroupManager
+from runtime.optim import MasterWeightsOptimizer
 from runtime.plugin import FlopsEstimatableModule, PluginId, RuntimePlugin
 from runtime.step_runners import DefaultStepRunner
 from runtime.types import MetricValue, ParamRole, RuntimePhase, RuntimeState, StepContext
@@ -31,6 +32,7 @@ class RuntimeCore:
     mesh: MeshConfig = field(default_factory=MeshConfig)
     plan: ParallelPlan = field(default_factory=ParallelPlan)
     device: torch.device | str | None = None
+    dtype: torch.dtype | None = None
     grad_accum_steps: int = 1
     grad_clip_max_norm: float | None = None
     optimizer_factory: OptimizerFactory | None = None
@@ -73,7 +75,10 @@ class RuntimeCore:
             self.device = _module_device(self.model)
         else:
             self.device = torch.device(self.device)
+        if self.dtype is None:
             self.model.to(self.device)
+        else:
+            self.model.to(device=self.device, dtype=self.dtype)
         self.state_manager.bind(self)
         self._param_roles.clear()
         for plugin in self.plugins:
@@ -247,7 +252,10 @@ class RuntimeCore:
     def create_optimizer(self, params: Iterable[nn.Parameter]) -> torch.optim.Optimizer:
         if self.optimizer_factory is None:
             raise ValueError("optimizer_factory is required to create an optimizer")
-        return self.optimizer_factory(params)
+        params = list(params)
+        if self.dtype is None or self.dtype == torch.float32:
+            return self.optimizer_factory(params)
+        return MasterWeightsOptimizer(params, optimizer_factory=self.optimizer_factory)
 
     def create_scheduler(
         self,
@@ -262,6 +270,9 @@ class RuntimeCore:
         optimizer, scheduler = self.get_optimizer_and_scheduler()
         if optimizer is None:
             raise RuntimeError("step_optimizer() requires a runtime-owned or plugin-owned optimizer")
+        copy_master_params = getattr(optimizer, "copy_master_params", None)
+        if callable(copy_master_params):
+            copy_master_params()
         scaler = self.state.scaler
         if scaler is not None:
             prev_scale = scaler.get_scale()

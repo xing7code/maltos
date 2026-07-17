@@ -35,6 +35,7 @@ echo "=== checkpoint manifest validation ==="
 
 echo "=== runtime optimizer checkpoint resume ==="
 "${PYTHON_BIN}" tests/tiny_model_runtime_optimizer_checkpoint_resume.py
+"${PYTHON_BIN}" tests/tiny_model_runtime_optimizer_checkpoint_resume.py --dtype bf16
 
 echo "=== dataloader checkpoint resume ==="
 "${PYTHON_BIN}" tests/simple_dataloader_checkpoint_resume.py

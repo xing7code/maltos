@@ -7,14 +7,11 @@ from runtime.plugin import PluginId, RuntimePlugin
 from runtime.types import MetricValue, RuntimePhase
 
 
-class PrecisionPlugin(RuntimePlugin):
-    def __init__(
-        self,
-        compute_dtype: torch.dtype | None = None,
-    ) -> None:
+class Fp16Plugin(RuntimePlugin):
+    def __init__(self) -> None:
         super().__init__(
-            id=PluginId.PRECISION,
-            name="precision",
+            id=PluginId.FP16,
+            name="fp16",
             runs_after={
                 PluginId.TP,
                 PluginId.SP,
@@ -22,46 +19,28 @@ class PrecisionPlugin(RuntimePlugin):
                 PluginId.PP,
                 PluginId.CP,
                 PluginId.EP,
-                PluginId.ZERO1,
-                PluginId.ZERO2,
-                PluginId.ZERO3,
             },
         )
-        self.compute_dtype = compute_dtype
-        self._autocast_context = None
 
     def transform_model(self, model: nn.Module) -> nn.Module:
         self._setup_scaler()
-        if self.compute_dtype is None:
-            return model
-        _validate_compute_dtype(self.compute_dtype)
         return model
 
     def on_phase(self, phase: RuntimePhase) -> None:
         if self.runtime is None:
             return
-        if phase == RuntimePhase.PRE_FORWARD:
-            self._enter_autocast()
-            return
-        if phase == RuntimePhase.POST_FORWARD:
-            self._exit_autocast()
-            return
         if phase == RuntimePhase.PRE_BACKWARD:
             self._scale_loss_for_backward()
-            return
-
-    def close(self) -> None:
-        self._exit_autocast()
 
     def _setup_scaler(self) -> None:
         if self.runtime is None:
             return
-        if self.compute_dtype != torch.float16:
+        if self.runtime.dtype != torch.float16:
             self.runtime.state.scaler = None
             return
         device = torch.device(self.runtime.device)
         if device.type != "cuda":
-            raise ValueError("PrecisionPlugin(fp16) requires CUDA model parameters")
+            raise ValueError("Fp16Plugin requires CUDA model parameters")
         self.runtime.state.scaler = torch.amp.GradScaler(device="cuda")
 
     def _scale_loss_for_backward(self) -> None:
@@ -70,22 +49,6 @@ class PrecisionPlugin(RuntimePlugin):
         if self.runtime.state.loss is None:
             return
         self.runtime.state.loss = self.runtime.state.scaler.scale(self.runtime.state.loss)
-
-    def _enter_autocast(self) -> None:
-        if self.compute_dtype is None or self._autocast_context is not None:
-            return
-        assert self.runtime is not None
-        device_type = torch.device(self.runtime.device).type
-        context = torch.autocast(device_type=device_type, dtype=self.compute_dtype)
-        context.__enter__()
-        self._autocast_context = context
-
-    def _exit_autocast(self) -> None:
-        if self._autocast_context is None:
-            self._autocast_context = None
-            return
-        self._autocast_context.__exit__(None, None, None)
-        self._autocast_context = None
 
     def export_plugin_state(self) -> dict[str, object]:
         if self.runtime is None or self.runtime.state.scaler is None:
@@ -103,14 +66,7 @@ class PrecisionPlugin(RuntimePlugin):
         if self.runtime is None:
             return {}
         return {
-            "compute_dtype": None if self.compute_dtype is None else str(self.compute_dtype),
+            "dtype": None if self.runtime.dtype is None else str(self.runtime.dtype),
             "loss_scale": self.runtime.state.metadata.get("loss_scale"),
             "overflow": bool(self.runtime.state.metadata.get("overflow", False)),
         }
-
-
-def _validate_compute_dtype(compute_dtype: torch.dtype) -> None:
-    if compute_dtype not in {torch.float16, torch.bfloat16}:
-        raise ValueError(
-            f"PrecisionPlugin only supports compute_dtype in {{torch.float16, torch.bfloat16}}, got {compute_dtype}"
-        )
