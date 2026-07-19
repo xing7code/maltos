@@ -200,8 +200,8 @@ def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = 
         reduced_baseline_loss = _reduce_loss(baseline_loss, baseline_core)
         reduced_runtime_loss = _reduce_loss(runtime_loss, runtime_core)
 
-        baseline_core._run_phase(RuntimePhase.PRE_STEP)
-        runtime_core._run_phase(RuntimePhase.PRE_STEP)
+        baseline_core._run_step_phase(RuntimePhase.PRE_STEP)
+        runtime_core._run_step_phase(RuntimePhase.PRE_STEP)
 
         baseline_zero3 = next((plugin for plugin in baseline_core.plugins if isinstance(plugin, Zero3Plugin)), None)
         runtime_zero3 = next((plugin for plugin in runtime_core.plugins if isinstance(plugin, Zero3Plugin)), None)

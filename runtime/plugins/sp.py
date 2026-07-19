@@ -13,6 +13,7 @@ from parallel.specs import TpSpComm, TpSpShardAxis, TpSpShardRule
 from runtime.layers.functional import all_gather
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
+from runtime.types import SetupPhase
 
 
 class SequenceParallelPlugin(RuntimePlugin):
@@ -47,7 +48,9 @@ class SequenceParallelPlugin(RuntimePlugin):
     def world_size(self) -> int:
         return dist.get_world_size(self.sp_group)
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase != SetupPhase.FINALIZE:
+            return model
         if not isinstance(model, TpSpParallelizableModule):
             return model
         assert self.runtime is not None

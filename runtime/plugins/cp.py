@@ -19,7 +19,7 @@ from runtime.layers.ring_attention import RingAttentionCore
 from runtime.mesh import MeshAxis
 from runtime.plugin import ContextParallelizableModule, PluginId, RuntimePlugin
 from runtime.plugins.zero_common import ChainedWork
-from runtime.types import ParamRole, RuntimePhase
+from runtime.types import ParamRole, RuntimePhase, SetupPhase
 from utils.attention_backend import AttentionBackend
 from utils.constants import (
     HIDDEN_STATES_KEY,
@@ -72,13 +72,18 @@ class ContextParallelPlugin(RuntimePlugin):
         )
         self._validate_runtime_support()
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
-        if self.world_size <= 1:
-            return model
-        if self._use_param_hook_sync:
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase == SetupPhase.TRANSFORM:
+            return self._transform_attention_cores(model)
+        if phase == SetupPhase.FINALIZE and self.world_size > 1 and self._use_param_hook_sync:
             for param in model.parameters():
                 if param.requires_grad:
                     param.register_post_accumulate_grad_hook(self._make_grad_sync_hook())
+        return model
+
+    def _transform_attention_cores(self, model: nn.Module) -> nn.Module:
+        if self.world_size <= 1:
+            return model
         if not isinstance(model, ContextParallelizableModule):
             return model
         spec = model.context_parallel_spec()
@@ -106,7 +111,7 @@ class ContextParallelPlugin(RuntimePlugin):
         active = self._active_plugin_ids
         zero_active = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
         # Temporary lifecycle bridge: reduction-chain wiring must happen after
-        # every plugin's transform_model() has run, because EP creates its grad
+        # every plugin's setup transforms have run, because EP creates its grad
         # buckets there. annotate_param_metadata() is currently the first hook
         # with that guarantee. Keep the wiring isolated here so it can move
         # unchanged to a future post-transform/finalize hook.
@@ -163,7 +168,7 @@ class ContextParallelPlugin(RuntimePlugin):
             **({"role_filter": ParamRole.EXPERT} if zero_active else {}),
         )
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         if self.world_size <= 1:
             return
         if phase == RuntimePhase.PRE_STEP_RUNNER:

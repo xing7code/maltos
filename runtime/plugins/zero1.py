@@ -17,7 +17,7 @@ from runtime.plugins.zero_common import (
     ZeroPluginBase,
     rearm_bucket_pending,
 )
-from runtime.types import ParamRole, RuntimePhase
+from runtime.types import ParamRole, RuntimePhase, SetupPhase
 from utils.distributed import all_gather_single, reduce_scatter_single
 
 
@@ -54,20 +54,24 @@ class Zero1Plugin(ZeroPluginBase):
         self.grad_buffer: torch.Tensor | None = None
         self.buckets: list[_Bucket] = []
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
-        assert self.runtime is not None
-        self.dp_group = self.runtime.get_group(MeshAxis.DP)
-        if self.dp_group is None:
-            raise ValueError("Zero1Plugin requires mesh.dp > 1")
-        self.world_size = dist.get_world_size(self.dp_group)
-        self.rank = dist.get_rank(self.dp_group)
-        self._prepare_buffers_and_buckets(model)
-        optimizer_params = [bucket.local_param for bucket in self.buckets]
-        self.optimizer = self.runtime.create_optimizer(optimizer_params)
-        self.scheduler = self.runtime.create_scheduler(self.optimizer)
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase == SetupPhase.MATERIALIZE:
+            assert self.runtime is not None
+            self.dp_group = self.runtime.get_group(MeshAxis.DP)
+            if self.dp_group is None:
+                raise ValueError("Zero1Plugin requires mesh.dp > 1")
+            self.world_size = dist.get_world_size(self.dp_group)
+            self.rank = dist.get_rank(self.dp_group)
+            self._prepare_buffers_and_buckets(model)
+            optimizer_params = [bucket.local_param for bucket in self.buckets]
+            self.optimizer = self.runtime.create_optimizer(optimizer_params)
+            self.scheduler = self.runtime.create_scheduler(self.optimizer)
+            return model
+        if phase == SetupPhase.FINALIZE:
+            self._add_param_hooks()
         return model
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_BACKWARD:
             assert self.runtime is not None
             context = self.runtime.state.step_context
@@ -152,7 +156,6 @@ class Zero1Plugin(ZeroPluginBase):
             offset += padded_size
 
         self._reset_buckets(grad_accum_start=True, grad_accum_end=True)
-        self._add_param_hooks()
 
     def _add_param_hooks(self) -> None:
         for bucket in self.buckets:

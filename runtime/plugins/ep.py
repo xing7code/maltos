@@ -17,7 +17,7 @@ from runtime.layers.moe import ExpertParallelMoE
 from runtime.mesh import MeshAxis
 from runtime.plugin import ExpertParallelizableModule, PluginId, RuntimePlugin
 from runtime.plugins.zero_common import ChainedWork, CompletedWork, build_param_buckets, expert_erep_correction, rearm_bucket_pending
-from runtime.types import ParamRole, RuntimePhase
+from runtime.types import ParamRole, RuntimePhase, SetupPhase
 
 
 @dataclass
@@ -65,7 +65,7 @@ class ExpertParallelPlugin(RuntimePlugin):
     def wrap_chained_work(self, wrap: Callable[[ChainedWork, torch.Tensor], ChainedWork]) -> None:
         """Layer one more sync step onto every expert-grad bucket's chain.
 
-        Must be called after EP's transform_model has built its buckets
+        Must be called after EP's setup transforms have built its buckets
         (e.g. from another plugin's annotate_param_metadata, not bind) --
         raises if called before any buckets exist. `wrap(work, grad_buffer)`
         receives a bucket's current `ChainedWork` (its EREP all-reduce, or
@@ -80,7 +80,7 @@ class ExpertParallelPlugin(RuntimePlugin):
         if not self._grad_buckets:
             raise RuntimeError(
                 "ExpertParallelPlugin.wrap_chained_work called before grad buckets exist "
-                "-- call from annotate_param_metadata (after transform_model), not bind"
+                "-- call from annotate_param_metadata (after setup transforms), not bind"
             )
         for bucket in self._grad_buckets:
             bucket.work = wrap(bucket.work, bucket.grad_buffer)
@@ -110,7 +110,7 @@ class ExpertParallelPlugin(RuntimePlugin):
         self._delegate_expert_sync = bool({PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} & active)
         self._validate_runtime_support()
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
+    def _transform_model(self, model: nn.Module) -> nn.Module:
         if not isinstance(model, ExpertParallelizableModule):
             raise TypeError(
                 "ExpertParallelPlugin requires model.expert_parallel_spec(), "
@@ -137,8 +137,15 @@ class ExpertParallelPlugin(RuntimePlugin):
                 continue
             role = ParamRole.EXPERT if id(param) in self._expert_param_ids else ParamRole.SHARED
             self.runtime.set_param_role(param, role)
-        if not self._delegate_expert_sync:
+        return model
+
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase == SetupPhase.TRANSFORM:
+            return self._transform_model(model)
+        if phase == SetupPhase.MATERIALIZE and not self._delegate_expert_sync:
             self._prepare_grad_buckets(model)
+        if phase == SetupPhase.FINALIZE and not self._delegate_expert_sync:
+            self._register_bucket_hooks()
         return model
 
     def _prepare_grad_buckets(self, model: nn.Module) -> None:
@@ -168,7 +175,10 @@ class ExpertParallelPlugin(RuntimePlugin):
             bucket = _GradBucket(params=bucket_params, grad_buffer=grad_buffer, pending=0)
             bucket.work = ChainedWork(None, self._bucket_erep_functor(bucket, edp_group), blocks_by_stream=edp_blocks_by_stream)
             self._grad_buckets.append(bucket)
-            for param in bucket_params:
+
+    def _register_bucket_hooks(self) -> None:
+        for bucket in self._grad_buckets:
+            for param in bucket.params:
                 param.register_post_accumulate_grad_hook(self._make_bucket_grad_hook(bucket))
 
     def _make_bucket_grad_hook(self, bucket: _GradBucket):
@@ -200,7 +210,7 @@ class ExpertParallelPlugin(RuntimePlugin):
                 replicated_axes=attrs.replicated_axes | {MeshAxis.EREP},
             )
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         assert self.runtime is not None
         if phase == RuntimePhase.PRE_BACKWARD:
             if not self._delegate_expert_sync and self.runtime.state.step_context.accum_start:

@@ -260,8 +260,8 @@ def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = 
         baseline_shard_rules = _rule_by_param_name(baseline_core.model)
         runtime_shard_rules = _rule_by_param_name(runtime_core.model)
 
-        baseline_core._run_phase(RuntimePhase.PRE_STEP)
-        runtime_core._run_phase(RuntimePhase.PRE_STEP)
+        baseline_core._run_step_phase(RuntimePhase.PRE_STEP)
+        runtime_core._run_step_phase(RuntimePhase.PRE_STEP)
         baseline_grads = (
             _named_tensors(
                 baseline_core.model,

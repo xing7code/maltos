@@ -9,7 +9,7 @@ import torch.distributed as dist
 from runtime.buffer_allocator import BufferPolicy, acquire_buffer
 from runtime.mesh import MeshAxis
 from runtime.plugin import PluginId, RuntimePlugin
-from runtime.types import ParamRole, RuntimePhase
+from runtime.types import ParamRole, RuntimePhase, SetupPhase
 
 
 class _NullWork:
@@ -39,7 +39,7 @@ class DataParallelPlugin(RuntimePlugin):
                 replicated_axes=attrs.replicated_axes | {MeshAxis.DP},
             )
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         if phase != RuntimePhase.POST_BACKWARD:
             return
         assert self.runtime is not None
@@ -140,18 +140,21 @@ class BucketDataParallelPlugin(RuntimePlugin):
         self.bucket_byte_size = bucket_mb_size * 1024 * 1024
         self.buckets: list[_Bucket] = []
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
-        assert self.runtime is not None
-        dp_group = self.runtime.get_group(MeshAxis.DP)
-        if dp_group is None:
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase == SetupPhase.MATERIALIZE:
+            assert self.runtime is not None
+            dp_group = self.runtime.get_group(MeshAxis.DP)
+            if dp_group is None:
+                return model
+            self._build_buckets(model, dp_group)
             return model
-        self._build_buckets(model, dp_group)
-        for bucket in self.buckets:
-            for param in bucket.params:
-                param.register_post_accumulate_grad_hook(bucket.make_hook())
+        if phase == SetupPhase.FINALIZE:
+            for bucket in self.buckets:
+                for param in bucket.params:
+                    param.register_post_accumulate_grad_hook(bucket.make_hook())
         return model
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_BACKWARD:
             assert self.runtime is not None
             context = self.runtime.state.step_context

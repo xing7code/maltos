@@ -27,7 +27,7 @@ class GradClipPlugin(RuntimePlugin):
                 "For ZeRO, set RuntimeCore.grad_clip_max_norm and let the ZeRO plugin clip local shards."
             )
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         if phase != RuntimePhase.PRE_STEP or self.runtime is None:
             return
         optimizer, _ = self.runtime.get_optimizer_and_scheduler()

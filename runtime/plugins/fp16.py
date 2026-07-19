@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from runtime.plugin import PluginId, RuntimePlugin
-from runtime.types import MetricValue, RuntimePhase
+from runtime.types import MetricValue, RuntimePhase, SetupPhase
 
 
 class Fp16Plugin(RuntimePlugin):
@@ -22,11 +22,12 @@ class Fp16Plugin(RuntimePlugin):
             },
         )
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
-        self._setup_scaler()
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase == SetupPhase.FINALIZE:
+            self._setup_scaler()
         return model
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         if self.runtime is None:
             return
         if phase == RuntimePhase.PRE_BACKWARD:

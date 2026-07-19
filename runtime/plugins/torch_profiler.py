@@ -57,7 +57,7 @@ class TorchProfilerPlugin(RuntimePlugin):
         super().bind(runtime)
         self._start()
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.POST_STEP and self._profiler is not None:
             self._profiler.step()
 

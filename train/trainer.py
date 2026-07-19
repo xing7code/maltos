@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from data.protocols import StatefulDataLoaderProtocol
 from runtime.core import RuntimeCore
-from state.checkpoint import load_sharded_checkpoint, save_sharded_checkpoint
+from state.checkpoint import save_sharded_checkpoint
 from utils.metrics import MetricAggregator, MetricLogger
 
 
@@ -68,10 +68,8 @@ class Trainer:
         self._last_logged_step = 0
 
     def setup(self) -> None:
-        self.runtime.setup()
         self.runtime.state_manager.bind_dataloader(self.dataloader)
-        if self.config.resume_from is not None:
-            load_sharded_checkpoint(self.runtime.state_manager, self.config.resume_from)
+        self.runtime.setup(checkpoint_path=self.config.resume_from)
         self._last_logged_step = self.runtime.state.step_context.step
 
     def fit(self) -> None:

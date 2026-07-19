@@ -17,7 +17,7 @@ from runtime.plugins.zero_common import (
     NarrowShardWork,
     ZeroPluginBase,
 )
-from runtime.types import ParamRole, RuntimePhase
+from runtime.types import ParamRole, RuntimePhase, SetupPhase
 from state.state import ParamState
 from utils.distributed import all_gather_single, reduce_scatter_single
 
@@ -71,6 +71,7 @@ class Zero3Plugin(ZeroPluginBase):
             id=PluginId.ZERO3,
             name="zero3",
             owns_optimizer=True,
+            owns_model_state=True,
             runs_after={PluginId.PP, PluginId.CP, PluginId.TP, PluginId.SP},
         )
         self.wrap_cls = set(wrap_cls or {nn.Linear})
@@ -83,22 +84,26 @@ class Zero3Plugin(ZeroPluginBase):
         self._last_bucket: _Bucket | None = None
         self.expert_params: list[nn.Parameter] = []
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
-        assert self.runtime is not None
-        self.dp_group = self.runtime.get_group(MeshAxis.DP)
-        if self.dp_group is None:
-            raise ValueError("Zero3Plugin requires mesh.dp > 1")
-        self.world_size = dist.get_world_size(self.dp_group)
-        self.rank = dist.get_rank(self.dp_group)
-        for cls in list(self.wrap_cls):
-            self.wrap_cls.update(self.runtime.get_module_replacements(cls))
-        self._prepare_buckets(model)
-        optimizer_params = [bucket.local_param for bucket in self.buckets]
-        self.optimizer = self.runtime.create_optimizer(optimizer_params)
-        self.scheduler = self.runtime.create_scheduler(self.optimizer)
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase == SetupPhase.MATERIALIZE:
+            assert self.runtime is not None
+            self.dp_group = self.runtime.get_group(MeshAxis.DP)
+            if self.dp_group is None:
+                raise ValueError("Zero3Plugin requires mesh.dp > 1")
+            self.world_size = dist.get_world_size(self.dp_group)
+            self.rank = dist.get_rank(self.dp_group)
+            for cls in list(self.wrap_cls):
+                self.wrap_cls.update(self.runtime.get_module_replacements(cls))
+            self._prepare_buckets(model)
+            optimizer_params = [bucket.local_param for bucket in self.buckets]
+            self.optimizer = self.runtime.create_optimizer(optimizer_params)
+            self.scheduler = self.runtime.create_scheduler(self.optimizer)
+            return model
+        if phase == SetupPhase.FINALIZE:
+            self._add_hooks()
         return model
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
             assert self.runtime is not None
             if (
@@ -167,7 +172,6 @@ class Zero3Plugin(ZeroPluginBase):
             self.buckets.append(bucket)
 
         self._reset_buckets(grad_accum_start=True)
-        self._add_hooks()
         for bucket in self.buckets:
             self._free_full_params(bucket)
 
@@ -198,11 +202,13 @@ class Zero3Plugin(ZeroPluginBase):
         if any(self.runtime.get_param_role(param) != role for param in params):
             raise ValueError(f"Zero3 bucket {index} mixes param roles, which is unsupported")
         group_context = self._group_context_for_role(role)
-        dtype, device = params[0].dtype, params[0].device
+        assert self.runtime.device is not None
+        device = torch.device(self.runtime.device)
+        dtype = self.runtime.dtype or params[0].dtype
         param_shapes = [param.shape for param in params]
         param_numels = [param.numel() for param in params]
         buffer_size = self._padded_len(sum(param_numels), group_context.world_size)
-        full_param = torch.zeros(buffer_size, dtype=dtype, device=device)
+        full_param = torch.zeros(buffer_size, dtype=params[0].dtype, device=params[0].device)
         offset = 0
         for param in params:
             full_param[offset : offset + param.numel()].copy_(param.detach().view(-1))
@@ -211,7 +217,7 @@ class Zero3Plugin(ZeroPluginBase):
         shard_len = buffer_size // group_context.world_size
         shard_start = group_context.rank * shard_len
         shard_end = (group_context.rank + 1) * shard_len
-        local_param = nn.Parameter(full_param[shard_start:shard_end].clone())
+        local_param = nn.Parameter(full_param[shard_start:shard_end].to(device=device, dtype=dtype).clone())
         exec_state_count = self.runtime.plan.pp_schedule.microbatches
         exec_states = [_BucketExecState() for _ in range(exec_state_count)]
         return _Bucket(
@@ -460,7 +466,7 @@ class Zero3Plugin(ZeroPluginBase):
             self._free_full_params(bucket)
         self._release_materialized_buffers()
 
-    def override_param_state_dict(self) -> tuple[dict[str, torch.Tensor], list[ParamState]] | None:
+    def export_model_state(self, state_manager) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
         state = {}
         metadata = []
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -479,13 +485,12 @@ class Zero3Plugin(ZeroPluginBase):
             )
         return state, metadata
 
-    def load_param_state_dict(self, state: dict[str, torch.Tensor]) -> bool:
+    def import_model_state(self, state_manager, state: dict[str, torch.Tensor]) -> None:
         for bucket in self.buckets:
             state_key = f"zero3_bucket_{bucket.index}"
             tensor = state[state_key].to(device=bucket.local_param.device, dtype=bucket.local_param.dtype)
             bucket.local_param.data.copy_(tensor)
             self._free_full_params(bucket)
-        return True
 
     def export_plugin_state(self) -> dict[str, object]:
         assert self.runtime is not None

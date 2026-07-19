@@ -12,6 +12,7 @@ import torch.nn as nn
 from runtime.mesh import MeshAxis
 from runtime.plugin import PipelineParallelizableModule, PluginId, RuntimePlugin
 from runtime.step_runners import PipelineScheduleKind, PipelineStepRunner
+from runtime.types import SetupPhase
 
 
 class PipelineParallelPlugin(RuntimePlugin):
@@ -48,7 +49,9 @@ class PipelineParallelPlugin(RuntimePlugin):
         self.sequence_parallel_enabled = PluginId.SP in active_plugins
         self.sequence_parallel_world_size = runtime.mesh.tp if self.sequence_parallel_enabled else 1
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase != SetupPhase.TRANSFORM:
+            return model
         assert self.runtime is not None
         self._validate_runtime_support()
         if not dist.is_initialized():

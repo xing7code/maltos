@@ -218,10 +218,17 @@ class ZeroPluginBase(RuntimePlugin):
         id: PluginId,
         name: str,
         owns_optimizer: bool,
+        owns_model_state: bool = False,
         runs_after: set[PluginId],
         bucket_mb_size: int = 25,
     ) -> None:
-        super().__init__(id=id, name=name, owns_optimizer=owns_optimizer, runs_after=runs_after)
+        super().__init__(
+            id=id,
+            name=name,
+            owns_optimizer=owns_optimizer,
+            owns_model_state=owns_model_state,
+            runs_after=runs_after,
+        )
         self.bucket_byte_size = bucket_mb_size * 1024 * 1024
         self.dp_group: dist.ProcessGroup | None = None
         self.world_size = 1

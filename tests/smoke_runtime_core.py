@@ -25,7 +25,7 @@ from models import (
 from attention_backend_utils import resolve_attention_backend
 from parallel import ParallelPlan
 from parallel.specs import TpSpShardAxis
-from runtime import DefaultStepRunner, MeshConfig, ParamRole, PluginId, RuntimeCore, RuntimePhase
+from runtime import DefaultStepRunner, MeshConfig, ParamRole, PluginId, RuntimeCore, RuntimePhase, SetupPhase
 from runtime.buffer_allocator import BufferPolicy, acquire_buffer, clear_buffer_pool, release_buffer
 from runtime.mesh import MeshAxis
 from runtime.plugins.ddp import DataParallelPlugin
@@ -34,6 +34,7 @@ from runtime.plugins.fp16 import Fp16Plugin
 from runtime.plugins.torch_profiler import TorchProfilerPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugin import RuntimePlugin
+from state import save_sharded_checkpoint
 from utils.attention_backend import AttentionBackend
 from utils.constants import INPUT_IDS_KEY, LABELS_KEY, POSITION_IDS_KEY, SEQUENCE_IDS_KEY
 
@@ -83,11 +84,12 @@ class RecordingPlugin(RuntimePlugin):
         )
         self.event_log = event_log
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
-        self.event_log.append(f"{self.name}:transform")
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase == SetupPhase.TRANSFORM:
+            self.event_log.append(f"{self.name}:transform")
         return model
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         self.event_log.append(f"{self.name}:{phase.value}")
 
 
@@ -119,7 +121,9 @@ class OptimizerOwnerPlugin(RuntimePlugin):
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase != SetupPhase.FINALIZE:
+            return model
         assert self.runtime is not None
         self.optimizer = self.runtime.create_optimizer(model.parameters())
         self.scheduler = self.runtime.create_scheduler(self.optimizer)
@@ -149,7 +153,9 @@ class ReplaceLinearPlugin(RuntimePlugin):
     def __init__(self) -> None:
         super().__init__(id=PluginId.CHECKPOINT, name="replace_linear")
 
-    def transform_model(self, model: nn.Module) -> nn.Module:
+    def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase != SetupPhase.TRANSFORM:
+            return model
         model.proj = nn.Linear(4, 1)
         return model
 
@@ -334,18 +340,17 @@ def test_train_step_phases_and_state_manager() -> None:
 
 
 def test_multiple_optimizer_plugin_owners_fail() -> None:
-    core = RuntimeCore(
-        mesh=MeshConfig(),
-        plan=ParallelPlan(),
-        model=LossModel(),
-        optimizer_factory=_sgd_factory(),
-        plugins=[
-            OptimizerOwnerPlugin(PluginId.ZERO1),
-            OptimizerOwnerPlugin(PluginId.ZERO2),
-        ],
-    )
     try:
-        core.setup()
+        RuntimeCore(
+            mesh=MeshConfig(),
+            plan=ParallelPlan(),
+            model=LossModel(),
+            optimizer_factory=_sgd_factory(),
+            plugins=[
+                OptimizerOwnerPlugin(PluginId.ZERO1),
+                OptimizerOwnerPlugin(PluginId.ZERO2),
+            ],
+        )
     except ValueError as exc:
         assert "only one optimizer-owning plugin" in str(exc)
     else:
@@ -353,18 +358,17 @@ def test_multiple_optimizer_plugin_owners_fail() -> None:
 
 
 def test_multiple_step_runner_plugin_owners_fail() -> None:
-    core = RuntimeCore(
-        mesh=MeshConfig(),
-        plan=ParallelPlan(),
-        model=LossModel(),
-        optimizer_factory=_sgd_factory(),
-        plugins=[
-            StepRunnerOwnerPlugin(PluginId.PP),
-            StepRunnerOwnerPlugin(PluginId.CP),
-        ],
-    )
     try:
-        core.setup()
+        RuntimeCore(
+            mesh=MeshConfig(),
+            plan=ParallelPlan(),
+            model=LossModel(),
+            optimizer_factory=_sgd_factory(),
+            plugins=[
+                StepRunnerOwnerPlugin(PluginId.PP),
+                StepRunnerOwnerPlugin(PluginId.CP),
+            ],
+        )
     except ValueError as exc:
         assert "only one step-runner-owning plugin" in str(exc)
     else:
@@ -739,6 +743,48 @@ def test_trainer_state_plugin_states_roundtrip() -> None:
     core.state_manager.import_trainer_state(trainer_state)
     assert echo.value == 7
     assert core.state.step_context.microbatch_idx == 1
+
+
+def test_runtime_setup_weights_only_checkpoint_load_skips_runtime_state() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        checkpoint_dir = Path(tmp) / "weights_only_ckpt"
+        source_model = LossModel()
+        source_plugin = PluginStateEcho()
+        source_core = RuntimeCore(
+            mesh=MeshConfig(),
+            plan=ParallelPlan(),
+            model=source_model,
+            optimizer_factory=_adamw_factory(),
+            plugins=[source_plugin],
+        )
+        source_core.setup()
+        source_batch = torch.ones(2, 4)
+        _, should_step = source_core.run_step(source_batch)
+        assert should_step is True
+        source_core.step_optimizer()
+        source_plugin.value = 9
+        source_weight = source_model.proj.weight.detach().clone()
+        save_sharded_checkpoint(source_core.state_manager, checkpoint_dir)
+        source_core.close()
+
+        restored_model = LossModel()
+        restored_plugin = PluginStateEcho()
+        restored_core = RuntimeCore(
+            mesh=MeshConfig(),
+            plan=ParallelPlan(),
+            model=restored_model,
+            optimizer_factory=_adamw_factory(),
+            plugins=[restored_plugin],
+        )
+        restored_core.setup(checkpoint_path=checkpoint_dir, load_weights_only=True)
+
+        optimizer, _ = restored_core.get_optimizer_and_scheduler()
+        assert optimizer is not None
+        assert torch.allclose(restored_model.proj.weight.detach(), source_weight)
+        assert restored_plugin.value == 0
+        assert restored_core.state.step_context.step == 0
+        assert optimizer.state_dict()["state"] == {}
+        restored_core.close()
 
 
 def test_grad_accumulation_runtime_step_cadence() -> None:

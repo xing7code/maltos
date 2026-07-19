@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 import warnings
 
@@ -13,10 +14,18 @@ import torch.distributed as dist
 from parallel.plan import ParallelPlan
 from runtime.mesh import MeshAxis, MeshConfig, ProcessGroupManager
 from runtime.optim import MasterWeightsOptimizer
-from runtime.plugin import FlopsEstimatableModule, PluginId, RuntimePlugin
+from runtime.plugin import (
+    FlopsEstimatableModule,
+    ModelStateOwner,
+    OptimizerOwner,
+    PluginId,
+    RuntimePlugin,
+    StepRunnerOwner,
+)
 from runtime.step_runners import DefaultStepRunner
-from runtime.types import MetricValue, ParamRole, RuntimePhase, RuntimeState, StepContext
-from state.state import StateManager
+from runtime.types import MetricValue, ParamRole, RuntimePhase, RuntimeState, SetupPhase, StepContext
+from state.state import ParamState, StateManager
+from state.checkpoint import load_sharded_checkpoint
 from utils.constants import INPUT_IDS_KEY
 
 if TYPE_CHECKING:
@@ -50,6 +59,9 @@ class RuntimeCore:
         default_factory=dict, init=False
     )
     _param_roles: dict[int, ParamRole] = field(default_factory=dict, init=False, repr=False)
+    _optimizer_owner: OptimizerOwner = field(init=False, repr=False)
+    _step_runner_owner: StepRunnerOwner = field(init=False, repr=False)
+    _model_state_owner: ModelStateOwner = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
@@ -61,6 +73,9 @@ class RuntimeCore:
         )
         self._group_manager = ProcessGroupManager.from_plan(self.plan, self.mesh)
         self.plugins = self._resolve_plugin_order(self.plugins)
+        self._optimizer_owner = self._resolve_optimizer_owner()
+        self._step_runner_owner = self._resolve_step_runner_owner()
+        self._model_state_owner = self._resolve_model_state_owner()
 
     def _populate_static_model_metrics(self) -> None:
         self.state.static_metrics["perf/world_size"] = self.mesh.world_size
@@ -70,28 +85,45 @@ class RuntimeCore:
             except AttributeError:
                 pass
 
-    def setup(self) -> None:
+    def setup(
+        self,
+        *,
+        checkpoint_path: str | Path | None = None,
+        load_weights_only: bool = False,
+    ) -> None:
+        if load_weights_only and checkpoint_path is None:
+            raise ValueError("load_weights_only=True requires checkpoint_path")
         if self.device is None:
             self.device = _module_device(self.model)
         else:
             self.device = torch.device(self.device)
-        if self.dtype is None:
-            self.model.to(self.device)
-        else:
-            self.model.to(device=self.device, dtype=self.dtype)
         self.state_manager.bind(self)
         self._param_roles.clear()
         for plugin in self.plugins:
             plugin.bind(self)
-        for plugin in self.plugins:
-            self.model = plugin.transform_model(self.model)
+        self._run_setup_phase(SetupPhase.TRANSFORM)
+        self._run_setup_phase(SetupPhase.MATERIALIZE)
         self.state_manager.register_module(self.model)
+        self._run_setup_phase(SetupPhase.FINALIZE)
         for plugin in self.plugins:
             plugin.annotate_param_metadata()
         self._resolve_param_checkpoint_metadata()
         self._populate_static_model_metrics()
         self._setup_optimizer_and_scheduler()
-        self._step_runner = self._resolve_step_runner()
+        self._step_runner = self._step_runner_owner.build_step_runner()
+        if self._step_runner is None:
+            if self._step_runner_owner is self:
+                raise ValueError("runtime default step runner owner did not provide a step runner")
+            owner_plugin = self._step_runner_owner
+            raise ValueError(
+                f"plugin={owner_plugin.id.value} declared owns_step_runner=True but did not provide a step runner"
+            )
+        if checkpoint_path is not None:
+            load_sharded_checkpoint(
+                self.state_manager,
+                checkpoint_path,
+                weights_only=load_weights_only,
+            )
 
     def close(self) -> None:
         if self._closed:
@@ -122,14 +154,48 @@ class RuntimeCore:
         if num_tokens is not None:
             self.state.metadata["tokens"] = num_tokens
         context = self.state.step_context
-        self._run_phase(RuntimePhase.PRE_STEP_RUNNER)
+        self._run_step_phase(RuntimePhase.PRE_STEP_RUNNER)
         loss = self._step_runner.run(self, self.state.batch)
         should_step = context.advance_micro_step()
         return loss, should_step
 
-    def _run_phase(self, phase: RuntimePhase) -> None:
+    def _run_setup_phase(self, phase: SetupPhase) -> None:
+        if phase is SetupPhase.MATERIALIZE and self._model_state_owner is self:
+            assert self.device is not None
+            if self.dtype is None:
+                self.model.to(self.device)
+            else:
+                self.model.to(device=self.device, dtype=self.dtype)
         for plugin in self.plugins:
-            plugin.on_phase(phase)
+            self.model = plugin.on_setup_phase(phase, self.model)
+
+    def export_model_state(self, state_manager: StateManager) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        entries = state_manager._export_param_states()
+        state: dict[str, torch.Tensor] = {}
+        for entry in entries:
+            if entry.source_rank is None:
+                raise RuntimeError(f"checkpoint source rank not resolved for param={entry.state_key}")
+            if entry.source_rank != rank:
+                continue
+            param = state_manager.get_param_tensor(entry.state_key)
+            state[entry.state_key] = param.detach().cpu().clone()
+        for entry in entries:
+            if entry.source_rank is None:
+                entry.source_rank = rank
+        return state, entries
+
+    def import_model_state(self, state_manager: StateManager, model_state: dict[str, torch.Tensor]) -> None:
+        for name, tensor in model_state.items():
+            resolved_name = state_manager._resolve_runtime_name(name)
+            if resolved_name not in state_manager.param_states:
+                raise KeyError(f"param state not found: {resolved_name}")
+            param = state_manager.get_param_tensor(resolved_name)
+            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+
+    def _run_step_phase(self, phase: RuntimePhase) -> None:
+        for plugin in self.plugins:
+            plugin.on_step_phase(phase)
 
     def get_group(self, axis: MeshAxis) -> dist.ProcessGroup | None:
         assert self._group_manager is not None
@@ -215,18 +281,13 @@ class RuntimeCore:
     # Optimizer / scheduler methods: begin
     # -------------------------------------
     def _setup_optimizer_and_scheduler(self) -> None:
-        runtime_owners = ["runtime"] if self._optimizer is not None else []
-        plugin_owners = [plugin for plugin in self.plugins if plugin.owns_optimizer]
-        if len(plugin_owners) > 1:
-            raise ValueError(
-                f"RuntimeCore allows only one optimizer-owning plugin, got {[plugin.id.value for plugin in plugin_owners]}"
-            )
-        if runtime_owners and plugin_owners:
-            raise ValueError(
-                "Runtime optimizer ownership is mutually exclusive with optimizer-owning plugins, "
-                f"got {runtime_owners + [plugin.id.value for plugin in plugin_owners]}"
-            )
-        if runtime_owners or plugin_owners:
+        if self._optimizer_owner is not self:
+            optimizer, _ = self._optimizer_owner.get_optimizer_and_scheduler()
+            if optimizer is None:
+                owner_plugin = self._optimizer_owner
+                raise ValueError(
+                    f"plugin={owner_plugin.id.value} declared owns_optimizer=True but did not provide an optimizer"
+                )
             return
         self._optimizer = self.create_optimizer(self.model.parameters())
         self._scheduler = self.create_scheduler(self._optimizer)
@@ -234,20 +295,9 @@ class RuntimeCore:
     def get_optimizer_and_scheduler(
         self,
     ) -> tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LRScheduler | None]:
-        if self._optimizer is not None:
+        if self._optimizer_owner is self:
             return self._optimizer, self._scheduler
-        for plugin in self.plugins:
-            if plugin.owns_optimizer:
-                return getattr(plugin, "optimizer", None), getattr(plugin, "scheduler", None)
-        return None, None
-
-    def get_optimizer_owner(self) -> str | None:
-        if self._optimizer is not None:
-            return "runtime"
-        for plugin in self.plugins:
-            if plugin.owns_optimizer:
-                return plugin.id.value
-        return None
+        return self._optimizer_owner.get_optimizer_and_scheduler()
 
     def create_optimizer(self, params: Iterable[nn.Parameter]) -> torch.optim.Optimizer:
         if self.optimizer_factory is None:
@@ -266,7 +316,7 @@ class RuntimeCore:
         return self.scheduler_factory(optimizer)
 
     def step_optimizer(self) -> None:
-        self._run_phase(RuntimePhase.PRE_STEP)
+        self._run_step_phase(RuntimePhase.PRE_STEP)
         optimizer, scheduler = self.get_optimizer_and_scheduler()
         if optimizer is None:
             raise RuntimeError("step_optimizer() requires a runtime-owned or plugin-owned optimizer")
@@ -288,17 +338,18 @@ class RuntimeCore:
         if scheduler is not None:
             scheduler.step()
         optimizer.zero_grad(set_to_none=True)
-        self._run_phase(RuntimePhase.POST_STEP)
+        self._run_step_phase(RuntimePhase.POST_STEP)
         self.state.step_context.advance_step()
 
     def should_save_optimizer(self, rank_id: int) -> bool:
         return self.optimizer_checkpoint_rank(rank_id) == rank_id
 
     def optimizer_checkpoint_rank(self, rank_id: int) -> int:
-        for plugin in self.plugins:
-            if plugin.owns_optimizer:
-                return plugin.optimizer_state_source_rank(rank_id)
+        if self._optimizer_owner is not self:
+            return self._optimizer_owner.optimizer_state_source_rank(rank_id)
+        return self.optimizer_state_source_rank(rank_id)
 
+    def optimizer_state_source_rank(self, rank_id: int) -> int:
         if any(plugin.id in {PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3} for plugin in self.plugins):
             return rank_id
 
@@ -358,9 +409,11 @@ class RuntimeCore:
                 metrics[metric_key] = value
         return metrics
 
-    def _resolve_step_runner(self) -> "StepRunner":
+    def build_step_runner(self) -> "StepRunner | None":
+        return DefaultStepRunner()
+
+    def _resolve_step_runner_owner(self) -> StepRunnerOwner:
         owner_plugin: RuntimePlugin | None = None
-        owner_runner: StepRunner | None = None
         stray_runners: list[str] = []
         for plugin in self.plugins:
             runner = plugin.build_step_runner()
@@ -369,7 +422,6 @@ class RuntimeCore:
                     names = [owner_plugin.id.value, plugin.id.value]
                     raise ValueError(f"RuntimeCore allows only one step-runner-owning plugin, got {names}")
                 owner_plugin = plugin
-                owner_runner = runner
                 continue
             if runner is not None:
                 stray_runners.append(plugin.id.value)
@@ -380,13 +432,33 @@ class RuntimeCore:
                 f"their step runners will be ignored: {stray_runners}",
                 stacklevel=2,
             )
-        if owner_plugin is None:
-            return DefaultStepRunner()
-        if owner_runner is None:
-            raise ValueError(
-                f"plugin={owner_plugin.id.value} declared owns_step_runner=True but did not provide a step runner"
-            )
-        return owner_runner
+        return self if owner_plugin is None else owner_plugin
+
+    def _resolve_optimizer_owner(self) -> OptimizerOwner:
+        owner_plugin: RuntimePlugin | None = None
+        for plugin in self.plugins:
+            if not plugin.owns_optimizer:
+                continue
+            if owner_plugin is not None:
+                raise ValueError(
+                    "RuntimeCore allows only one optimizer-owning plugin, "
+                    f"got {[owner_plugin.id.value, plugin.id.value]}"
+                )
+            owner_plugin = plugin
+        return self if owner_plugin is None else owner_plugin
+
+    def _resolve_model_state_owner(self) -> ModelStateOwner:
+        owner_plugin: RuntimePlugin | None = None
+        for plugin in self.plugins:
+            if not plugin.owns_model_state:
+                continue
+            if owner_plugin is not None:
+                raise ValueError(
+                    "RuntimeCore allows only one model-state-owning plugin, "
+                    f"got {[owner_plugin.id.value, plugin.id.value]}"
+                )
+            owner_plugin = plugin
+        return self if owner_plugin is None else owner_plugin
 
     def _resolve_plugin_order(self, plugins: list[RuntimePlugin]) -> list[RuntimePlugin]:
         if not plugins:

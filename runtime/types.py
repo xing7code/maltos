@@ -10,6 +10,21 @@ import torch
 MetricValue = float | int | str | bool | None
 
 
+class SetupPhase(str, Enum):
+    # Structural rewrite only: plugins may replace/prune modules or swap
+    # attention/parallel layer implementations, but should not allocate final
+    # runtime state or register execution hooks here.
+    TRANSFORM = "transform"
+    # State materialization only: allocate/rebind the tensors that define the
+    # runtime storage layout (for example flat buffers, local shards, optimizer
+    # params, or other persistent backing state), but do not attach hooks yet.
+    MATERIALIZE = "materialize"
+    # Execution wiring only: register forward/backward/grad hooks and other
+    # behavior that depends on the final materialized state, without changing
+    # the underlying storage layout again.
+    FINALIZE = "finalize"
+
+
 class RuntimePhase(str, Enum):
     PRE_STEP_RUNNER = "pre_step_runner"
     PRE_FORWARD = "pre_forward"

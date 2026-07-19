@@ -180,14 +180,18 @@ def _save_sharded_checkpoint_contents(state_manager: StateManager, checkpoint_di
 
     distributed_barrier()
 
-
-def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> None:
+def load_sharded_checkpoint(
+    state_manager: StateManager,
+    path: str | Path,
+    *,
+    weights_only: bool = False,
+) -> None:
     runtime = state_manager.runtime
 
     checkpoint_dir = Path(path)
     rank = dist.get_rank() if dist.is_initialized() else 0
     manifest = _load_manifest(checkpoint_dir)
-    _validate_manifest_for_runtime(manifest, runtime)
+    _validate_manifest_for_runtime(manifest, runtime, weights_only=weights_only)
 
     model_state = _load_model_state_for_rank(
         checkpoint_dir,
@@ -196,19 +200,22 @@ def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> No
         rank=rank,
     )
 
-    trainer_artifact = _find_artifact(manifest, kind="trainer", rank=rank)
-    if trainer_artifact is None:
-        raise ValueError(f"manifest missing trainer artifact for rank={rank}")
-    with torch.serialization.safe_globals([PpStatus]):
-        trainer_state = torch.load(checkpoint_dir / trainer_artifact.path, map_location="cpu", weights_only=True)
+    trainer_state = None
+    optim_state = None
+    if not weights_only:
+        trainer_artifact = _find_artifact(manifest, kind="trainer", rank=rank)
+        if trainer_artifact is None:
+            raise ValueError(f"manifest missing trainer artifact for rank={rank}")
+        with torch.serialization.safe_globals([PpStatus]):
+            trainer_state = torch.load(checkpoint_dir / trainer_artifact.path, map_location="cpu", weights_only=True)
 
-    optim_source_rank = manifest.optimizer_source_ranks[rank]
-    optimizer_artifact = _find_artifact(manifest, kind="optimizer", rank=optim_source_rank)
-    optim_state = (
-        torch.load(checkpoint_dir / optimizer_artifact.path, map_location="cpu", weights_only=True)
-        if optimizer_artifact is not None
-        else None
-    )
+        optim_source_rank = manifest.optimizer_source_ranks[rank]
+        optimizer_artifact = _find_artifact(manifest, kind="optimizer", rank=optim_source_rank)
+        optim_state = (
+            torch.load(checkpoint_dir / optimizer_artifact.path, map_location="cpu", weights_only=True)
+            if optimizer_artifact is not None
+            else None
+        )
     state_manager.import_model_state(model_state)
     if optim_state is not None:
         state_manager.import_optimizer_state(OptimizerState(state=optim_state))
@@ -225,7 +232,7 @@ def load_sharded_checkpoint(state_manager: StateManager, path: str | Path) -> No
             )
         )
 
-    runtime._run_phase(RuntimePhase.POST_LOAD)
+    runtime._run_step_phase(RuntimePhase.POST_LOAD)
     distributed_barrier()
 
 
@@ -306,7 +313,12 @@ def _load_model_state_for_rank(
     return merged_state
 
 
-def _validate_manifest_for_runtime(manifest: CheckpointManifest, runtime) -> None:
+def _validate_manifest_for_runtime(
+    manifest: CheckpointManifest,
+    runtime,
+    *,
+    weights_only: bool = False,
+) -> None:
     runtime_world_size = dist.get_world_size() if dist.is_initialized() else 1
     runtime_rank = dist.get_rank() if dist.is_initialized() else 0
     if manifest.world_size != runtime_world_size:
@@ -328,7 +340,7 @@ def _validate_manifest_for_runtime(manifest: CheckpointManifest, runtime) -> Non
     for rank_id in range(manifest.world_size):
         if _find_artifact(manifest, kind="model", rank=rank_id) is None:
             raise ValueError(f"manifest missing model artifact for rank={rank_id}")
-        if _find_artifact(manifest, kind="trainer", rank=rank_id) is None:
+        if not weights_only and _find_artifact(manifest, kind="trainer", rank=rank_id) is None:
             raise ValueError(f"manifest missing trainer artifact for rank={rank_id}")
     _validate_unique_artifacts(manifest)
 
@@ -348,6 +360,9 @@ def _validate_manifest_for_runtime(manifest: CheckpointManifest, runtime) -> Non
                     f"manifest missing model artifact for source rank={entry.source_rank} "
                     f"(used by rank={rank_meta.rank}, entry={entry.state_key})"
                 )
+
+    if weights_only:
+        return
 
     optimizer_artifact_ranks = {artifact.rank for artifact in manifest.artifacts if artifact.kind == "optimizer"}
     if optimizer_artifact_ranks:

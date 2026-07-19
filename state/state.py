@@ -167,10 +167,10 @@ class StateManager:
 
     def export_optimizer_state(self) -> OptimizerState | None:
         runtime = self.runtime
-        owner = runtime.get_optimizer_owner()
         optimizer, scheduler = runtime.get_optimizer_and_scheduler()
-        if owner is None or optimizer is None:
+        if optimizer is None:
             return None
+        owner = "runtime" if runtime._optimizer_owner is runtime else runtime._optimizer_owner.id.value
         state: dict[str, Any] = {self._optimizer_state_key(owner): optimizer.state_dict()}
         if scheduler is not None:
             state[self._scheduler_state_key(owner)] = scheduler.state_dict()
@@ -179,10 +179,10 @@ class StateManager:
     def import_optimizer_state(self, state: OptimizerState) -> None:
         runtime = self.runtime
         payload = state.state
-        owner = runtime.get_optimizer_owner()
         optimizer, scheduler = runtime.get_optimizer_and_scheduler()
-        if owner is None or optimizer is None:
+        if optimizer is None:
             raise ValueError("no optimizer available to load state into")
+        owner = "runtime" if runtime._optimizer_owner is runtime else runtime._optimizer_owner.id.value
         optimizer_state = payload.get(self._optimizer_state_key(owner))
         if optimizer_state is None:
             raise ValueError(f"no optimizer state found for owner={owner}")
@@ -206,42 +206,10 @@ class StateManager:
         ]
 
     def export_model_state(self) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
-        runtime = self.runtime
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        for plugin in runtime.plugins:
-            override_state = plugin.override_param_state_dict()
-            if override_state is not None:
-                state, entries = override_state
-                break
-        else:
-            entries = self._export_param_states()
-            state = {}
-            for entry in entries:
-                if entry.source_rank is None:
-                    raise RuntimeError(f"checkpoint source rank not resolved for param={entry.state_key}")
-                if entry.source_rank != rank:
-                    continue
-                param = self.get_param_tensor(entry.state_key)
-                state[entry.state_key] = param.detach().cpu().clone()
-
-        for entry in entries:
-            if entry.source_rank is None:
-                entry.source_rank = rank
-
-        return state, entries
+        return self.runtime._model_state_owner.export_model_state(self)
 
     def import_model_state(self, model_state: dict[str, torch.Tensor]) -> None:
-        runtime = self.runtime
-        for plugin in runtime.plugins:
-            if plugin.load_param_state_dict(model_state):
-                return
-
-        for name, tensor in model_state.items():
-            resolved_name = self._resolve_runtime_name(name)
-            if resolved_name not in self.param_states:
-                raise KeyError(f"param state not found: {resolved_name}")
-            param = self.get_param_tensor(name)
-            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+        self.runtime._model_state_owner.import_model_state(self, model_state)
 
     def export_trainer_state(self) -> TrainerState:
         runtime = self.runtime

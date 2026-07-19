@@ -19,7 +19,7 @@ class MetricPlugin(RuntimePlugin):
         self._step_start: float | None = None
         self._metrics: dict[str, MetricValue] = {}
 
-    def on_phase(self, phase: RuntimePhase) -> None:
+    def on_step_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_STEP_RUNNER:
             assert self.runtime is not None
             context = self.runtime.state.step_context

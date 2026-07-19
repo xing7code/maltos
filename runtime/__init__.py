@@ -12,7 +12,7 @@ from .plugin import (
     TpSpParallelizableModule,
 )
 from .step_runners import DefaultStepRunner, PipelineScheduleKind, PipelineStepRunner, StepRunner
-from .types import MetricValue, ParamRole, PpStatus, RuntimePhase, RuntimeState, StepContext
+from .types import MetricValue, ParamRole, PpStatus, RuntimePhase, RuntimeState, SetupPhase, StepContext
 
 __all__ = [
     "acquire_buffer",
@@ -36,6 +36,7 @@ __all__ = [
     "RuntimePlugin",
     "RuntimePhase",
     "RuntimeState",
+    "SetupPhase",
     "StepContext",
     "StepRunner",
     "TpSpParallelizableModule",
