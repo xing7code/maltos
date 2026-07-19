@@ -4,13 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import shutil
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch.distributed as dist
 
 from data.protocols import StatefulDataLoaderProtocol
 from runtime.core import RuntimeCore
-from state.checkpoint import save_sharded_checkpoint
+from state.checkpoint import save_runtime_spec, save_sharded_checkpoint
 from utils.metrics import MetricAggregator, MetricLogger
 
 
@@ -41,6 +41,7 @@ class Trainer:
         logger: MetricLogger | list[MetricLogger] | None = None,
         metric_aggregator: MetricAggregator | None = None,
         checkpoint_uploader: CheckpointUploader | None = None,
+        runtime_spec: dict[str, Any] | None = None,
     ) -> None:
         if config.max_steps < 0:
             raise ValueError(f"max_steps must be >= 0, got {config.max_steps}")
@@ -50,6 +51,8 @@ class Trainer:
             raise ValueError(f"checkpoint_every must be >= 1, got {config.checkpoint_every}")
         if config.checkpoint_every is not None and config.checkpoint_dir is None:
             raise ValueError("checkpoint_dir is required when checkpoint_every is set")
+        if config.checkpoint_every is not None and runtime_spec is None:
+            raise ValueError("runtime_spec is required when checkpoint_every is set")
         if config.checkpoint_keep_last is not None and config.checkpoint_keep_last < 0:
             raise ValueError(f"checkpoint_keep_last must be >= 0, got {config.checkpoint_keep_last}")
         if config.checkpoint_keep_every_n_steps is not None and config.checkpoint_keep_every_n_steps < 1:
@@ -65,11 +68,19 @@ class Trainer:
         self.loggers = _normalize_loggers(logger)
         self.metric_aggregator = metric_aggregator or MetricAggregator()
         self.checkpoint_uploader = checkpoint_uploader
+        self.runtime_spec = runtime_spec
         self._last_logged_step = 0
 
     def setup(self) -> None:
         self.runtime.state_manager.bind_dataloader(self.dataloader)
         self.runtime.setup(checkpoint_path=self.config.resume_from)
+        if self.config.checkpoint_every is not None:
+            assert self.config.checkpoint_dir is not None
+            assert self.runtime_spec is not None
+            if _is_log_rank():
+                save_runtime_spec(self.config.checkpoint_dir, self.runtime_spec)
+            if dist.is_initialized():
+                dist.barrier()
         self._last_logged_step = self.runtime.state.step_context.step
 
     def fit(self) -> None:

@@ -58,6 +58,9 @@ def main() -> None:
             init_kwargs.pop("name")
     run = wandb.init(**init_kwargs)
     try:
+        runtime_spec = checkpoint_root / "runtime_spec.json"
+        if not runtime_spec.is_file():
+            raise ValueError(f"runtime checkpoint spec not found: {runtime_spec}")
         for step in args.steps:
             checkpoint_dir = checkpoint_root / f"step_{step:08d}"
             _validate_checkpoint_dir(checkpoint_dir)
@@ -70,7 +73,8 @@ def main() -> None:
                 type=args.artifact_type,
                 metadata={"step": step, "path": str(checkpoint_dir), "files": _count_files(checkpoint_dir)},
             )
-            artifact.add_dir(str(checkpoint_dir))
+            artifact.add_file(str(runtime_spec), name="runtime_spec.json")
+            artifact.add_dir(str(checkpoint_dir), name=checkpoint_dir.name)
             logged_artifact = run.log_artifact(artifact, aliases=aliases)
             if args.wait:
                 logged_artifact.wait()

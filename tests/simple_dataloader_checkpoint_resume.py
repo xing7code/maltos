@@ -63,7 +63,10 @@ def main() -> None:
     first_batch = continuous_loader.next_batch()
     _, should_step = continuous_core.run_step(first_batch)
     continuous_core.step_optimizer()
-    save_sharded_checkpoint(continuous_core.state_manager, checkpoint_dir)
+    save_sharded_checkpoint(
+        continuous_core.state_manager,
+        checkpoint_dir,
+    )
 
     continuous_second_batch = continuous_loader.next_batch()
     _, should_step = continuous_core.run_step(continuous_second_batch)

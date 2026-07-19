@@ -8,10 +8,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
+import torch.nn as nn
 
 from models import TinyModel
 from runtime import RuntimeCore
 from state import load_sharded_checkpoint, save_sharded_checkpoint
+
+
+class _BufferedModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+        self.register_buffer("rope_cos", torch.arange(16, dtype=torch.float32).view(4, 4))
+
+    def forward(self, batch: torch.Tensor) -> torch.Tensor:
+        return self.proj(batch + self.rope_cos).sum()
 
 
 def _build_core(seed: int = 1234, hidden_size: int = 32, grad_accum_steps: int = 1) -> RuntimeCore:
@@ -20,6 +31,16 @@ def _build_core(seed: int = 1234, hidden_size: int = 32, grad_accum_steps: int =
     core = RuntimeCore(
         model=model,
         grad_accum_steps=grad_accum_steps,
+        optimizer_factory=lambda params: torch.optim.SGD(params, lr=1e-2),
+    )
+    core.setup()
+    return core
+
+
+def _build_buffer_core(seed: int = 1234) -> RuntimeCore:
+    torch.manual_seed(seed)
+    core = RuntimeCore(
+        model=_BufferedModel(),
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=1e-2),
     )
     core.setup()
@@ -175,6 +196,24 @@ def test_microbatch_idx_roundtrip_succeeds() -> None:
         )
 
 
+def test_persistent_buffer_roundtrip_succeeds() -> None:
+    checkpoint_dir = Path(tempfile.mkdtemp(prefix="manifest_validation_buffer_"))
+    core = _build_buffer_core()
+    core.model.rope_cos.add_(7.0)
+    save_sharded_checkpoint(core.state_manager, checkpoint_dir)
+
+    manifest = _load_manifest(checkpoint_dir)
+    manifest_entries = manifest["ranks"][0]["entries"]
+    if not any(entry["state_key"] == "rope_cos" for entry in manifest_entries):
+        raise AssertionError("expected manifest to include persistent buffer entry for rope_cos")
+
+    restored_core = _build_buffer_core(seed=4321)
+    restored_core.model.rope_cos.zero_()
+    load_sharded_checkpoint(restored_core.state_manager, checkpoint_dir, weights_only=True)
+    if not torch.equal(restored_core.model.rope_cos, core.model.rope_cos):
+        raise AssertionError("expected persistent buffer to roundtrip through sharded checkpoint")
+
+
 def main() -> None:
     test_missing_artifacts_field_fails()
     test_world_size_mismatch_fails()
@@ -185,6 +224,7 @@ def main() -> None:
     test_missing_model_entry_in_source_artifact_fails()
     test_eval_only_manifest_load_succeeds()
     test_microbatch_idx_roundtrip_succeeds()
+    test_persistent_buffer_roundtrip_succeeds()
     print("PASS")
 
 

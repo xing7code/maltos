@@ -103,7 +103,10 @@ def main() -> None:
     saved_runtime_step = continuous_core.state.step
     saved_microbatch_idx = continuous_core.state.step_context.microbatch_idx
     saved_loader_state = continuous_loader.state_dict()
-    save_sharded_checkpoint(continuous_core.state_manager, checkpoint_dir)
+    save_sharded_checkpoint(
+        continuous_core.state_manager,
+        checkpoint_dir,
+    )
 
     continuous_second_batch = continuous_loader.next_batch()
     _, should_step = continuous_core.run_step(_batch_tuple(continuous_second_batch))

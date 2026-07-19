@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -16,20 +17,33 @@ if TYPE_CHECKING:
 
 @dataclass
 class RuntimeParamAttrs:
-    """Runtime-only metadata for one parameter reference."""
+    """Runtime-only metadata for one checkpointed model-state tensor."""
 
     sharded_axes: set[MeshAxis] = field(default_factory=set)
     replicated_axes: set[MeshAxis] = field(default_factory=set)
 
 
 @dataclass
-class ParamState:
+class ModelStateMeta:
     state_key: str
     logical_names: list[str]
     logical_shapes: list[tuple[int, ...]]
     physical_shape: tuple[int, ...]
     dtype: str
     source_rank: int | None = None
+
+
+@dataclass
+class ParamEntry:
+    meta: ModelStateMeta
+    param: nn.Parameter
+    attrs: RuntimeParamAttrs = field(default_factory=RuntimeParamAttrs)
+
+
+@dataclass
+class BufferEntry:
+    meta: ModelStateMeta
+    tensor: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -53,11 +67,10 @@ class OptimizerState:
 
 @dataclass
 class StateManager:
-    """Runtime-owned index of logical training state."""
+    """Runtime-owned index of checkpointable model and training state."""
 
-    param_states: dict[str, ParamState] = field(default_factory=dict)
-    _runtime_params: dict[str, nn.Parameter] = field(default_factory=dict, repr=False)
-    _runtime_attrs: dict[str, RuntimeParamAttrs] = field(default_factory=dict, repr=False)
+    params: dict[str, ParamEntry] = field(default_factory=dict)
+    buffers: dict[str, BufferEntry] = field(default_factory=dict)
     _param_names_by_id: dict[int, str] = field(default_factory=dict, repr=False)
     _runtime: "RuntimeCore | None" = field(default=None, init=False, repr=False)
     _dataloader: "StatefulDataLoaderProtocol | None" = field(default=None, init=False, repr=False)
@@ -72,35 +85,59 @@ class StateManager:
         return f"{self._SCHEDULER_STATE_PREFIX}{owner}"
 
     def _resolve_runtime_name(self, fq_name: str) -> str:
-        if fq_name in self._runtime_params or fq_name in self.param_states or fq_name in self._runtime_attrs:
+        if (
+            fq_name in self.params
+            or fq_name in self.buffers
+        ):
             return fq_name
         with_prefix = f"module.{fq_name}"
-        if with_prefix in self._runtime_params or with_prefix in self.param_states or with_prefix in self._runtime_attrs:
+        if (
+            with_prefix in self.params
+            or with_prefix in self.buffers
+        ):
             return with_prefix
         if fq_name.startswith("module."):
             without_prefix = fq_name[len("module.") :]
-            if without_prefix in self._runtime_params or without_prefix in self.param_states or without_prefix in self._runtime_attrs:
+            if (
+                without_prefix in self.params
+                or without_prefix in self.buffers
+            ):
                 return without_prefix
         return fq_name
 
     def register_module(self, model: nn.Module) -> None:
-        self.param_states.clear()
-        self._runtime_params.clear()
-        self._runtime_attrs.clear()
+        self.params.clear()
+        self.buffers.clear()
         self._param_names_by_id.clear()
         for fq_name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            self._runtime_params[fq_name] = param
             self._param_names_by_id[id(param)] = fq_name
-            self.param_states[fq_name] = ParamState(
-                state_key=fq_name,
-                logical_names=[fq_name],
-                logical_shapes=[tuple(param.shape)],
-                physical_shape=tuple(param.shape),
-                dtype=str(param.dtype),
+            self.params[fq_name] = ParamEntry(
+                meta=ModelStateMeta(
+                    state_key=fq_name,
+                    logical_names=[fq_name],
+                    logical_shapes=[tuple(param.shape)],
+                    physical_shape=tuple(param.shape),
+                    dtype=str(param.dtype),
+                ),
+                param=param,
             )
-            self._runtime_attrs[fq_name] = RuntimeParamAttrs()
+        param_names = set(self.params)
+        persistent_buffer_names = set(model.state_dict()) - param_names
+        for fq_name, buffer in model.named_buffers():
+            if fq_name not in persistent_buffer_names:
+                continue
+            self.buffers[fq_name] = BufferEntry(
+                meta=ModelStateMeta(
+                    state_key=fq_name,
+                    logical_names=[fq_name],
+                    logical_shapes=[tuple(buffer.shape)],
+                    physical_shape=tuple(buffer.shape),
+                    dtype=str(buffer.dtype),
+                ),
+                tensor=buffer,
+            )
 
     def bind(self, runtime: "RuntimeCore") -> None:
         self._runtime = runtime
@@ -114,7 +151,15 @@ class StateManager:
     def bind_dataloader(self, dataloader: "StatefulDataLoaderProtocol | None") -> None:
         self._dataloader = dataloader
 
-    def update_param_state(
+    @property
+    def param_states(self) -> Mapping[str, ModelStateMeta]:
+        return {fq_name: entry.meta for fq_name, entry in self.params.items()}
+
+    @property
+    def buffer_states(self) -> Mapping[str, ModelStateMeta]:
+        return {fq_name: entry.meta for fq_name, entry in self.buffers.items()}
+
+    def update_model_state(
         self,
         fq_name: str,
         *,
@@ -127,43 +172,45 @@ class StateManager:
         replicated_axes: set[MeshAxis] | None = None,
     ) -> None:
         fq_name = self._resolve_runtime_name(fq_name)
-        state = self.param_states.get(fq_name)
-        if state is None:
-            raise KeyError(f"param state not found: {fq_name}")
+        param_entry = self.params.get(fq_name)
+        if param_entry is not None:
+            meta = param_entry.meta
+            attrs = param_entry.attrs
+        else:
+            buffer_entry = self.buffers.get(fq_name)
+            meta = buffer_entry.meta if buffer_entry is not None else None
+            attrs = None
+        if meta is None:
+            raise KeyError(f"model state not found: {fq_name}")
         if logical_names is not None:
-            state.logical_names = logical_names
+            meta.logical_names = logical_names
         if logical_shapes is not None:
-            state.logical_shapes = logical_shapes
+            meta.logical_shapes = logical_shapes
         if physical_shape is not None:
-            state.physical_shape = physical_shape
+            meta.physical_shape = physical_shape
         if dtype is not None:
-            state.dtype = dtype
+            meta.dtype = dtype
         if source_rank is not None:
-            state.source_rank = source_rank
-        attrs = self._runtime_attrs.get(fq_name)
+            meta.source_rank = source_rank
         if attrs is not None:
             if sharded_axes is not None:
                 attrs.sharded_axes = sharded_axes
             if replicated_axes is not None:
                 attrs.replicated_axes = replicated_axes
 
-    def get_param_tensor(self, fq_name: str) -> nn.Parameter:
+    def get_model_tensor(self, fq_name: str) -> torch.Tensor:
         fq_name = self._resolve_runtime_name(fq_name)
-        if fq_name not in self._runtime_params:
-            raise KeyError(f"runtime parameter not found: {fq_name}")
-        return self._runtime_params[fq_name]
+        if fq_name in self.params:
+            return self.params[fq_name].param
+        if fq_name in self.buffers:
+            return self.buffers[fq_name].tensor
+        raise KeyError(f"runtime model tensor not found: {fq_name}")
 
     def get_param_name(self, param: nn.Parameter) -> str:
         fq_name = self._param_names_by_id.get(id(param))
         if fq_name is None:
             raise KeyError("runtime parameter name not found")
         return fq_name
-
-    def get_param_attrs(self, fq_name: str) -> RuntimeParamAttrs:
-        fq_name = self._resolve_runtime_name(fq_name)
-        if fq_name not in self._runtime_attrs:
-            raise KeyError(f"runtime param attrs not found: {fq_name}")
-        return self._runtime_attrs[fq_name]
 
     def export_optimizer_state(self) -> OptimizerState | None:
         runtime = self.runtime
@@ -191,21 +238,7 @@ class StateManager:
         if scheduler_state is not None and scheduler is not None:
             scheduler.load_state_dict(scheduler_state)
 
-    def _export_param_states(self, names: list[str] | None = None) -> list[ParamState]:
-        names = list(self.param_states) if names is None else names
-        return [
-            ParamState(
-                state_key=self.param_states[name].state_key,
-                logical_names=list(self.param_states[name].logical_names),
-                logical_shapes=list(self.param_states[name].logical_shapes),
-                physical_shape=tuple(self.param_states[name].physical_shape),
-                dtype=self.param_states[name].dtype,
-                source_rank=self.param_states[name].source_rank,
-            )
-            for name in names
-        ]
-
-    def export_model_state(self) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
+    def export_model_state(self) -> tuple[dict[str, torch.Tensor], list[ModelStateMeta]]:
         return self.runtime._model_state_owner.export_model_state(self)
 
     def import_model_state(self, model_state: dict[str, torch.Tensor]) -> None:

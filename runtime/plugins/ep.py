@@ -196,18 +196,39 @@ class ExpertParallelPlugin(RuntimePlugin):
 
     def annotate_param_metadata(self) -> None:
         assert self.runtime is not None
+        expert_runtime_to_logical = self._expert_runtime_name_map()
         erep_group = self.edp_group
         erep_size = dist.get_world_size(erep_group) if erep_group is not None else 1
-        if erep_size <= 1:
-            return
-        for fq_name in self.runtime.state_manager.param_states:
-            param = self.runtime.state_manager.get_param_tensor(fq_name)
-            if self.runtime.get_param_role(param) != ParamRole.EXPERT:
+        for fq_name, logical_name in expert_runtime_to_logical.items():
+            if fq_name not in self.runtime.state_manager.params:
                 continue
-            attrs = self.runtime.state_manager.get_param_attrs(fq_name)
-            self.runtime.state_manager.update_param_state(
+            param = self.runtime.state_manager.get_model_tensor(fq_name)
+            self.runtime.state_manager.update_model_state(
                 fq_name,
-                replicated_axes=attrs.replicated_axes | {MeshAxis.EREP},
+                logical_names=[logical_name],
+                logical_shapes=[tuple(param.shape)],
+                physical_shape=tuple(param.shape),
+                dtype=str(param.dtype),
+            )
+        if erep_size > 1:
+            for fq_name, entry in self.runtime.state_manager.params.items():
+                if id(entry.param) not in self._expert_param_ids:
+                    continue
+                attrs = entry.attrs
+                self.runtime.state_manager.update_model_state(
+                    fq_name,
+                    replicated_axes=attrs.replicated_axes | {MeshAxis.EREP},
+                )
+        for fq_name, logical_name in expert_runtime_to_logical.items():
+            if fq_name not in self.runtime.state_manager.buffers:
+                continue
+            buffer = self.runtime.state_manager.get_model_tensor(fq_name)
+            self.runtime.state_manager.update_model_state(
+                fq_name,
+                logical_names=[logical_name],
+                logical_shapes=[tuple(buffer.shape)],
+                physical_shape=tuple(buffer.shape),
+                dtype=str(buffer.dtype),
             )
 
     def on_step_phase(self, phase: RuntimePhase) -> None:
@@ -296,6 +317,21 @@ class ExpertParallelPlugin(RuntimePlugin):
                 f"got dp={mesh.dp} tp={mesh.tp} pp={mesh.pp} cp={mesh.cp} ep={mesh.ep}"
             )
         active = {plugin.id for plugin in self.runtime.plugins if plugin is not self}
+
+    def _expert_runtime_name_map(self) -> dict[str, str]:
+        assert self.runtime is not None
+        mapping: dict[str, str] = {}
+        for module_path, module in self.runtime.model.named_modules():
+            if not isinstance(module, ExpertParallelMoE):
+                continue
+            prefix = f"{module_path}." if module_path else ""
+            for local_idx, global_idx in enumerate(module.local_expert_ids):
+                runtime_prefix = f"{prefix}local_experts.{local_idx}."
+                logical_prefix = f"{prefix}experts.{global_idx}."
+                for fq_name in list(self.runtime.state_manager.param_states) + list(self.runtime.state_manager.buffer_states):
+                    if fq_name.startswith(runtime_prefix):
+                        mapping[fq_name] = logical_prefix + fq_name[len(runtime_prefix) :]
+        return mapping
 
 
 def _validate_supported_moe_module(module: nn.Module) -> None:

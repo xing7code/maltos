@@ -24,7 +24,7 @@ from runtime.plugin import (
 )
 from runtime.step_runners import DefaultStepRunner
 from runtime.types import MetricValue, ParamRole, RuntimePhase, RuntimeState, SetupPhase, StepContext
-from state.state import ParamState, StateManager
+from state.state import ModelStateMeta, StateManager
 from state.checkpoint import load_sharded_checkpoint
 from utils.constants import INPUT_IDS_KEY
 
@@ -169,29 +169,27 @@ class RuntimeCore:
         for plugin in self.plugins:
             self.model = plugin.on_setup_phase(phase, self.model)
 
-    def export_model_state(self, state_manager: StateManager) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
+    def export_model_state(self, state_manager: StateManager) -> tuple[dict[str, torch.Tensor], list[ModelStateMeta]]:
         rank = dist.get_rank() if dist.is_initialized() else 0
-        entries = state_manager._export_param_states()
+        entries = [entry.meta for entry in state_manager.params.values()]
+        entries.extend(entry.meta for entry in state_manager.buffers.values())
         state: dict[str, torch.Tensor] = {}
         for entry in entries:
             if entry.source_rank is None:
-                raise RuntimeError(f"checkpoint source rank not resolved for param={entry.state_key}")
+                raise RuntimeError(f"checkpoint source rank not resolved for model state={entry.state_key}")
             if entry.source_rank != rank:
                 continue
-            param = state_manager.get_param_tensor(entry.state_key)
-            state[entry.state_key] = param.detach().cpu().clone()
-        for entry in entries:
-            if entry.source_rank is None:
-                entry.source_rank = rank
+            tensor = state_manager.get_model_tensor(entry.state_key)
+            state[entry.state_key] = tensor.detach().cpu().clone()
         return state, entries
 
     def import_model_state(self, state_manager: StateManager, model_state: dict[str, torch.Tensor]) -> None:
         for name, tensor in model_state.items():
             resolved_name = state_manager._resolve_runtime_name(name)
-            if resolved_name not in state_manager.param_states:
-                raise KeyError(f"param state not found: {resolved_name}")
-            param = state_manager.get_param_tensor(resolved_name)
-            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+            if resolved_name not in state_manager.params and resolved_name not in state_manager.buffers:
+                raise KeyError(f"model state not found: {resolved_name}")
+            target = state_manager.get_model_tensor(resolved_name)
+            target.data.copy_(tensor.to(device=target.device, dtype=target.dtype))
 
     def _run_step_phase(self, phase: RuntimePhase) -> None:
         for plugin in self.plugins:
@@ -242,7 +240,7 @@ class RuntimeCore:
 
     def grad_norm_replica_factor(self, param: nn.Parameter) -> int:
         fq_name = self.state_manager.get_param_name(param)
-        attrs = self.state_manager.get_param_attrs(fq_name)
+        attrs = self.state_manager.params[fq_name].attrs
         factor = 1
         for axis in attrs.replicated_axes:
             if axis == MeshAxis.DP:
@@ -261,8 +259,10 @@ class RuntimeCore:
             raise ValueError(f"invalid grad_norm_replica_factor={factor} for param={fq_name}")
         return factor
 
-    def param_checkpoint_rank(self, fq_name: str, *, rank_id: int) -> int:
-        attrs = self.state_manager.get_param_attrs(fq_name)
+    def model_state_checkpoint_rank(self, fq_name: str, *, rank_id: int) -> int:
+        if fq_name in self.state_manager.buffers:
+            return rank_id
+        attrs = self.state_manager.params[fq_name].attrs
         return self.mesh.infer_checkpoint_rank(
             rank_id,
             plan=self.plan,
@@ -272,9 +272,14 @@ class RuntimeCore:
     def _resolve_param_checkpoint_metadata(self) -> None:
         rank = dist.get_rank() if dist.is_initialized() else 0
         for fq_name in self.state_manager.param_states:
-            self.state_manager.update_param_state(
+            self.state_manager.update_model_state(
                 fq_name,
-                source_rank=self.param_checkpoint_rank(fq_name, rank_id=rank),
+                source_rank=self.model_state_checkpoint_rank(fq_name, rank_id=rank),
+            )
+        for fq_name in self.state_manager.buffer_states:
+            self.state_manager.update_model_state(
+                fq_name,
+                source_rank=self.model_state_checkpoint_rank(fq_name, rank_id=rank),
             )
 
     # -------------------------------------

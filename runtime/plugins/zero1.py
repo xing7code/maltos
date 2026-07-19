@@ -221,7 +221,7 @@ class Zero1Plugin(ZeroPluginBase):
             if overlap_start < overlap_end:
                 local_start = overlap_start - local_shard_start
                 local_end = overlap_end - local_shard_start
-                logical_param = self.runtime.state_manager.get_param_tensor(logical_name)
+                logical_param = self.runtime.state_manager.get_model_tensor(logical_name)
                 factor = self.runtime.grad_norm_replica_factor(logical_param)
                 shard_sq.add_(bucket.local_param.grad[local_start:local_end].detach().float().pow(2).sum() / float(factor))
             offset = seg_end

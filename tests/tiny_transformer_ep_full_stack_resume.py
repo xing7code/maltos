@@ -212,7 +212,10 @@ def _run_step_resume(rank: int, args: argparse.Namespace, device: torch.device |
             raise AssertionError("EP step-resume: expected should_step=True for grad_accum_steps=1")
         cont_core.step_optimizer()
         dist.barrier()
-        save_sharded_checkpoint(cont_core.state_manager, args.checkpoint_dir)
+        save_sharded_checkpoint(
+            cont_core.state_manager,
+            args.checkpoint_dir,
+        )
         dist.barrier()
         cont_loss, should_step = cont_core.run_step(_make_batch(local_b, args))
         if not should_step:
@@ -281,7 +284,10 @@ def _run_midstep_resume(rank: int, args: argparse.Namespace, device: torch.devic
             raise AssertionError("EP midstep: continuous core must be at mid-step state before checkpoint")
         if should_step is not False:
             raise AssertionError("EP midstep: first microbatch should not step optimizer")
-        save_sharded_checkpoint(cont_core.state_manager, args.checkpoint_dir)
+        save_sharded_checkpoint(
+            cont_core.state_manager,
+            args.checkpoint_dir,
+        )
         la1_cont, should_step = cont_core.run_step(_make_batch(local_a[2:4], args))
         if should_step is not True:
             raise AssertionError("EP midstep: second microbatch should step optimizer")

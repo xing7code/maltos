@@ -243,6 +243,9 @@ class ZeroPluginBase(RuntimePlugin):
     def optimizer_state_source_rank(self, rank_id: int) -> int:
         return rank_id
 
+    def annotate_param_metadata(self) -> None:
+        return
+
     def wrap_chained_work(
         self,
         wrap: Callable[[ChainedWork, torch.Tensor], ChainedWork],

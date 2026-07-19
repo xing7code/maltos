@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from runtime.core import RuntimeCore
     from runtime.step_runners import StepRunner
     from runtime.types import RuntimePhase, SetupPhase
-    from state.state import ParamState, StateManager
+    from state.state import ModelStateMeta, StateManager
 
 
 class PluginId(str, Enum):
@@ -60,7 +60,7 @@ class ModelStateOwner(Protocol):
     def export_model_state(
         self,
         state_manager: "StateManager",
-    ) -> tuple[dict[str, torch.Tensor], list["ParamState"]]: ...
+    ) -> tuple[dict[str, torch.Tensor], list["ModelStateMeta"]]: ...
 
     def import_model_state(
         self,
@@ -128,7 +128,7 @@ class RuntimePlugin:
     def export_model_state(
         self,
         state_manager: "StateManager",
-    ) -> tuple[dict[str, torch.Tensor], list["ParamState"]]:
+    ) -> tuple[dict[str, torch.Tensor], list["ModelStateMeta"]]:
         raise NotImplementedError(
             f"plugin={self.id.value} owns_model_state={self.owns_model_state} must implement export_model_state()"
         )

@@ -18,7 +18,7 @@ from runtime.plugins.zero_common import (
     ZeroPluginBase,
 )
 from runtime.types import ParamRole, RuntimePhase, SetupPhase
-from state.state import ParamState
+from state.state import ModelStateMeta
 from utils.distributed import all_gather_single, reduce_scatter_single
 
 
@@ -135,6 +135,20 @@ class Zero3Plugin(ZeroPluginBase):
         elif phase == RuntimePhase.PRE_STEP:
             self._maybe_clip_local_shards()
 
+    def annotate_param_metadata(self) -> None:
+        super().annotate_param_metadata()
+        assert self.runtime is not None
+        logical_name_by_runtime = {
+            fq_name: state.logical_names[0]
+            for fq_name, state in self.runtime.state_manager.param_states.items()
+            if len(state.logical_names) == 1
+        }
+        for bucket in self.buckets:
+            bucket.logical_names = [
+                logical_name_by_runtime.get(runtime_name, runtime_name)
+                for runtime_name in bucket.logical_names
+            ]
+
     def _prepare_buckets(self, model: nn.Module) -> None:
         visited: set[str] = set()
         param_to_name = {id(param): name for name, param in model.named_parameters()}
@@ -183,7 +197,7 @@ class Zero3Plugin(ZeroPluginBase):
         local_shard_start = bucket.group_context.rank * bucket.local_param.numel()
         local_shard_end = local_shard_start + bucket.local_param.numel()
         offset = 0
-        for logical_name, param_numel in zip(bucket.logical_names, bucket.param_numels, strict=True):
+        for param, logical_name, param_numel in zip(bucket.params, bucket.logical_names, bucket.param_numels, strict=True):
             seg_start = offset
             seg_end = offset + param_numel
             overlap_start = max(seg_start, local_shard_start)
@@ -191,8 +205,7 @@ class Zero3Plugin(ZeroPluginBase):
             if overlap_start < overlap_end:
                 local_start = overlap_start - local_shard_start
                 local_end = overlap_end - local_shard_start
-                logical_param = self.runtime.state_manager.get_param_tensor(logical_name)
-                factor = self.runtime.grad_norm_replica_factor(logical_param)
+                factor = self.runtime.grad_norm_replica_factor(param)
                 shard_sq.add_(bucket.local_param.grad[local_start:local_end].detach().float().pow(2).sum() / float(factor))
             offset = seg_end
         return shard_sq
@@ -466,7 +479,7 @@ class Zero3Plugin(ZeroPluginBase):
             self._free_full_params(bucket)
         self._release_materialized_buffers()
 
-    def export_model_state(self, state_manager) -> tuple[dict[str, torch.Tensor], list[ParamState]]:
+    def export_model_state(self, state_manager) -> tuple[dict[str, torch.Tensor], list[ModelStateMeta]]:
         state = {}
         metadata = []
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -474,7 +487,7 @@ class Zero3Plugin(ZeroPluginBase):
             state_key = f"zero3_bucket_{bucket.index}"
             state[state_key] = bucket.local_param.detach().cpu().clone()
             metadata.append(
-                ParamState(
+                ModelStateMeta(
                     state_key=state_key,
                     logical_names=bucket.logical_names,
                     logical_shapes=[tuple(shape) for shape in bucket.param_shapes],
@@ -483,6 +496,15 @@ class Zero3Plugin(ZeroPluginBase):
                     source_rank=rank,
                 )
             )
+        buffer_entries = [entry.meta for entry in state_manager.buffers.values()]
+        for entry in buffer_entries:
+            if entry.source_rank is None:
+                raise RuntimeError(f"checkpoint source rank not resolved for buffer={entry.state_key}")
+            if entry.source_rank != rank:
+                continue
+            buffer = state_manager.get_model_tensor(entry.state_key)
+            state[entry.state_key] = buffer.detach().cpu().clone()
+        metadata.extend(buffer_entries)
         return state, metadata
 
     def import_model_state(self, state_manager, state: dict[str, torch.Tensor]) -> None:
@@ -491,6 +513,12 @@ class Zero3Plugin(ZeroPluginBase):
             tensor = state[state_key].to(device=bucket.local_param.device, dtype=bucket.local_param.dtype)
             bucket.local_param.data.copy_(tensor)
             self._free_full_params(bucket)
+        for fq_name in state_manager.buffer_states:
+            if fq_name not in state:
+                continue
+            buffer = state_manager.get_model_tensor(fq_name)
+            tensor = state[fq_name].to(device=buffer.device, dtype=buffer.dtype)
+            buffer.data.copy_(tensor)
 
     def export_plugin_state(self) -> dict[str, object]:
         assert self.runtime is not None

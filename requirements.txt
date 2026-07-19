@@ -4,3 +4,4 @@ datasets
 absl-py
 wandb
 PyYAML
+safetensors

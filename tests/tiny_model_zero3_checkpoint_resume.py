@@ -97,7 +97,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     continuous_core, continuous_zero3 = _build_core(continuous_model, args.world_size)
     _, should_step = continuous_core.run_step(first_local_batch)
     continuous_core.step_optimizer()
-    save_sharded_checkpoint(continuous_core.state_manager, args.checkpoint_dir)
+    save_sharded_checkpoint(
+        continuous_core.state_manager,
+        args.checkpoint_dir,
+    )
     _, should_step = continuous_core.run_step(second_local_batch)
     continuous_core.step_optimizer()
 

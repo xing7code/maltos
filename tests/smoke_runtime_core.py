@@ -477,12 +477,12 @@ def test_runtime_param_checkpoint_policy() -> None:
         optimizer_factory=_sgd_factory(),
     )
     core.setup()
-    core.state_manager.update_param_state("shared", replicated_axes={MeshAxis.DP, MeshAxis.TP})
-    core.state_manager.update_param_state("expert", replicated_axes={MeshAxis.TP})
+    core.state_manager.update_model_state("shared", replicated_axes={MeshAxis.DP, MeshAxis.TP})
+    core.state_manager.update_model_state("expert", replicated_axes={MeshAxis.TP})
     core._resolve_param_checkpoint_metadata()
 
-    assert core.param_checkpoint_rank("shared", rank_id=3) == 0
-    assert core.param_checkpoint_rank("expert", rank_id=3) == 2
+    assert core.model_state_checkpoint_rank("shared", rank_id=3) == 0
+    assert core.model_state_checkpoint_rank("expert", rank_id=3) == 2
     assert core.state_manager.param_states["shared"].source_rank == 0
     assert core.state_manager.param_states["expert"].source_rank == 0
 
@@ -764,7 +764,10 @@ def test_runtime_setup_weights_only_checkpoint_load_skips_runtime_state() -> Non
         source_core.step_optimizer()
         source_plugin.value = 9
         source_weight = source_model.proj.weight.detach().clone()
-        save_sharded_checkpoint(source_core.state_manager, checkpoint_dir)
+        save_sharded_checkpoint(
+            source_core.state_manager,
+            checkpoint_dir,
+        )
         source_core.close()
 
         restored_model = LossModel()

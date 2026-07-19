@@ -30,11 +30,11 @@ class DataParallelPlugin(RuntimePlugin):
         if self.runtime.mesh.dp <= 1:
             return
         for fq_name in self.runtime.state_manager.param_states:
-            param = self.runtime.state_manager.get_param_tensor(fq_name)
+            param = self.runtime.state_manager.get_model_tensor(fq_name)
             if self.runtime.get_param_role(param) == ParamRole.EXPERT:
                 continue
-            attrs = self.runtime.state_manager.get_param_attrs(fq_name)
-            self.runtime.state_manager.update_param_state(
+            attrs = self.runtime.state_manager.params[fq_name].attrs
+            self.runtime.state_manager.update_model_state(
                 fq_name,
                 replicated_axes=attrs.replicated_axes | {MeshAxis.DP},
             )
@@ -176,11 +176,11 @@ class BucketDataParallelPlugin(RuntimePlugin):
         if self.runtime.mesh.dp <= 1:
             return
         for fq_name in self.runtime.state_manager.param_states:
-            param = self.runtime.state_manager.get_param_tensor(fq_name)
+            param = self.runtime.state_manager.get_model_tensor(fq_name)
             if self.runtime.get_param_role(param) == ParamRole.EXPERT:
                 continue
-            attrs = self.runtime.state_manager.get_param_attrs(fq_name)
-            self.runtime.state_manager.update_param_state(
+            attrs = self.runtime.state_manager.params[fq_name].attrs
+            self.runtime.state_manager.update_model_state(
                 fq_name,
                 replicated_axes=attrs.replicated_axes | {MeshAxis.DP},
             )

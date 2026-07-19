@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from checkpoint_test_utils import test_runtime_spec
 from data import SimpleTensorDataLoader
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
@@ -195,6 +196,7 @@ def test_trainer_checkpoint_resume_matches_continuous() -> None:
             runtime=interrupted,
             dataloader=_make_loader(),
             config=TrainerConfig(max_steps=2, checkpoint_every=2, checkpoint_dir=checkpoint_dir),
+            runtime_spec=test_runtime_spec("trainer_resume"),
         )
         interrupted_trainer.setup()
         interrupted_trainer.fit()
@@ -228,6 +230,7 @@ def test_trainer_checkpoint_uploader_follows_upload_cadence() -> None:
             dataloader=_make_loader(),
             config=TrainerConfig(max_steps=4, checkpoint_every=1, checkpoint_dir=checkpoint_dir),
             checkpoint_uploader=uploader,
+            runtime_spec=test_runtime_spec("trainer_uploader"),
         )
         trainer.setup()
         trainer.fit()
@@ -251,11 +254,16 @@ def test_trainer_checkpoint_retention() -> None:
                 checkpoint_keep_last=1,
                 checkpoint_keep_every_n_steps=2,
             ),
+            runtime_spec=test_runtime_spec("trainer_retention"),
         )
         trainer.setup()
         trainer.fit()
 
-        assert sorted(path.name for path in checkpoint_dir.iterdir()) == ["step_00000002", "step_00000004"]
+        assert sorted(path.name for path in checkpoint_dir.iterdir()) == [
+            "runtime_spec.json",
+            "step_00000002",
+            "step_00000004",
+        ]
 
 
 def test_trainer_checkpoint_min_free_space_raises() -> None:
@@ -271,6 +279,7 @@ def test_trainer_checkpoint_min_free_space_raises() -> None:
                 checkpoint_dir=checkpoint_dir,
                 checkpoint_min_free_gb=1_000_000_000,
             ),
+            runtime_spec=test_runtime_spec("trainer_free_space"),
         )
         trainer.setup()
         try:

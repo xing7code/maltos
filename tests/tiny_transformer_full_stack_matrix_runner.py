@@ -160,6 +160,35 @@ def _format_case_status(index: int, total: int, result: CaseResult) -> str:
     return f"[{status} {index}/{total}] {result.case.name} {suffix}"
 
 
+def _finalize_matrix_results(
+    *,
+    results: list[CaseResult],
+    reported_failed_names: list[str],
+    report_path: Path | None,
+    mode_label: str,
+) -> None:
+    failed = [result for result in results if not result.ok]
+    failed_names = [result.case.name for result in failed]
+    passed = len(results) - len(failed)
+    summary = f"Full-stack matrix done: pass={passed} fail={len(failed)} total={len(results)}"
+    print(summary)
+    _append_line(report_path, summary)
+    if reported_failed_names != failed_names:
+        mismatch = (
+            "Matrix runner internal inconsistency: "
+            f"reported_failed_names={reported_failed_names} results_failed_names={failed_names}"
+        )
+        print(mismatch)
+        _append_line(report_path, mismatch)
+        raise SystemExit(2)
+    if failed_names:
+        failed_line = f"Failed cases: {', '.join(failed_names)}"
+        print(failed_line)
+        _append_line(report_path, failed_line)
+        raise SystemExit(1)
+    print(f"{mode_label} PASS")
+
+
 def _group_key(case: MatrixCase) -> str:
     parts = case.name.split("/")
     if len(parts) < 2:
@@ -371,6 +400,7 @@ def run_subprocess_matrix(args: argparse.Namespace) -> None:
     failures_path = _init_output_file(args.failures_file)
     passes_path = _init_output_file(args.passes_file)
     results: list[CaseResult] = []
+    reported_failed_names: list[str] = []
     for index, case in enumerate(cases, start=1):
         result = _run_subprocess_case_keep_going(case)
         results.append(result)
@@ -380,18 +410,14 @@ def run_subprocess_matrix(args: argparse.Namespace) -> None:
         if result.ok:
             _append_line(passes_path, case.name)
         else:
+            reported_failed_names.append(case.name)
             _append_line(failures_path, case.name)
-    failed = [result for result in results if not result.ok]
-    passed = len(results) - len(failed)
-    summary = f"Full-stack matrix done: pass={passed} fail={len(failed)} total={len(results)}"
-    print(summary)
-    _append_line(report_path, summary)
-    if failed:
-        failed_names = ", ".join(result.case.name for result in failed)
-        print(f"Failed cases: {failed_names}")
-        _append_line(report_path, f"Failed cases: {failed_names}")
-        raise SystemExit(1)
-    print("Subprocess full-stack matrix PASS")
+    _finalize_matrix_results(
+        results=results,
+        reported_failed_names=reported_failed_names,
+        report_path=report_path,
+        mode_label="Subprocess full-stack matrix",
+    )
 
 
 def _run_merged_group_once(args: argparse.Namespace, cases: list[MatrixCase], completed_file: str) -> None:
@@ -452,6 +478,7 @@ def run_grouped_merged_matrix(args: argparse.Namespace) -> None:
     failures_path = _init_output_file(args.failures_file)
     passes_path = _init_output_file(args.passes_file)
     results: list[CaseResult] = []
+    reported_failed_names: list[str] = []
     total = len(cases)
     next_index = 1
 
@@ -499,23 +526,18 @@ def run_grouped_merged_matrix(args: argparse.Namespace) -> None:
                 status_line = _format_case_status(next_index, total, result)
                 print(status_line)
                 _append_line(report_path, status_line)
+                reported_failed_names.append(failed_case.name)
                 _append_line(failures_path, failed_case.name)
                 next_index += 1
                 remaining = remaining[completed_count + 1 :]
             finally:
                 Path(completed_file).unlink(missing_ok=True)
-
-    failed = [result for result in results if not result.ok]
-    passed = len(results) - len(failed)
-    summary = f"Full-stack matrix done: pass={passed} fail={len(failed)} total={len(results)}"
-    print(summary)
-    _append_line(report_path, summary)
-    if failed:
-        failed_names = ", ".join(result.case.name for result in failed)
-        print(f"Failed cases: {failed_names}")
-        _append_line(report_path, f"Failed cases: {failed_names}")
-        raise SystemExit(1)
-    print("Merged full-stack matrix PASS")
+    _finalize_matrix_results(
+        results=results,
+        reported_failed_names=reported_failed_names,
+        report_path=report_path,
+        mode_label="Merged full-stack matrix",
+    )
 
 
 def _print_case_names(args: argparse.Namespace) -> None:

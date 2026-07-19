@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
 
 import numpy as np
 import torch
 import torch.distributed as dist
-import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -58,7 +55,14 @@ from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
 from train import Trainer, TrainerConfig
-from utils.attention_backend import ATTENTION_BACKEND_CHOICES, AttentionBackend
+from train.flags import (
+    _load_config_defaults,
+    build_arg_parser,
+    build_runtime_spec,
+    parse_args,
+    parse_args_from,
+)
+from utils.attention_backend import AttentionBackend
 from utils.metrics import (
     ConsoleMetricLogger,
     JsonlMetricLogger,
@@ -78,110 +82,6 @@ _ZERO3_WRAP_CLS = {
     OlmoRMSNorm,
     DistributedRMSNorm,
 }
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LLM training recipe.")
-    parser.add_argument("--config", type=str, default=None, help="YAML training recipe")
-    parser.add_argument(
-        "--data",
-        type=str,
-        nargs="+",
-        default=None,
-        help="Token shard .bin files or directories, or a packed SFT dataset directory/meta.json",
-    )
-    parser.add_argument("--data-format", type=str, default="auto", choices=("auto", "pretrain", "sft"))
-    parser.add_argument("--token-dtype", type=str, default="uint32", choices=("uint16", "uint32", "int64"))
-    parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--micro-batch-size", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=10)
-    parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--adam-beta1", type=float, default=0.9)
-    parser.add_argument("--adam-beta2", type=float, default=0.95)
-    parser.add_argument("--adam-eps", type=float, default=1e-8)
-    parser.add_argument("--fused-adamw", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--lr-schedule", type=str, default="constant", choices=("constant", "linear", "cosine"))
-    parser.add_argument("--warmup-steps", type=int, default=0)
-    parser.add_argument("--min-lr", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=42)
-
-    parser.add_argument("--model", type=str, default="tiny", choices=("tiny", "tiny_moe", "llama", "olmo", "olmo2"))
-    parser.add_argument("--dim", type=int, default=256)
-    parser.add_argument("--n-heads", type=int, default=8)
-    parser.add_argument("--n-kv-heads", type=int, default=None)
-    parser.add_argument("--hidden-size", type=int, default=1024)
-    parser.add_argument("--n-layers", type=int, default=4)
-    parser.add_argument("--num-experts", type=int, default=8)
-    parser.add_argument("--vocab-size", type=int, default=32000)
-    parser.add_argument("--eps", type=float, default=1e-5)
-    parser.add_argument(
-        "--attention-backend",
-        type=str,
-        default=AttentionBackend.SDPA_AUTO,
-        choices=ATTENTION_BACKEND_CHOICES,
-    )
-    parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--activation-checkpoint-every-n-layers", type=int, default=1)
-
-    parser.add_argument("--dp-size", type=int, default=1)
-    parser.add_argument("--pp-size", type=int, default=1)
-    parser.add_argument("--pp-microbatches", type=int, default=1)
-    parser.add_argument("--cp-size", type=int, default=1)
-    parser.add_argument(
-        "--cp-attn-core",
-        type=str,
-        default="all_gather_kv",
-        choices=tuple(core.value for core in ContextParallelAttentionCoreType),
-    )
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--ep-size", type=int, default=1)
-    parser.add_argument("--zero-stage", type=int, default=0, choices=(0, 1, 2, 3))
-    parser.add_argument("--use-sp", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--ddp-mode", type=str, default=None, choices=("sync", "async", "bucket"))
-    parser.add_argument("--precision", type=str, default="fp32", choices=("fp32", "bf16", "fp16"))
-    parser.add_argument("--grad-clip", type=float, default=None)
-    parser.add_argument("--disable-metrics", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--torch-profiler", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--torch-profiler-dir", type=str, default="traces/train")
-    parser.add_argument("--torch-profiler-wait", type=int, default=1)
-    parser.add_argument("--torch-profiler-warmup", type=int, default=1)
-    parser.add_argument("--torch-profiler-active", type=int, default=3)
-    parser.add_argument("--torch-profiler-repeat", type=int, default=1)
-    parser.add_argument("--torch-profiler-record-shapes", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--torch-profiler-profile-memory", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--torch-profiler-with-stack", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--torch-profiler-with-flops", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--torch-profiler-rank0-only", action=argparse.BooleanOptionalAction, default=False)
-
-    parser.add_argument("--log-every", type=int, default=1)
-    parser.add_argument("--metrics-jsonl", type=str, default=None)
-    parser.add_argument("--run-manifest", type=str, default=None)
-    parser.add_argument("--wandb-project", type=str, default=None)
-    parser.add_argument("--wandb-run-name", type=str, default=None)
-    parser.add_argument("--wandb-entity", type=str, default=None)
-    parser.add_argument("--wandb-run-id", type=str, default=None)
-    parser.add_argument("--wandb-mode", type=str, default=None, choices=("online", "offline", "disabled"))
-    parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags")
-    parser.add_argument("--wandb-checkpoint-every", type=int, default=None)
-    parser.add_argument("--checkpoint-dir", type=str, default=None)
-    parser.add_argument("--checkpoint-every", type=int, default=None)
-    parser.add_argument("--checkpoint-keep-last", type=int, default=None)
-    parser.add_argument("--checkpoint-keep-every-n-steps", type=int, default=None)
-    parser.add_argument("--checkpoint-min-free-gb", type=float, default=None)
-    parser.add_argument("--resume-from", type=str, default=None)
-
-    parser.add_argument("--backend", type=str, default=None)
-    parser.add_argument("--master-addr", type=str, default="127.0.0.1")
-    parser.add_argument("--master-port", type=str, default="29550")
-    config_path = _preparse_config_path()
-    if config_path is not None:
-        parser.set_defaults(**_load_config_defaults(config_path))
-    args = parser.parse_args()
-    if args.data is None:
-        raise ValueError("--data is required unless provided by --config")
-    return args
 
 
 def main() -> None:
@@ -241,6 +141,7 @@ def main() -> None:
         ),
         logger=logger,
         checkpoint_uploader=checkpoint_uploader,
+        runtime_spec=build_runtime_spec(args),
     )
     trainer.setup()
     _print_run_summary(
@@ -345,11 +246,21 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
     )
 
 
-def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: torch.device) -> RuntimeCore:
+def _build_runtime(
+    args,
+    model: torch.nn.Module,
+    device: torch.device,
+    *,
+    weights_only: bool = False,
+) -> RuntimeCore:
     plugins = []
     grad_clip_max_norm = None
-    optimizer_factory = _build_optimizer_factory(args)
-    scheduler_factory = _build_scheduler_factory(args)
+    optimizer_factory = (
+        (lambda params: torch.optim.SGD(params, lr=0.0))
+        if weights_only
+        else _build_optimizer_factory(args)
+    )
+    scheduler_factory = None if weights_only else _build_scheduler_factory(args)
     if args.tp_size > 1:
         plugins.append(TensorParallelPlugin())
     if args.use_sp:
@@ -376,14 +287,14 @@ def _build_runtime(args: argparse.Namespace, model: torch.nn.Module, device: tor
     runtime_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
     if runtime_dtype == torch.float16:
         plugins.append(Fp16Plugin())
-    if args.grad_clip is not None:
+    if not weights_only and args.grad_clip is not None:
         if args.zero_stage == 0:
             plugins.append(GradClipPlugin(max_norm=args.grad_clip))
         else:
             grad_clip_max_norm = args.grad_clip
-    if not args.disable_metrics:
+    if not weights_only and not args.disable_metrics:
         plugins.append(MetricPlugin())
-    if args.torch_profiler:
+    if not weights_only and args.torch_profiler:
         plugins.append(
             TorchProfilerPlugin(
                 trace_dir=args.torch_profiler_dir,
@@ -503,112 +414,6 @@ def _build_logging(args: argparse.Namespace, rank: int) -> tuple[list[MetricLogg
             artifact_prefix=args.wandb_run_name,
         )
     return loggers, checkpoint_uploader
-
-
-def _preparse_config_path() -> str | None:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--config", type=str, default=None)
-    args, _ = parser.parse_known_args()
-    return args.config
-
-
-def _load_config_defaults(path: str) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
-    if not isinstance(raw, dict):
-        raise ValueError(f"config must be a YAML mapping, got {type(raw)!r}")
-    defaults: dict[str, Any] = {"config": path}
-    for section, values in raw.items():
-        if not isinstance(values, dict):
-            defaults[section] = values
-            continue
-        for key, value in values.items():
-            defaults[_config_key_to_arg_dest(section, key)] = value
-    return defaults
-
-
-def _config_key_to_arg_dest(section: str, key: str) -> str:
-    aliases = {
-        ("data", "paths"): "data",
-        ("data", "format"): "data_format",
-        ("data", "seq_len"): "seq_len",
-        ("data", "micro_batch_size"): "micro_batch_size",
-        ("model", "type"): "model",
-        ("model", "hidden_size"): "dim",
-        ("model", "dim"): "dim",
-        ("model", "intermediate_size"): "hidden_size",
-        ("model", "num_layers"): "n_layers",
-        ("model", "n_layers"): "n_layers",
-        ("model", "num_experts"): "num_experts",
-        ("model", "num_heads"): "n_heads",
-        ("model", "n_heads"): "n_heads",
-        ("model", "num_kv_heads"): "n_kv_heads",
-        ("model", "n_kv_heads"): "n_kv_heads",
-        ("model", "vocab_size"): "vocab_size",
-        ("model", "rms_norm_eps"): "eps",
-        ("model", "eps"): "eps",
-        ("model", "attention_backend"): "attention_backend",
-        ("model", "activation_checkpointing"): "activation_checkpointing",
-        ("model", "activation_checkpoint_every_n_layers"): "activation_checkpoint_every_n_layers",
-        ("parallel", "dp_size"): "dp_size",
-        ("parallel", "pp_size"): "pp_size",
-        ("parallel", "pp_microbatches"): "pp_microbatches",
-        ("parallel", "cp_size"): "cp_size",
-        ("parallel", "cp_attn_core"): "cp_attn_core",
-        ("parallel", "tp_size"): "tp_size",
-        ("parallel", "ep_size"): "ep_size",
-        ("parallel", "use_sp"): "use_sp",
-        ("parallel", "zero_stage"): "zero_stage",
-        ("parallel", "ddp_mode"): "ddp_mode",
-        ("training", "max_steps"): "max_steps",
-        ("training", "dry_run"): "dry_run",
-        ("training", "grad_accum_steps"): "grad_accum_steps",
-        ("training", "lr"): "lr",
-        ("training", "weight_decay"): "weight_decay",
-        ("training", "adam_beta1"): "adam_beta1",
-        ("training", "adam_beta2"): "adam_beta2",
-        ("training", "adam_eps"): "adam_eps",
-        ("training", "fused_adamw"): "fused_adamw",
-        ("training", "lr_schedule"): "lr_schedule",
-        ("training", "warmup_steps"): "warmup_steps",
-        ("training", "min_lr"): "min_lr",
-        ("training", "precision"): "precision",
-        ("training", "grad_clip"): "grad_clip",
-        ("training", "disable_metrics"): "disable_metrics",
-        ("profiling", "torch_profiler"): "torch_profiler",
-        ("profiling", "torch_profiler_dir"): "torch_profiler_dir",
-        ("profiling", "torch_profiler_wait"): "torch_profiler_wait",
-        ("profiling", "torch_profiler_warmup"): "torch_profiler_warmup",
-        ("profiling", "torch_profiler_active"): "torch_profiler_active",
-        ("profiling", "torch_profiler_repeat"): "torch_profiler_repeat",
-        ("profiling", "torch_profiler_record_shapes"): "torch_profiler_record_shapes",
-        ("profiling", "torch_profiler_profile_memory"): "torch_profiler_profile_memory",
-        ("profiling", "torch_profiler_with_stack"): "torch_profiler_with_stack",
-        ("profiling", "torch_profiler_with_flops"): "torch_profiler_with_flops",
-        ("profiling", "torch_profiler_rank0_only"): "torch_profiler_rank0_only",
-        ("logging", "log_every"): "log_every",
-        ("logging", "metrics_jsonl"): "metrics_jsonl",
-        ("logging", "run_manifest"): "run_manifest",
-        ("logging", "wandb_project"): "wandb_project",
-        ("logging", "wandb_run_name"): "wandb_run_name",
-        ("logging", "wandb_entity"): "wandb_entity",
-        ("logging", "wandb_run_id"): "wandb_run_id",
-        ("logging", "wandb_mode"): "wandb_mode",
-        ("logging", "wandb_tags"): "wandb_tags",
-        ("logging", "wandb_checkpoint_every"): "wandb_checkpoint_every",
-        ("checkpoint", "dir"): "checkpoint_dir",
-        ("checkpoint", "checkpoint_dir"): "checkpoint_dir",
-        ("checkpoint", "every"): "checkpoint_every",
-        ("checkpoint", "checkpoint_every"): "checkpoint_every",
-        ("checkpoint", "keep_last"): "checkpoint_keep_last",
-        ("checkpoint", "checkpoint_keep_last"): "checkpoint_keep_last",
-        ("checkpoint", "keep_every_n_steps"): "checkpoint_keep_every_n_steps",
-        ("checkpoint", "checkpoint_keep_every_n_steps"): "checkpoint_keep_every_n_steps",
-        ("checkpoint", "min_free_gb"): "checkpoint_min_free_gb",
-        ("checkpoint", "checkpoint_min_free_gb"): "checkpoint_min_free_gb",
-        ("checkpoint", "resume_from"): "resume_from",
-    }
-    return aliases.get((section, key), key)
 
 
 def _parse_tags(tags: str | list[str] | None) -> list[str] | None:

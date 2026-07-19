@@ -70,7 +70,10 @@ def main() -> None:
     continuous_core = _build_core(continuous_model, args.dtype)
     _, should_step = continuous_core.run_step(first_batch)
     continuous_core.step_optimizer()
-    save_sharded_checkpoint(continuous_core.state_manager, checkpoint_dir)
+    save_sharded_checkpoint(
+        continuous_core.state_manager,
+        checkpoint_dir,
+    )
     second_batch = torch.randn(args.batch_size, args.hidden_size, dtype=batch_dtype)
     _, should_step = continuous_core.run_step(second_batch)
     continuous_core.step_optimizer()

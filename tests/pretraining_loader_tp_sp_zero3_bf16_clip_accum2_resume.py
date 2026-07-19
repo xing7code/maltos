@@ -149,7 +149,10 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
     if continuous_core.state.step != 0 or continuous_core.state.step_context.microbatch_idx != 1:
         raise AssertionError("continuous core must be at mid-step state before checkpoint")
     saved_loader_state = continuous_loader.state_dict()
-    save_sharded_checkpoint(continuous_core.state_manager, args.checkpoint_dir)
+    save_sharded_checkpoint(
+        continuous_core.state_manager,
+        args.checkpoint_dir,
+    )
     if dist.is_initialized():
         dist.barrier()
 

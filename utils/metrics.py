@@ -197,7 +197,11 @@ class WandbCheckpointUploader:
             type="checkpoint",
             metadata={"step": step, "path": str(checkpoint_dir)},
         )
-        artifact.add_dir(str(checkpoint_dir))
+        runtime_spec = checkpoint_dir.parent / "runtime_spec.json"
+        if not runtime_spec.is_file():
+            raise FileNotFoundError(f"runtime checkpoint spec not found: {runtime_spec}")
+        artifact.add_file(str(runtime_spec), name="runtime_spec.json")
+        artifact.add_dir(str(checkpoint_dir), name=checkpoint_dir.name)
         logged_artifact = self.logger.run.log_artifact(
             artifact,
             aliases=["latest", f"step_{step}"],

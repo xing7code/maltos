@@ -193,29 +193,30 @@ class TensorParallelPlugin(RuntimePlugin):
 
     def annotate_param_metadata(self) -> None:
         assert self.runtime is not None
-        for fq_name, param_state in self.runtime.state_manager.param_states.items():
-            param = self.runtime.state_manager.get_param_tensor(fq_name)
-            logical_shape = self._logical_shapes.get(fq_name, tuple(param.shape))
-            local_shape = tuple(param.shape)
-            self.runtime.state_manager.update_param_state(
+        for fq_name, logical_shape in self._logical_shapes.items():
+            param = self.runtime.state_manager.get_model_tensor(fq_name)
+            self.runtime.state_manager.update_model_state(
                 fq_name,
                 logical_names=[fq_name],
                 logical_shapes=[logical_shape],
-                physical_shape=local_shape,
+                physical_shape=tuple(param.shape),
                 dtype=str(param.dtype),
             )
-            if self.runtime.mesh.tp <= 1:
-                continue
+        if self.runtime.mesh.tp <= 1:
+            return
+        for fq_name in self._param_shard_axis:
+            attrs = self.runtime.state_manager.params[fq_name].attrs
+            self.runtime.state_manager.update_model_state(
+                fq_name,
+                sharded_axes=attrs.sharded_axes | {MeshAxis.TP},
+            )
+        for fq_name, entry in self.runtime.state_manager.params.items():
             if fq_name in self._param_shard_axis:
-                attrs = self.runtime.state_manager.get_param_attrs(fq_name)
-                self.runtime.state_manager.update_param_state(
-                    fq_name,
-                    sharded_axes=attrs.sharded_axes | {MeshAxis.TP},
-                )
                 continue
-            if fq_name in self._tp_replicated_params or self.runtime.get_param_role(param) == ParamRole.SHARED:
-                attrs = self.runtime.state_manager.get_param_attrs(fq_name)
-                self.runtime.state_manager.update_param_state(
-                    fq_name,
-                    replicated_axes=attrs.replicated_axes | {MeshAxis.TP},
-                )
+            if fq_name not in self._tp_replicated_params and self.runtime.get_param_role(entry.param) != ParamRole.SHARED:
+                continue
+            attrs = entry.attrs
+            self.runtime.state_manager.update_model_state(
+                fq_name,
+                replicated_axes=attrs.replicated_axes | {MeshAxis.TP},
+            )
