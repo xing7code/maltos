@@ -108,10 +108,9 @@ Use the base model, not `OLMo-2-1124-13B-SFT`. The base repo is published in
 the `model.safetensors.index.json` format accepted by MALTOS.
 
 ```bash
-huggingface-cli download "$BASE_REPO" \
+hf download "$BASE_REPO" \
   --revision "$BASE_REVISION" \
-  --local-dir "$BASE_LOGICAL" \
-  --local-dir-use-symlinks False
+  --local-dir "$BASE_LOGICAL"
 
 test -f "$BASE_LOGICAL/model.safetensors.index.json"
 du -sh "$BASE_LOGICAL"

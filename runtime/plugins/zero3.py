@@ -257,6 +257,14 @@ class Zero3Plugin(ZeroPluginBase):
 
     def _make_materialize_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs) -> None:
+            state = self._exec_state(bucket)
+            # Non-reentrant activation checkpointing recomputes this module's
+            # forward during backward. Its output-gradient hook has already
+            # materialized the bucket for that backward, so a second forward
+            # materialization would replace (and the matching post-hook would
+            # release) the buffer needed by the parameter-gradient functions.
+            if state.backward_materialized:
+                return
             self._record_forward_bucket(bucket)
             self._materialize_full_params(bucket, direction=_ExecDirection.FORWARD)
             # gloo does not support concurrent ops on groups sharing the same rank pair;
@@ -273,6 +281,12 @@ class Zero3Plugin(ZeroPluginBase):
     def _make_free_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs, outputs) -> None:
             state = self._exec_state(bucket)
+            # See _make_materialize_forward_hook: keep the backward
+            # materialization alive across an activation-checkpoint recompute.
+            # The gradient-reduction hook releases it after parameter grads are
+            # produced.
+            if state.backward_materialized:
+                return
             self._register_backward_output_hooks(bucket, outputs)
             self._free_full_params(bucket)
             self._release_data_buffer(state)
