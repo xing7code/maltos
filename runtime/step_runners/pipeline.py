@@ -244,12 +244,16 @@ class PipelineStepRunner:
 
     def broadcast_loss(self, *, runtime, total_loss: torch.Tensor | None, batch) -> torch.Tensor:
         device = model_device(runtime.model)
-        dtype = torch.float32 if total_loss is None else total_loss.dtype
         if self.plugin.next_global_rank is None:
             assert total_loss is not None
-            loss = total_loss / float(runtime.plan.pp_schedule.microbatches)
+            # Every PP rank participates in this collective.  The last stage's
+            # loss may be bf16 under autocast while non-last stages have no loss
+            # tensor at all; reduce a canonical fp32 metric value on every rank.
+            # Backward has already consumed raw_loss, so this cast only affects
+            # the returned/logged loss.
+            loss = total_loss.float() / float(runtime.plan.pp_schedule.microbatches)
         else:
-            loss = torch.zeros((), device=device, dtype=dtype)
+            loss = torch.zeros((), device=device, dtype=torch.float32)
         if self.plugin.pp_group is not None and self.plugin.stage_count > 1:
             all_reduce_tensor(loss, op=dist.ReduceOp.SUM, group=self.plugin.pp_group)
         return loss
