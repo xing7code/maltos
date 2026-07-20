@@ -39,6 +39,10 @@ class MatrixCase:
                 if value is True:
                     args.append("--packed-batch")
                 continue
+            if key == "activation_checkpointing":
+                if value is True:
+                    args.append("--activation-checkpointing")
+                continue
             flag = f"--{key.replace('_', '-')}"
             args.extend([flag, str(value)])
         return args
@@ -549,6 +553,25 @@ def build_full_stack_matrix_cases(
             pp_schedule="afab",
             grad_accum_steps=1,
             model="olmo2",
+        )
+    )
+
+    # J: exact non-PP target topology with non-reentrant activation checkpoint
+    # recompute. This guards the ZeRO-3 parameter lifecycle exercised by the
+    # OLMo2 13B SFT recipe.
+    add(
+        _case(
+            "J/olmo2_tp_sp_zero3_activation_checkpoint/full_eq/z3",
+            "full_eq",
+            backend=backend,
+            world_size=world_size,
+            dp_size=4,
+            pp_size=1,
+            cp_size=1,
+            tp_size=2,
+            zero_stage=3,
+            model="olmo2",
+            activation_checkpointing=True,
         )
     )
 

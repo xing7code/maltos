@@ -257,23 +257,6 @@ class Zero3Plugin(ZeroPluginBase):
 
     def _make_materialize_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs) -> None:
-            state = self._exec_state(bucket)
-            # Non-reentrant activation checkpointing recomputes this module's
-            # forward during backward. Its output-gradient hook has already
-            # materialized the bucket for that backward, so a second forward
-            # materialization would replace (and the matching post-hook would
-            # release) the buffer needed by the parameter-gradient functions.
-            if state.backward_materialized:
-                return
-            # PRE_BACKWARD may already have prefetched this bucket for the
-            # output-gradient hook. A non-reentrant activation-checkpoint
-            # recompute is the only forward that can observe such a handle;
-            # consume it as the backward materialization instead of launching
-            # a competing forward all-gather into the same data buffer.
-            if state.bwd_handle is not None:
-                self._materialize_full_params(bucket, direction=_ExecDirection.BACKWARD)
-                state.backward_materialized = True
-                return
             self._record_forward_bucket(bucket)
             self._materialize_full_params(bucket, direction=_ExecDirection.FORWARD)
             # gloo does not support concurrent ops on groups sharing the same rank pair;
@@ -290,12 +273,6 @@ class Zero3Plugin(ZeroPluginBase):
     def _make_free_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs, outputs) -> None:
             state = self._exec_state(bucket)
-            # See _make_materialize_forward_hook: keep the backward
-            # materialization alive across an activation-checkpoint recompute.
-            # The gradient-reduction hook releases it after parameter grads are
-            # produced.
-            if state.backward_materialized:
-                return
             self._register_backward_output_hooks(bucket, outputs)
             self._free_full_params(bucket)
             self._release_data_buffer(state)
@@ -709,12 +686,6 @@ class Zero3Plugin(ZeroPluginBase):
         return state.shard_buffer
 
     def _release_data_buffer(self, state: _BucketExecState) -> None:
-        # An asynchronous all-gather writes directly into this buffer. Keep it
-        # alive until the matching forward/backward materialization waits for
-        # the handle; activation-checkpoint recompute can otherwise release a
-        # backward-prefetch buffer before its output-gradient hook consumes it.
-        if state.fwd_handle is not None or state.bwd_handle is not None:
-            return
         state.data_buffer = None
 
     def _release_grad_buffers(self, state: _BucketExecState) -> None:

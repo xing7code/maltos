@@ -38,7 +38,15 @@ from distributed_test_utils import (
 )
 from attention_backend_utils import add_attention_backend_arg, resolve_attention_backend
 from helpers import causal_lm_batch, packed_causal_lm_batch
-from models import OlmoConfig, OlmoForCausalLM, OlmoForCausalLMTpSp, OlmoRMSNorm, TinyTransformer, TinyTransformerTpSp
+from models import (
+    ActivationCheckpointConfig,
+    OlmoConfig,
+    OlmoForCausalLM,
+    OlmoForCausalLMTpSp,
+    OlmoRMSNorm,
+    TinyTransformer,
+    TinyTransformerTpSp,
+)
 from models.tiny_transformer import RmsNorm
 from parallel import ContextParallelAttentionCoreType, ParallelPlan
 from parallel.plan import PipelineScheduleConfig
@@ -100,6 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--packed-batch", action="store_true")
     parser.add_argument("--model", choices=("tiny", "olmo2"), default="tiny")
+    parser.add_argument("--activation-checkpointing", action="store_true")
     add_attention_backend_arg(parser)
 
     return parser.parse_args()
@@ -111,11 +120,24 @@ def _model_vocab_size(model_name: str) -> int:
     return int(_OLMO_MODEL_KWARGS["vocab_size"])
 
 
-def _build_model(model_name: str, attention_backend: str, *, parallelized: bool) -> nn.Module:
+def _build_model(
+    model_name: str,
+    attention_backend: str,
+    *,
+    parallelized: bool,
+    activation_checkpointing: bool = False,
+) -> nn.Module:
     if model_name == "tiny":
         cls = TinyTransformerTpSp if parallelized else TinyTransformer
         return cls(**_TINY_MODEL_KWARGS, attention_backend=attention_backend)
-    config = OlmoConfig(**_OLMO_MODEL_KWARGS, attention_backend=attention_backend)
+    config = OlmoConfig(
+        **_OLMO_MODEL_KWARGS,
+        attention_backend=attention_backend,
+        activation_checkpointing=ActivationCheckpointConfig(
+            enabled=activation_checkpointing,
+            every_n_layers=1,
+        ),
+    )
     cls = OlmoForCausalLMTpSp if parallelized else OlmoForCausalLM
     return cls(config)
 
@@ -132,10 +154,16 @@ def _build_reference(
     seq_len: int,
     attention_backend: str,
     model_name: str,
+    activation_checkpointing: bool,
 ) -> tuple[nn.Module, torch.Tensor]:
     torch.manual_seed(seed)
     tokens = torch.randint(0, _model_vocab_size(model_name), (batch_size, seq_len))
-    model = _build_model(model_name, attention_backend, parallelized=False)
+    model = _build_model(
+        model_name,
+        attention_backend,
+        parallelized=False,
+        activation_checkpointing=activation_checkpointing,
+    )
     return model, tokens
 
 def _find_zero_plugin(core: RuntimeCore) -> Zero1Plugin | Zero2Plugin | Zero3Plugin | None:
@@ -156,7 +184,12 @@ def _make_zero_plugin(args: argparse.Namespace) -> Zero1Plugin | Zero2Plugin | Z
 
 
 def _make_baseline_core(reference_model: nn.Module, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
-    model = _build_model(args.model, args.resolved_attention_backend, parallelized=True)
+    model = _build_model(
+        args.model,
+        args.resolved_attention_backend,
+        parallelized=True,
+        activation_checkpointing=args.activation_checkpointing,
+    )
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
@@ -179,7 +212,12 @@ def _make_baseline_core(reference_model: nn.Module, args: argparse.Namespace, de
 
 
 def _make_runtime_core(reference_model: nn.Module, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
-    model = _build_model(args.model, args.resolved_attention_backend, parallelized=True)
+    model = _build_model(
+        args.model,
+        args.resolved_attention_backend,
+        parallelized=True,
+        activation_checkpointing=args.activation_checkpointing,
+    )
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
@@ -234,6 +272,7 @@ def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = 
         args.seq_len,
         args.resolved_attention_backend,
         args.model,
+        args.activation_checkpointing,
     )
 
     baseline_core = _make_baseline_core(reference_model, args, device)
