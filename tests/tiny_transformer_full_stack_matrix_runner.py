@@ -33,6 +33,11 @@ _DEFAULT_FAILURES_FILE = str(_LOCAL_NOTES_DIR / "matrix_failures.txt")
 _DEFAULT_PASSES_FILE = str(_LOCAL_NOTES_DIR / "matrix_passes.txt")
 _PORT_RETRY_LIMIT = 5
 _MERGED_CASE_TIMEOUT_SEC = 40.0
+# Keep the cost benefit of a merged worker, but bound how much distributed
+# process-group and CUDA state any one worker carries.  Resume groups contain
+# 16 cases; splitting them prevents a long accumulated lifecycle from masking
+# an otherwise valid individual case.
+_MAX_MERGED_CASES_PER_WORKER = 8
 
 
 RUN_CASE_BY_MODULE = {
@@ -207,7 +212,19 @@ def _group_cases(cases: list[MatrixCase]) -> list[tuple[str, list[MatrixCase]]]:
             groups[-1][1].append(case)
         else:
             groups.append((key, [case]))
-    return groups
+
+    worker_groups: list[tuple[str, list[MatrixCase]]] = []
+    for key, group_cases in groups:
+        chunks = [
+            group_cases[index : index + _MAX_MERGED_CASES_PER_WORKER]
+            for index in range(0, len(group_cases), _MAX_MERGED_CASES_PER_WORKER)
+        ]
+        if len(chunks) == 1:
+            worker_groups.append((key, chunks[0]))
+            continue
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            worker_groups.append((f"{key} [{chunk_index}/{len(chunks)}]", chunk))
+    return worker_groups
 
 
 def _append_completed_case(path_str: str | None, case_name: str) -> None:
