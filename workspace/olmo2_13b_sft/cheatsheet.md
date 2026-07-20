@@ -190,7 +190,92 @@ If this fails from CUDA OOM, stop here. Do not increase micro-batch size;
 reduce sequence length only as a temporary systems smoke and record that it is
 no longer the target SFT recipe.
 
-## 6a. Short All-Rank Efficiency Trace
+## 6a. Mini OLMo2 SFT Systems Validation (8x3090 / 8x5060 Ti)
+
+Run this only after the NCCL matrix is green and before returning to an
+expensive 8xA100 instance. It uses the exact packed OLMo SFT data but starts
+from random **~270M** OLMo2 weights, so it validates the SFT data path,
+`DP=4/TP=2/SP/ZeRO-3`, BF16, activation checkpointing, metrics, and native
+checkpointing without downloading or converting the 13B base checkpoint.
+
+The recipe needs the prepared data from section 2, but none of sections 3--5.
+It is a systems/stability check, not an OLMo 13B convergence comparison.
+
+```bash
+export MINI_PROJECT=workspace/olmo2_mini_sft
+export MINI_CONFIG=configs/olmo2_mini_sft.yaml
+export MINI_LOG_DIR=$MINI_PROJECT/logs
+export MINI_CKPT_DIR=$MINI_PROJECT/checkpoints
+
+mkdir -p "$MINI_LOG_DIR" "$MINI_CKPT_DIR"
+test -f "$PROJECT_DIR/data/olmo2_13b_sft/meta.json"
+```
+
+First do a 20-step stability run. It writes scalar metrics to W&B and JSONL;
+no checkpoint artifact is uploaded to W&B.
+
+```bash
+torchrun --nproc_per_node=8 \
+  --master_addr 127.0.0.1 \
+  --master_port 29612 \
+  train/cli.py \
+  --config "$MINI_CONFIG" \
+  --max-steps 20 \
+  --warmup-steps 2 \
+  --checkpoint-every 20 \
+  --checkpoint-dir "$MINI_CKPT_DIR/smoke20" \
+  --metrics-jsonl "$MINI_LOG_DIR/smoke20_metrics.jsonl" \
+  --wandb-project maltos \
+  --wandb-run-name olmo2-mini-sft-smoke20 \
+  --backend nccl \
+  2>&1 | tee "$MINI_LOG_DIR/smoke20.log"
+
+test -f "$MINI_CKPT_DIR/smoke20/step_00000020/manifest.json"
+```
+
+If the loss is finite and trends down after warmup, run the 100-step curve:
+
+```bash
+torchrun --nproc_per_node=8 \
+  --master_addr 127.0.0.1 \
+  --master_port 29612 \
+  train/cli.py \
+  --config "$MINI_CONFIG" \
+  --checkpoint-dir "$MINI_CKPT_DIR/main100" \
+  --metrics-jsonl "$MINI_LOG_DIR/main100_metrics.jsonl" \
+  --wandb-project maltos \
+  --wandb-run-name olmo2-mini-sft-main100 \
+  --backend nccl \
+  2>&1 | tee "$MINI_LOG_DIR/main100.log"
+```
+
+Profiling is optional and should be a separate run after `smoke20` passes. A
+consumer-GPU trace is useful for finding MALTOS CPU/NCCL bubbles, but its PCIe
+topology is not a throughput prediction for an A100 NVSwitch host.
+
+```bash
+torchrun --nproc_per_node=8 \
+  --master_addr 127.0.0.1 \
+  --master_port 29612 \
+  train/cli.py \
+  --config "$MINI_CONFIG" \
+  --max-steps 50 \
+  --warmup-steps 2 \
+  --checkpoint-every 50 \
+  --checkpoint-dir "$MINI_CKPT_DIR/profile50" \
+  --metrics-jsonl "$MINI_LOG_DIR/profile50_metrics.jsonl" \
+  --wandb-mode disabled \
+  --torch-profiler \
+  --torch-profiler-dir "$MINI_PROJECT/traces/profile50" \
+  --torch-profiler-wait 40 \
+  --torch-profiler-warmup 5 \
+  --torch-profiler-active 5 \
+  --torch-profiler-repeat 1 \
+  --backend nccl \
+  2>&1 | tee "$MINI_LOG_DIR/profile50.log"
+```
+
+## 6b. Short All-Rank Efficiency Trace (13B)
 
 Run profiling as a separate short job. The profiler records CPU, CUDA, and NCCL
 events for all eight ranks and writes Chrome/TensorBoard-compatible traces.

@@ -1,0 +1,69 @@
+# Systems-validation SFT recipe for eight BF16-capable GPUs (e.g. RTX 3090,
+# RTX 5060 Ti, or A100).  This is deliberately not a 13B checkpoint test:
+# it starts from random OLMo2 weights while retaining the 13B recipe's data
+# format and DP=4 / TP=2 / SP / ZeRO-3 execution path.
+seed: 8
+
+data:
+  paths:
+    - workspace/olmo2_13b_sft/data/olmo2_13b_sft
+  format: sft
+  seq_len: 4096
+  micro_batch_size: 1
+
+model:
+  type: olmo2
+  vocab_size: 100352
+  # About 270M parameters: the OLMo vocabulary is intentionally unchanged so
+  # the real packed OLMo SFT data can be consumed without re-tokenizing.
+  hidden_size: 768
+  intermediate_size: 3072
+  num_layers: 12
+  num_heads: 12
+  num_kv_heads: 12
+  rms_norm_eps: 1.0e-6
+  attention_backend: sdpa_auto
+  activation_checkpointing: true
+  activation_checkpoint_every_n_layers: 1
+
+parallel:
+  dp_size: 4
+  tp_size: 2
+  use_sp: true
+  zero_stage: 3
+
+training:
+  max_steps: 100
+  # Global batch = 1 micro-batch * 4 DP * 4 accumulation = 16 sequences.
+  grad_accum_steps: 4
+  lr: 1.0e-4
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  fused_adamw: true
+  lr_schedule: linear
+  warmup_steps: 5
+  min_lr: 0.0
+  precision: bf16
+  grad_clip: 1.0
+
+logging:
+  log_every: 1
+  metrics_jsonl: workspace/olmo2_mini_sft/logs/metrics.jsonl
+  wandb_project: maltos
+  wandb_run_name: olmo2-mini-sft-random-gbs16-dp4-tp2-sp-zero3
+  wandb_run_id: null
+  wandb_tags:
+    - olmo2
+    - mini-sft
+    - systems-validation
+  wandb_checkpoint_every: null
+
+checkpoint:
+  dir: workspace/olmo2_mini_sft/checkpoints/runtime
+  every: 50
+  keep_last: 2
+  keep_every_n_steps: 100
+  min_free_gb: 30
+  resume_from: null
