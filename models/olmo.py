@@ -14,6 +14,7 @@ from parallel.specs import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from runtime.layers.distributed_rmsnorm import DistributedRMSNorm
 from utils.attention_backend import AttentionBackend, validate_attention_backend
+from utils.activation_checkpoint import activation_checkpoint_context_fn
 from utils.constants import (
     HIDDEN_STATES_KEY,
     IGNORE_INDEX,
@@ -206,6 +207,7 @@ class OlmoForCausalLM(nn.Module):
                     ),
                     x,
                     use_reentrant=False,
+                    context_fn=activation_checkpoint_context_fn,
                 )
             else:
                 x = layer(x, position_offset=position_offset, position_ids=position_ids, sequence_ids=sequence_ids)

@@ -20,6 +20,7 @@ from runtime.plugins.zero_common import (
 from runtime.types import ParamRole, RuntimePhase, SetupPhase
 from state.state import ModelStateMeta
 from utils.distributed import all_gather_single, reduce_scatter_single
+from utils.activation_checkpoint import is_activation_checkpoint_recompute
 
 
 class _ExecDirection(str, Enum):
@@ -257,6 +258,21 @@ class Zero3Plugin(ZeroPluginBase):
 
     def _make_materialize_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs) -> None:
+            state = self._exec_state(bucket)
+            if is_activation_checkpoint_recompute():
+                # ``checkpoint(..., use_reentrant=False)`` runs the wrapped layer a
+                # second time while autograd is already in backward.  The normal
+                # forward post-hook released this bucket's buffer, so bind the
+                # explicitly prefetched backward copy instead.  Do not infer this
+                # from bwd_handle: the next real forward may also see a stale state.
+                # A backward output hook may have materialized this bucket before
+                # checkpoint asks for its recomputation, then its parameter-gradient
+                # hook may already have released the buffer.  The flag records that
+                # history; buffer ownership decides whether it is usable now.
+                if not state.backward_materialized or state.data_buffer is None:
+                    self._materialize_full_params(bucket, direction=_ExecDirection.BACKWARD)
+                    state.backward_materialized = True
+                return
             self._record_forward_bucket(bucket)
             self._materialize_full_params(bucket, direction=_ExecDirection.FORWARD)
             # gloo does not support concurrent ops on groups sharing the same rank pair;
@@ -272,6 +288,10 @@ class Zero3Plugin(ZeroPluginBase):
 
     def _make_free_forward_hook(self, bucket: _Bucket):
         def hook(_module: nn.Module, _inputs, outputs) -> None:
+            if is_activation_checkpoint_recompute():
+                # Parameter-gradient hooks still need these full tensors after the
+                # recomputed module returns.  They release the buffer on completion.
+                return
             state = self._exec_state(bucket)
             self._register_backward_output_hooks(bucket, outputs)
             self._free_full_params(bucket)

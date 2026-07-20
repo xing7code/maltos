@@ -12,6 +12,7 @@ from parallel.specs import ContextParallelSpec
 from parallel.specs import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
 from utils.attention_backend import AttentionBackend, causal_attention, validate_attention_backend
+from utils.activation_checkpoint import activation_checkpoint_context_fn
 from runtime.layers.attn_masking_utils import canonical_position_ids, canonical_sequence_ids
 from utils.constants import (
     HIDDEN_STATES_KEY,
@@ -282,6 +283,7 @@ class LlamaForCausalLM(nn.Module):
                     ),
                     x,
                     use_reentrant=False,
+                    context_fn=activation_checkpoint_context_fn,
                 )
             else:
                 x = layer(x, position_offset=position_offset, position_ids=position_ids, sequence_ids=sequence_ids)
