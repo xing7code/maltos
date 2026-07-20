@@ -260,6 +260,14 @@ def _cleanup_checkpoint_dir(path: str | None) -> None:
 
 def _reset_merged_case_state(device: torch.device | None) -> None:
     """Clear process-local test state which a subprocess would discard."""
+    # A case creates and destroys several NCCL subgroups.  Their Python handles
+    # may be gone while CUDA work queued through those communicators is still
+    # retiring.  Fence every rank through the default group before the next
+    # case creates fresh subgroups; otherwise a long merged EP/1F1B suite can
+    # race communicator teardown with the next case's collectives.
+    if device is not None:
+        torch.cuda.synchronize(device)
+    dist.barrier()
     # RuntimeCore/plugin hooks form reference cycles.  Reclaim them before
     # clearing the process-global test allocator so one case cannot retain or
     # alias the next case's buffers.
@@ -267,6 +275,7 @@ def _reset_merged_case_state(device: torch.device | None) -> None:
     clear_buffer_pool()
     if device is not None:
         torch.cuda.empty_cache()
+    dist.barrier()
 
 
 def _run_merged_worker(rank: int, args: argparse.Namespace) -> None:
@@ -312,7 +321,6 @@ def _run_merged_worker(rank: int, args: argparse.Namespace) -> None:
             finally:
                 _cleanup_checkpoint_dir(checkpoint_dir)
                 _reset_merged_case_state(device)
-            dist.barrier()
         if rank == 0:
             print("Merged full-stack matrix PASS")
     finally:
