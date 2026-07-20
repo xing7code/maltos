@@ -1,4 +1,4 @@
-# OLMo2 13B SFT on 4xA100
+# OLMo2 13B SFT on 8xA100 80GB
 
 This is the budget-conscious MALTOS validation run: start from the public
 OLMo2 13B **base** weights, train the public SFT recipe for a short segment,
@@ -15,7 +15,7 @@ Open Instruct recipe where MALTOS has an equivalent setting:
 - base model: `allenai/OLMo-2-1124-13B` at `main`
 - data: `allenai/tulu-3-sft-olmo-2-mixture-0225`
 - seed 8, BF16, LR `5e-6`, linear decay, 3% warmup, no weight decay
-- 4 GPUs: TP=2, DP=2, SP, ZeRO-3, global batch 64
+- 8 GPUs: TP=2, DP=4, SP, ZeRO-3, global batch 64
 
 MALTOS uses packed fixed-length SFT data and `sdpa_auto`, so neither the exact
 batch composition nor the attention kernel is asserted to equal Open
@@ -43,14 +43,13 @@ mkdir -p "$PROJECT_DIR"/data "$PROJECT_DIR"/checkpoints \
 
 ## 1. Machine and Disk Preflight
 
-Use a 4xA100 **80GB** instance. The reduced DP degree doubles each rank's
-ZeRO-3 shard relative to the 8-GPU layout, so 40GB cards are not the target
-configuration. Choose a host with at
-least **512GB system RAM** as well as the four GPUs: model construction and
+Use an 8xA100 **80GB** instance. The target layout is TP=2 and DP=4; 40GB
+cards are not the target configuration. Choose a host with at least **512GB
+system RAM** (1TB preferred) as well as the eight GPUs: model construction and
 logical-to-runtime conversion temporarily use CPU memory before the TP/ZeRO-3
-layout is fully materialized. Reserve at least 500GB of local disk: base
-weights are about 60GB and each ZeRO-3 training checkpoint can be large
-because it contains optimizer state.
+layout is fully materialized. Reserve at least 1TB of local disk: base weights,
+prepared data, and two ZeRO-3 training checkpoints with optimizer state must
+coexist.
 
 ```bash
 nvidia-smi
@@ -118,16 +117,16 @@ test -f "$BASE_LOGICAL/model.safetensors.index.json"
 du -sh "$BASE_LOGICAL"
 ```
 
-## 4. Convert Base Logical Weights to a 4-way Runtime Checkpoint
+## 4. Convert Base Logical Weights to an 8-way Runtime Checkpoint
 
-This conversion shards weights for the target TP=2, DP=2, ZeRO-3 runtime. Its
+This conversion shards weights for the target TP=2, DP=4, ZeRO-3 runtime. Its
 output is intentionally weights-only; the first training segment creates new
 optimizer, scheduler, RNG, and dataloader state. The converter reads logical
 safetensors on demand per target rank instead of materializing the full logical
 checkpoint in every rank's host memory.
 
 ```bash
-torchrun --nproc_per_node=4 \
+torchrun --nproc_per_node=8 \
   --master_addr 127.0.0.1 \
   --master_port "$MASTER_PORT" \
   tools/convert_checkpoint.py logical-to-runtime \
@@ -146,11 +145,11 @@ test -f "$BASE_RUNTIME/step_00000000/manifest.json"
 
 ## 5. Dry-Run the Full 8-GPU Topology
 
-This verifies the data path, model construction, 4-GPU mesh, and checkpoint load
+This verifies the data path, model construction, 8-GPU mesh, and checkpoint load
 without entering the training loop.
 
 ```bash
-torchrun --nproc_per_node=4 \
+torchrun --nproc_per_node=8 \
   --master_addr 127.0.0.1 \
   --master_port "$MASTER_PORT" \
   train/cli.py \
@@ -169,7 +168,7 @@ Run this before the longer jobs. It both proves a real optimizer step and
 creates a MALTOS-native runtime checkpoint.
 
 ```bash
-torchrun --nproc_per_node=4 \
+torchrun --nproc_per_node=8 \
   --master_addr 127.0.0.1 \
   --master_port "$MASTER_PORT" \
   train/cli.py \
@@ -195,11 +194,11 @@ no longer the target SFT recipe.
 ## 6a. Short All-Rank Efficiency Trace
 
 Run profiling as a separate short job. The profiler records CPU, CUDA, and NCCL
-events for all four ranks and writes Chrome/TensorBoard-compatible traces.
+events for all eight ranks and writes Chrome/TensorBoard-compatible traces.
 First run 40 optimizer steps without recording, then give the profiler five
 warmup steps and capture five active steps. This gets past CUDA allocator,
 NCCL communicator, dataloader, and LR-warmup transients. Each optimizer step
-contains 32 accumulated microsteps, so the capture is still deliberately
+contains 16 accumulated microsteps, so the capture is still deliberately
 bounded.
 
 Do **not** use this run's throughput as the headline throughput number; profiler
@@ -207,7 +206,7 @@ instrumentation adds overhead. Use the unprofiled 100- or 500-step run for
 `perf/tokens_per_sec`, `perf/step_sec`, and `perf/tflops_per_gpu`.
 
 ```bash
-torchrun --nproc_per_node=4 \
+torchrun --nproc_per_node=8 \
   --master_addr 127.0.0.1 \
   --master_port "$MASTER_PORT" \
   train/cli.py \
@@ -245,7 +244,7 @@ the optimizer-step boundary.
 
 ### Archive and Download the Trace
 
-Do not add the raw traces to Git or upload them as W&B artifacts: four-rank
+Do not add the raw traces to Git or upload them as W&B artifacts: eight-rank
 traces can be hundreds of MB or multiple GB. Archive them on Vast, then pull
 them to the local machine with `rsync`, which is resumable if the connection
 drops.
@@ -293,7 +292,7 @@ This is the cheapest meaningful loss-curve check. Three warmup steps round the
 recipe's 3% warmup ratio.
 
 ```bash
-torchrun --nproc_per_node=4 \
+torchrun --nproc_per_node=8 \
   --master_addr 127.0.0.1 \
   --master_port "$MASTER_PORT" \
   train/cli.py \
@@ -317,7 +316,7 @@ Run only after the 100-step curve is stable. The config defaults already set a
 15-step warmup, equal to 3% of 500.
 
 ```bash
-torchrun --nproc_per_node=4 \
+torchrun --nproc_per_node=8 \
   --master_addr 127.0.0.1 \
   --master_port "$MASTER_PORT" \
   train/cli.py \
@@ -339,7 +338,7 @@ scheduler, RNG, trainer, plugin, and dataloader state. This is the required
 resume check for a real run.
 
 ```bash
-torchrun --nproc_per_node=4 \
+torchrun --nproc_per_node=8 \
   --master_addr 127.0.0.1 \
   --master_port "$MASTER_PORT" \
   train/cli.py \

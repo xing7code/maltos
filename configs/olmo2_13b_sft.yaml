@@ -8,7 +8,7 @@ data:
     - workspace/olmo2_13b_sft/data/olmo2_13b_sft
   format: sft
   seq_len: 4096
-  # 4 GPUs with TP=2 gives DP=2. Together with grad_accum_steps=32 this is
+  # 8 GPUs with TP=2 gives DP=4. Together with grad_accum_steps=16 this is
   # the reference recipe's global batch size of 64 sequences.
   micro_batch_size: 1
 
@@ -26,14 +26,14 @@ model:
   activation_checkpoint_every_n_layers: 1
 
 parallel:
-  dp_size: 2
+  dp_size: 4
   tp_size: 2
   use_sp: true
   zero_stage: 3
 
 training:
   max_steps: 500
-  grad_accum_steps: 32
+  grad_accum_steps: 16
   lr: 5.0e-6
   weight_decay: 0.0
   adam_beta1: 0.9
@@ -52,7 +52,7 @@ logging:
   log_every: 1
   metrics_jsonl: workspace/olmo2_13b_sft/logs/metrics.jsonl
   wandb_project: maltos
-  wandb_run_name: olmo2-13b-sft-base-gbs64-dp2-tp2-sp-zero3
+  wandb_run_name: olmo2-13b-sft-base-gbs64-dp4-tp2-sp-zero3
   wandb_run_id: null
   wandb_tags:
     - olmo2
