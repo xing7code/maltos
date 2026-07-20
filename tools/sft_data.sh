@@ -14,15 +14,17 @@ fi
 
 case "$PRESET" in
   olmo|olmo2|olmo2_13b_sft)
-    TOKENIZER_DEFAULT=allenai/OLMo-2-1124-13B-SFT
-    DATASET_DEFAULT=allenai/tulu-3-sft-olmo-2-mixture
+    # Keep preprocessing aligned with the current public Open Instruct 13B
+    # recipe. It tokenizes from the base model and uses the updated -0225 mix.
+    TOKENIZER_DEFAULT=allenai/OLMo-2-1124-13B
+    DATASET_DEFAULT=allenai/tulu-3-sft-olmo-2-mixture-0225
     DATASET_CONFIG_DEFAULT=
     CHAT_TEMPLATE_FILE_DEFAULT=configs/chat_templates/olmo2_sft_masked.jinja
     SPLIT_DEFAULT=train
     MESSAGES_COLUMN_DEFAULT=messages
     PROMPT_COLUMN_DEFAULT=prompt
     COMPLETION_COLUMN_DEFAULT=completion
-    OUTPUT_DIR_DEFAULT=datasets/olmo2_13b_sft
+    OUTPUT_DIR_DEFAULT=workspace/olmo2_13b_sft/data/olmo2_13b_sft
     SEQ_LEN_DEFAULT=4096
     SEQUENCES_PER_SHARD_DEFAULT=8192
     MAX_EXAMPLES_DEFAULT=
@@ -34,7 +36,7 @@ case "$PRESET" in
     APPLY_CHAT_TEMPLATE_DEFAULT=true
     APPEND_EOS_DEFAULT=true
     STREAMING_DEFAULT=false
-    SEED_DEFAULT=42
+    SEED_DEFAULT=8
     SHUFFLE_BUFFER_SIZE_DEFAULT=10000
     LOG_EVERY_EXAMPLES_DEFAULT=1000
     ;;
@@ -47,7 +49,7 @@ case "$PRESET" in
     MESSAGES_COLUMN_DEFAULT=messages
     PROMPT_COLUMN_DEFAULT=prompt
     COMPLETION_COLUMN_DEFAULT=completion
-    OUTPUT_DIR_DEFAULT=datasets/sft
+    OUTPUT_DIR_DEFAULT=workspace/sft/data/sft
     SEQ_LEN_DEFAULT=4096
     SEQUENCES_PER_SHARD_DEFAULT=8192
     MAX_EXAMPLES_DEFAULT=

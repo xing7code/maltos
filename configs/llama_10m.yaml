@@ -2,7 +2,7 @@ seed: 42
 
 data:
   paths:
-    - data/fineweb10bt-10m
+    - workspace/llama_10m/data/fineweb10bt-10m
   seq_len: 512
   micro_batch_size: 1
 
@@ -42,7 +42,7 @@ training:
 
 logging:
   log_every: 1
-  metrics_jsonl: logs/llama_10m.jsonl
+  metrics_jsonl: workspace/llama_10m/logs/metrics.jsonl
   wandb_project: maltos
   wandb_run_name: llama-10m-dp2-tp2-sp-zero3
   wandb_run_id: null
@@ -53,7 +53,7 @@ logging:
   wandb_checkpoint_every: null
 
 checkpoint:
-  dir: checkpoints/llama_10m
+  dir: workspace/llama_10m/checkpoints/runtime
   every: 50
   keep_last: 1
   keep_every_n_steps: 250

@@ -1,7 +1,7 @@
 """
 example:
 PYTHONPATH=. python tools/upload_wandb_checkpoint.py \
-  --checkpoint-dir checkpoints/llama_50m_dp2_tp2_sp_zero3 \
+  --checkpoint-dir workspace/llama_50m/checkpoints/runtime \
   --steps 1000 2000 3000 \
   --project maltos \
   --entity xing7-org \

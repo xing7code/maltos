@@ -135,6 +135,7 @@ def main() -> None:
             checkpoint_every=args.checkpoint_every,
             checkpoint_dir=args.checkpoint_dir,
             resume_from=args.resume_from,
+            load_weights_only=args.load_weights_only,
             checkpoint_keep_last=args.checkpoint_keep_last,
             checkpoint_keep_every_n_steps=args.checkpoint_keep_every_n_steps,
             checkpoint_min_free_gb=args.checkpoint_min_free_gb,

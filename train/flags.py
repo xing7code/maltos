@@ -136,6 +136,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-keep-every-n-steps", type=int, default=None)
     parser.add_argument("--checkpoint-min-free-gb", type=float, default=None)
     parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--load-weights-only", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--backend", type=str, default=None)
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
@@ -315,5 +316,6 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("checkpoint", "min_free_gb"): "checkpoint_min_free_gb",
         ("checkpoint", "checkpoint_min_free_gb"): "checkpoint_min_free_gb",
         ("checkpoint", "resume_from"): "resume_from",
+        ("checkpoint", "load_weights_only"): "load_weights_only",
     }
     return aliases.get((section, key), key)

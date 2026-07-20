@@ -26,6 +26,7 @@ class TrainerConfig:
     checkpoint_every: int | None = None
     checkpoint_dir: str | Path | None = None
     resume_from: str | Path | None = None
+    load_weights_only: bool = False
     checkpoint_keep_last: int | None = None
     checkpoint_keep_every_n_steps: int | None = None
     checkpoint_min_free_gb: float | None = None
@@ -73,7 +74,10 @@ class Trainer:
 
     def setup(self) -> None:
         self.runtime.state_manager.bind_dataloader(self.dataloader)
-        self.runtime.setup(checkpoint_path=self.config.resume_from)
+        self.runtime.setup(
+            checkpoint_path=self.config.resume_from,
+            load_weights_only=self.config.load_weights_only,
+        )
         if self.config.checkpoint_every is not None:
             assert self.config.checkpoint_dir is not None
             assert self.runtime_spec is not None

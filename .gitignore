@@ -3,6 +3,12 @@ logs/
 checkpoints/
 wandb/
 local_notes/
+workspace/*
+!workspace/README.md
+!workspace/.gitkeep
+!workspace/olmo2_13b_sft/
+workspace/olmo2_13b_sft/*
+!workspace/olmo2_13b_sft/cheatsheet.md
 .venv/
 __pycache__/
 *.pyc

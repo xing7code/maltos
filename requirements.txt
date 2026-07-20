@@ -1,6 +1,7 @@
 torch
 transformers
 datasets
+huggingface_hub
 absl-py
 wandb
 PyYAML

@@ -1,9 +1,16 @@
-seed: 42
+# Matches the public Open Instruct OLMo-2 13B SFT recipe where MALTOS has an
+# equivalent option. This is a fresh SFT run from the public *base* weights,
+# not an optimizer/dataloader-state resume of AI2's original run.
+seed: 8
 
 data:
+  paths:
+    - workspace/olmo2_13b_sft/data/olmo2_13b_sft
   format: sft
   seq_len: 4096
-  micro_batch_size: 2
+  # 4 GPUs with TP=2 gives DP=2. Together with grad_accum_steps=32 this is
+  # the reference recipe's global batch size of 64 sequences.
+  micro_batch_size: 1
 
 model:
   type: olmo2
@@ -19,31 +26,33 @@ model:
   activation_checkpoint_every_n_layers: 1
 
 parallel:
-  dp_size: 4
+  dp_size: 2
   tp_size: 2
   use_sp: true
   zero_stage: 3
 
 training:
-  max_steps: 1000
-  grad_accum_steps: 16
+  max_steps: 500
+  grad_accum_steps: 32
   lr: 5.0e-6
   weight_decay: 0.0
   adam_beta1: 0.9
   adam_beta2: 0.95
   adam_eps: 1.0e-8
   fused_adamw: true
-  lr_schedule: constant
-  warmup_steps: 50
+  lr_schedule: linear
+  # 3% of the default 500-step validation run. Override this together with
+  # --max-steps for shorter probes; see workspace/olmo2_13b_sft/cheatsheet.md.
+  warmup_steps: 15
   min_lr: 0.0
   precision: bf16
   grad_clip: 1.0
 
 logging:
   log_every: 1
-  metrics_jsonl: logs/olmo2_13b_sft.jsonl
+  metrics_jsonl: workspace/olmo2_13b_sft/logs/metrics.jsonl
   wandb_project: maltos
-  wandb_run_name: olmo2-13b-sft-dp4-tp2-sp-zero3
+  wandb_run_name: olmo2-13b-sft-base-gbs64-dp2-tp2-sp-zero3
   wandb_run_id: null
   wandb_tags:
     - olmo2
@@ -52,9 +61,11 @@ logging:
   wandb_checkpoint_every: null
 
 checkpoint:
-  dir: checkpoints/olmo2_13b_sft
-  every: 100
+  dir: workspace/olmo2_13b_sft/checkpoints/runtime
+  every: 50
   keep_last: 2
   keep_every_n_steps: 500
-  min_free_gb: 20
+  # A 13B ZeRO-3 runtime checkpoint includes sharded optimizer state. Do not
+  # start a run on a disk that cannot retain at least two complete checkpoints.
+  min_free_gb: 250
   resume_from: null

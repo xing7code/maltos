@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
@@ -30,6 +31,43 @@ _DEFAULT_LOGICAL_SHARD_SIZE_BYTES = 5 * 1024 * 1024 * 1024
 class LogicalCheckpointManifest:
     metadata: dict[str, str | int]
     weight_map: dict[str, str]
+
+
+class LogicalCheckpointTensorReader(Mapping[str, torch.Tensor]):
+    """Read logical checkpoint tensors on demand without materializing the full model.
+
+    Logical-to-runtime conversion is launched once per target rank. Keeping a
+    complete 13B logical checkpoint in every process would multiply host-memory
+    use by world size, even though each rank only needs its own runtime shards.
+    This mapping validates keys cheaply from the index, then opens and returns
+    each requested safetensors tensor on demand.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        index_path = self.path / _LOGICAL_INDEX_NAME
+        single_path = self.path / _LOGICAL_SINGLE_NAME
+        if index_path.is_file():
+            self._names = frozenset(_load_logical_index(index_path).weight_map)
+        elif single_path.is_file():
+            with safe_open(str(single_path), framework="pt", device="cpu") as f:
+                self._names = frozenset(_logical_tensor_name(name) for name in f.keys())
+        else:
+            raise ValueError(
+                f"logical checkpoint not found in {self.path}; "
+                f"expected {_LOGICAL_INDEX_NAME} or {_LOGICAL_SINGLE_NAME}"
+            )
+
+    def __getitem__(self, name: str) -> torch.Tensor:
+        if name not in self._names:
+            raise KeyError(f"logical checkpoint missing tensor={name}")
+        return load_logical_tensor(self.path, name)
+
+    def __iter__(self):
+        return iter(self._names)
+
+    def __len__(self) -> int:
+        return len(self._names)
 
 
 def save_logical_checkpoint(
@@ -75,9 +113,10 @@ def load_logical_checkpoint(path: str | Path) -> dict[str, torch.Tensor]:
             shard_tensors = load_file(str(checkpoint_dir / shard_name), device="cpu")
             for name, mapped_shard in manifest.weight_map.items():
                 if mapped_shard == shard_name:
-                    if name not in shard_tensors:
-                        raise ValueError(f"logical checkpoint shard={shard_name} missing tensor={name}")
-                    tensors[name] = shard_tensors[name]
+                    checkpoint_name = _resolve_checkpoint_tensor_name(shard_tensors, name)
+                    if checkpoint_name not in shard_tensors:
+                        raise ValueError(f"logical checkpoint shard={shard_name} missing tensor={checkpoint_name}")
+                    tensors[name] = shard_tensors[checkpoint_name]
         return tensors
     if single_path.is_file():
         return load_file(str(single_path), device="cpu")
@@ -94,10 +133,14 @@ def load_logical_tensor(path: str | Path, name: str) -> torch.Tensor:
     if index_path.is_file():
         manifest = _load_logical_index(index_path)
         shard_name = manifest.weight_map.get(name)
+        checkpoint_name = _checkpoint_tensor_name(name)
+        if shard_name is None and checkpoint_name != name:
+            shard_name = manifest.weight_map.get(checkpoint_name)
         if shard_name is None:
             raise KeyError(f"logical checkpoint missing tensor={name}")
         with safe_open(str(checkpoint_dir / shard_name), framework="pt", device="cpu") as f:
-            return f.get_tensor(name)
+            checkpoint_name = _resolve_checkpoint_tensor_name(f.keys(), name)
+            return f.get_tensor(checkpoint_name)
     if single_path.is_file():
         with safe_open(str(single_path), framework="pt", device="cpu") as f:
             if name not in f.keys():
@@ -121,7 +164,7 @@ def iter_logical_checkpoint_tensors(path: str | Path) -> Iterable[tuple[str, tor
         for shard_name in sorted(by_shard):
             with safe_open(str(checkpoint_dir / shard_name), framework="pt", device="cpu") as f:
                 for name in sorted(by_shard[shard_name]):
-                    yield name, f.get_tensor(name)
+                    yield name, f.get_tensor(_resolve_checkpoint_tensor_name(f.keys(), name))
         return
     if single_path.is_file():
         with safe_open(str(single_path), framework="pt", device="cpu") as f:
@@ -223,7 +266,7 @@ def iter_logical_tensors_from_runtime_checkpoint(
 
 def _build_runtime_model_state_from_logical_tensors(
     runtime: "RuntimeCore",
-    tensors: dict[str, torch.Tensor],
+    tensors: Mapping[str, torch.Tensor],
 ) -> tuple[dict[str, torch.Tensor], list[ModelStateMeta]]:
     _validate_supported_runtime_for_import(runtime)
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -291,7 +334,7 @@ def _build_runtime_entry_tensor(
     *,
     runtime: "RuntimeCore",
     entry: ModelStateMeta,
-    tensors: dict[str, torch.Tensor],
+    tensors: Mapping[str, torch.Tensor],
     shard_rules: dict[str, str],
     tp_rank: int,
     tp_world_size: int,
@@ -341,15 +384,47 @@ def _load_logical_index(index_path: Path) -> LogicalCheckpointManifest:
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError(f"logical checkpoint index missing weight_map: {index_path}")
     fmt = metadata.get("format")
-    version = int(metadata.get("version", 0))
-    if fmt != "logical_model":
-        raise ValueError(f"unsupported logical checkpoint format={fmt!r}")
-    if version != 1:
-        raise ValueError(f"unsupported logical checkpoint version={version}")
+    if fmt is not None:
+        version = int(metadata.get("version", 0))
+        if fmt != "logical_model":
+            raise ValueError(f"unsupported logical checkpoint format={fmt!r}")
+        if version != 1:
+            raise ValueError(f"unsupported logical checkpoint version={version}")
+    normalized_weight_map: dict[str, str] = {}
+    checkpoint_names_by_logical_name: dict[str, str] = {}
+    for checkpoint_name, shard_name in weight_map.items():
+        logical_name = _logical_tensor_name(str(checkpoint_name))
+        previous_checkpoint_name = checkpoint_names_by_logical_name.get(logical_name)
+        if previous_checkpoint_name is not None and previous_checkpoint_name != str(checkpoint_name):
+            raise ValueError(
+                f"logical checkpoint index maps multiple tensors to logical name={logical_name}: "
+                f"{previous_checkpoint_name}, {checkpoint_name}"
+            )
+        checkpoint_names_by_logical_name[logical_name] = str(checkpoint_name)
+        normalized_weight_map[logical_name] = str(shard_name)
     return LogicalCheckpointManifest(
         metadata={str(key): value for key, value in metadata.items()},
-        weight_map={str(name): str(shard_name) for name, shard_name in weight_map.items()},
+        weight_map=normalized_weight_map,
     )
+
+
+def _logical_tensor_name(checkpoint_name: str) -> str:
+    if checkpoint_name.startswith("model."):
+        return checkpoint_name[len("model.") :]
+    return checkpoint_name
+
+
+def _checkpoint_tensor_name(logical_name: str) -> str:
+    return f"model.{logical_name}" if logical_name != "lm_head.weight" else logical_name
+
+
+def _resolve_checkpoint_tensor_name(keys, logical_name: str) -> str:
+    if logical_name in keys:
+        return logical_name
+    checkpoint_name = _checkpoint_tensor_name(logical_name)
+    if checkpoint_name in keys:
+        return checkpoint_name
+    return logical_name
 
 
 def _plan_logical_shards(
@@ -591,7 +666,7 @@ def _local_tensor_for_runtime_tensor(
 def _build_zero3_bucket_tensor(
     *,
     bucket,
-    tensors: dict[str, torch.Tensor],
+    tensors: Mapping[str, torch.Tensor],
     shard_rules: dict[str, str],
     tp_rank: int,
     tp_world_size: int,

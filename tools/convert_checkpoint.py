@@ -17,12 +17,11 @@ if str(_REPO_ROOT) not in sys.path:
 from state import (
     iter_logical_tensors_from_runtime_checkpoint,
     load_runtime_spec,
-    load_logical_checkpoint,
     save_logical_checkpoint,
     save_runtime_spec,
 )
 from state.checkpoint import save_sharded_checkpoint_from_model_state
-from state.logical_checkpoint import _build_runtime_model_state_from_logical_tensors
+from state.logical_checkpoint import LogicalCheckpointTensorReader, _build_runtime_model_state_from_logical_tensors
 from train.flags import parse_args_from as parse_training_args_from
 from train.flags import build_runtime_spec, parse_runtime_spec_args
 from utils.distributed import distributed_barrier
@@ -119,7 +118,7 @@ def _runtime_to_logical(recipe_args: argparse.Namespace, checkpoint_dir: Path, o
 
 
 def _logical_to_runtime(runtime, checkpoint_dir: Path, output_dir: Path, *, recipe_args: argparse.Namespace, rank: int) -> None:
-    tensors = load_logical_checkpoint(checkpoint_dir)
+    tensors = LogicalCheckpointTensorReader(checkpoint_dir)
     model_state, rank_entries = _build_runtime_model_state_from_logical_tensors(runtime, tensors)
     if rank == 0:
         save_runtime_spec(output_dir, build_runtime_spec(recipe_args))
