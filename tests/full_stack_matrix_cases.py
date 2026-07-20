@@ -79,6 +79,12 @@ _BASE_ARGS: dict[str, dict[str, object]] = {
         "batch_size": 8,
         "seq_len": 32,
         "seed": 42,
+        # Keep these parser defaults in the case namespace too: merged mode
+        # invokes run_case() directly instead of going through argparse.
+        "packed_batch": False,
+        "model": "tiny",
+        "activation_checkpointing": False,
+        "attention_backend": "auto",
     },
     "full_resume": {
         "world_size": 8,
@@ -100,6 +106,9 @@ _BASE_ARGS: dict[str, dict[str, object]] = {
         "zero_stage": 3,
         "disable_precision": False,
         "disable_grad_clip": False,
+        "packed_batch": False,
+        "model": "tiny",
+        "attention_backend": "auto",
     },
     "ep_full_eq": {
         "world_size": 8,
@@ -120,6 +129,8 @@ _BASE_ARGS: dict[str, dict[str, object]] = {
         "batch_size": 8,
         "seq_len": 32,
         "seed": 42,
+        "packed_batch": False,
+        "attention_backend": "auto",
     },
     "ep_full_resume": {
         "world_size": 8,
@@ -144,6 +155,8 @@ _BASE_ARGS: dict[str, dict[str, object]] = {
         "zero_stage": 3,
         "disable_precision": False,
         "disable_grad_clip": False,
+        "packed_batch": False,
+        "attention_backend": "auto",
     },
 }
 

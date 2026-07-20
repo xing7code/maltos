@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import gc
 import os
 from pathlib import Path
 import shutil
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 import torch
 import torch.distributed as dist
@@ -20,6 +22,7 @@ import tiny_transformer_ep_full_stack_resume as ep_full_resume
 import tiny_transformer_full_stack_equivalence as full_eq
 import tiny_transformer_full_stack_resume as full_resume
 from full_stack_matrix_cases import MODULE_SCRIPTS, MatrixCase, build_full_stack_matrix_cases
+from runtime.buffer_allocator import clear_buffer_pool
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _LOCAL_NOTES_DIR = _REPO_ROOT / "local_notes"
@@ -255,6 +258,17 @@ def _cleanup_checkpoint_dir(path: str | None) -> None:
     dist.barrier()
 
 
+def _reset_merged_case_state(device: torch.device | None) -> None:
+    """Clear process-local test state which a subprocess would discard."""
+    # RuntimeCore/plugin hooks form reference cycles.  Reclaim them before
+    # clearing the process-global test allocator so one case cannot retain or
+    # alias the next case's buffers.
+    gc.collect()
+    clear_buffer_pool()
+    if device is not None:
+        torch.cuda.empty_cache()
+
+
 def _run_merged_worker(rank: int, args: argparse.Namespace) -> None:
     case_names, blacklist_names = _resolve_case_names(args)
     device: torch.device | None = None
@@ -297,8 +311,7 @@ def _run_merged_worker(rank: int, args: argparse.Namespace) -> None:
                 _append_completed_case(args.completed_cases_file, case.name)
             finally:
                 _cleanup_checkpoint_dir(checkpoint_dir)
-                if device is not None:
-                    torch.cuda.empty_cache()
+                _reset_merged_case_state(device)
             dist.barrier()
         if rank == 0:
             print("Merged full-stack matrix PASS")
@@ -502,6 +515,11 @@ def run_grouped_merged_matrix(args: argparse.Namespace) -> None:
                     next_index += 1
                 remaining = []
             except BaseException as exc:
+                # The merged worker owns a single process group, so an error from
+                # one rank is surfaced here as ProcessRaisedException.  Preserve
+                # its nested worker traceback; otherwise every failure looks like
+                # an opaque rc=1 in the matrix report.
+                traceback.print_exc()
                 duration_sec = time.perf_counter() - start
                 completed_names = _read_completed_cases(completed_file)
                 completed_count = len(completed_names)
