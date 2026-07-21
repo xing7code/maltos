@@ -85,19 +85,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--packed-batch", action="store_true")
+    parser.add_argument("--moe-aux-loss-coef", type=float, default=0.0)
     add_attention_backend_arg(parser)
     return parser.parse_args()
 
 
-def _build_reference(seed: int, batch_size: int, seq_len: int, attention_backend: str) -> tuple[TinyMoETransformer, torch.Tensor]:
+def _model_kwargs(args: argparse.Namespace | None = None) -> dict:
+    return {
+        **_MODEL_KWARGS,
+        **({"moe_aux_loss_coef": args.moe_aux_loss_coef} if args is not None else {}),
+    }
+
+
+def _build_reference(
+    seed: int, batch_size: int, seq_len: int, attention_backend: str, args: argparse.Namespace
+) -> tuple[TinyMoETransformer, torch.Tensor]:
     torch.manual_seed(seed)
     tokens = torch.randint(0, _MODEL_KWARGS["vocab_size"], (batch_size, seq_len))
-    model = TinyMoETransformer(**_MODEL_KWARGS, attention_backend=attention_backend)
+    model = TinyMoETransformer(**_model_kwargs(args), attention_backend=attention_backend)
     return model, tokens
 
 
 def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
-    model = TinyMoETransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend)
+    model = TinyMoETransformerTpSp(**_model_kwargs(args), attention_backend=args.resolved_attention_backend)
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
@@ -124,7 +134,7 @@ def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Name
 
 
 def _make_runtime_core(reference_model: TinyMoETransformer, args: argparse.Namespace, device: torch.device | None = None) -> RuntimeCore:
-    model = TinyMoETransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend)
+    model = TinyMoETransformerTpSp(**_model_kwargs(args), attention_backend=args.resolved_attention_backend)
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
@@ -176,7 +186,9 @@ def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = 
         require_dense_block=args.cp_size > 1 and args.cp_attn_core == "ring",
         allow_flash=not (args.packed_batch and args.cp_size > 1 and args.cp_attn_core == "ring"),
     )
-    reference_model, tokens = _build_reference(args.seed, args.batch_size, args.seq_len, args.resolved_attention_backend)
+    reference_model, tokens = _build_reference(
+        args.seed, args.batch_size, args.seq_len, args.resolved_attention_backend, args
+    )
 
     baseline_core = _make_baseline_core(reference_model, args, device)
     runtime_core = _make_runtime_core(reference_model, args, device)
@@ -207,7 +219,9 @@ def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = 
         runtime_zero3 = next((plugin for plugin in runtime_core.plugins if isinstance(plugin, Zero3Plugin)), None)
         baseline_zero23 = next((p for p in baseline_core.plugins if isinstance(p, (Zero2Plugin, Zero3Plugin))), None)
         runtime_zero23 = next((p for p in runtime_core.plugins if isinstance(p, (Zero2Plugin, Zero3Plugin))), None)
-        shard_rules = _rule_by_param_name(TinyMoETransformerTpSp(**_MODEL_KWARGS, attention_backend=args.resolved_attention_backend))
+        shard_rules = _rule_by_param_name(
+            TinyMoETransformerTpSp(**_model_kwargs(args), attention_backend=args.resolved_attention_backend)
+        )
         baseline_tp_group = baseline_core.get_group(MeshAxis.TP)
         runtime_tp_group = runtime_core.get_group(MeshAxis.TP)
         baseline_pp_group = baseline_core.get_group(MeshAxis.PP)

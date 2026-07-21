@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
-from runtime.types import RuntimePhase
+from runtime.types import LossOutput, PipelineOutput, RuntimePhase
 
 if TYPE_CHECKING:
     from runtime.core import RuntimeCore
@@ -29,7 +29,15 @@ class DefaultStepRunner:
         try:
             outputs = runtime.model(batch)
             runtime.state.outputs = outputs
-            runtime.state.loss = outputs if torch.is_tensor(outputs) else None
+            if isinstance(outputs, LossOutput):
+                runtime.state.loss = outputs.loss
+                runtime.state.metadata["model_metrics"] = dict(outputs.metrics)
+            elif isinstance(outputs, PipelineOutput):
+                runtime.state.loss = None
+                runtime.state.metadata.pop("model_metrics", None)
+            else:
+                runtime.state.loss = outputs if torch.is_tensor(outputs) else None
+                runtime.state.metadata.pop("model_metrics", None)
         finally:
             runtime._run_step_phase(RuntimePhase.POST_FORWARD)
 
@@ -51,4 +59,17 @@ class DefaultStepRunner:
             if not torch.is_tensor(runtime.state.outputs):
                 raise TypeError("RuntimeCore expected runtime.state.outputs Tensor for activation backward()")
             runtime.state.outputs.backward(grad_output)
+        runtime._run_step_phase(RuntimePhase.POST_BACKWARD)
+
+    @staticmethod
+    def run_backward_many(
+        runtime: "RuntimeCore",
+        tensors: list[torch.Tensor],
+        grad_tensors: list[torch.Tensor],
+    ) -> None:
+        """Run one autograd traversal for activation and auxiliary gradients."""
+        if len(tensors) != len(grad_tensors):
+            raise ValueError("backward tensors and grad_tensors must have the same length")
+        runtime._run_step_phase(RuntimePhase.PRE_BACKWARD)
+        torch.autograd.backward(tensors=tensors, grad_tensors=grad_tensors)
         runtime._run_step_phase(RuntimePhase.POST_BACKWARD)

@@ -19,7 +19,7 @@ from utils.constants import (
 
 from runtime.buffer_allocator import BufferPolicy, acquire_buffer
 from runtime.step_runners.base import DefaultStepRunner
-from runtime.types import PpStatus
+from runtime.types import LossOutput, PipelineOutput, PpStatus
 from utils.distributed import all_reduce_tensor, irecv_tensor_async, isend_tensor_async
 
 if TYPE_CHECKING:
@@ -31,6 +31,7 @@ class PipelineMicroState:
     input_activation: torch.Tensor | None = None
     output_activation: torch.Tensor | None = None
     raw_loss: torch.Tensor | None = None
+    auxiliary_loss: torch.Tensor | None = None
     activation_send_buffer: torch.Tensor | None = None
     activation_send_work: object | None = None
     grad_send_buffer: torch.Tensor | None = None
@@ -69,15 +70,17 @@ class PipelineStepRunner:
             )
         states = [PipelineMicroState() for _ in range(num_microbatches)]
         total_loss: torch.Tensor | None = None
+        total_auxiliary_loss: torch.Tensor | None = None
 
         for action in self.build_schedule(num_microbatches):
             if action.kind == PipelineActionKind.FORWARD:
-                total_loss = self.run_forward_action(
+                total_loss, total_auxiliary_loss = self.run_forward_action(
                     runtime=runtime,
                     micro_batches=micro_batches,
                     states=states,
                     action=action,
                     total_loss=total_loss,
+                    total_auxiliary_loss=total_auxiliary_loss,
                 )
             else:
                 self.run_backward_action(
@@ -92,7 +95,12 @@ class PipelineStepRunner:
             if state.grad_send_work is not None:
                 state.grad_send_work.wait()
 
-        loss_out = self.broadcast_loss(runtime=runtime, total_loss=total_loss, batch=micro_batches[0])
+        loss_out = self.broadcast_loss(
+            runtime=runtime,
+            total_loss=total_loss,
+            total_auxiliary_loss=total_auxiliary_loss,
+            batch=micro_batches[0],
+        )
         runtime.state.loss = loss_out
         return loss_out
 
@@ -159,7 +167,8 @@ class PipelineStepRunner:
         states: list[PipelineMicroState],
         action: PipelineAction,
         total_loss: torch.Tensor | None,
-    ) -> torch.Tensor | None:
+        total_auxiliary_loss: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         context = runtime.state.step_context
         context.set_pp_state(microbatch_idx=action.microbatch_idx, status=PpStatus.FORWARD)
         micro_batch = micro_batches[action.microbatch_idx]
@@ -191,17 +200,38 @@ class PipelineStepRunner:
             if not torch.is_tensor(runtime.state.loss):
                 raise TypeError("last PP stage must return a Tensor loss")
             state.raw_loss = runtime.state.loss
-            return runtime.state.loss.detach() if total_loss is None else total_loss + runtime.state.loss.detach()
+            if isinstance(runtime.state.outputs, LossOutput) and runtime.state.outputs.auxiliary_loss is not None:
+                state.auxiliary_loss = runtime.state.outputs.auxiliary_loss
+                detached_auxiliary_loss = state.auxiliary_loss.detach()
+                total_auxiliary_loss = (
+                    detached_auxiliary_loss
+                    if total_auxiliary_loss is None
+                    else total_auxiliary_loss + detached_auxiliary_loss
+                )
+            return (
+                runtime.state.loss.detach() if total_loss is None else total_loss + runtime.state.loss.detach(),
+                total_auxiliary_loss,
+            )
 
-        if not torch.is_tensor(runtime.state.outputs):
-            raise TypeError("non-last PP stage must return Tensor activations")
-        boundary_activation = cast_boundary_activation(runtime.state.outputs, runtime)
+        if isinstance(runtime.state.outputs, PipelineOutput):
+            boundary_activation = cast_boundary_activation(runtime.state.outputs.activation, runtime)
+            state.auxiliary_loss = runtime.state.outputs.auxiliary_loss
+            detached_auxiliary_loss = state.auxiliary_loss.detach()
+            total_auxiliary_loss = (
+                detached_auxiliary_loss
+                if total_auxiliary_loss is None
+                else total_auxiliary_loss + detached_auxiliary_loss
+            )
+        elif torch.is_tensor(runtime.state.outputs):
+            boundary_activation = cast_boundary_activation(runtime.state.outputs, runtime)
+        else:
+            raise TypeError("non-last PP stage must return Tensor or PipelineOutput activations")
         runtime.state.outputs = boundary_activation
         state.output_activation = boundary_activation
         send_buffer, send_work = self.send_activation_async(boundary_activation.detach())
         state.activation_send_buffer = send_buffer
         state.activation_send_work = send_work
-        return total_loss
+        return total_loss, total_auxiliary_loss
 
     def run_backward_action(
         self,
@@ -235,14 +265,30 @@ class PipelineStepRunner:
         runtime.state.outputs = state.output_activation
         grad_output, recv_work = self.recv_grad_async(runtime, state.output_activation)
         recv_work.wait()
-        DefaultStepRunner.run_backward(runtime, grad_output=grad_output)
+        if state.auxiliary_loss is None:
+            DefaultStepRunner.run_backward(runtime, grad_output=grad_output)
+        else:
+            auxiliary_grad = torch.ones_like(state.auxiliary_loss)
+            auxiliary_grad /= float(num_microbatches) * context.loss_divisor
+            DefaultStepRunner.run_backward_many(
+                runtime,
+                tensors=[state.output_activation, state.auxiliary_loss],
+                grad_tensors=[grad_output, auxiliary_grad],
+            )
         if self.plugin.prev_global_rank is not None:
             assert state.input_activation is not None and state.input_activation.grad is not None
             send_buffer, send_work = self.send_grad_async(state.input_activation.grad.detach())
             state.grad_send_buffer = send_buffer
             state.grad_send_work = send_work
 
-    def broadcast_loss(self, *, runtime, total_loss: torch.Tensor | None, batch) -> torch.Tensor:
+    def broadcast_loss(
+        self,
+        *,
+        runtime,
+        total_loss: torch.Tensor | None,
+        total_auxiliary_loss: torch.Tensor | None,
+        batch,
+    ) -> torch.Tensor:
         device = model_device(runtime.model)
         if self.plugin.next_global_rank is None:
             assert total_loss is not None
@@ -256,6 +302,25 @@ class PipelineStepRunner:
             loss = torch.zeros((), device=device, dtype=torch.float32)
         if self.plugin.pp_group is not None and self.plugin.stage_count > 1:
             all_reduce_tensor(loss, op=dist.ReduceOp.SUM, group=self.plugin.pp_group)
+        if total_auxiliary_loss is None:
+            return loss
+
+        stage_auxiliary_loss = total_auxiliary_loss.float() / float(runtime.plan.pp_schedule.microbatches)
+        global_auxiliary_loss = stage_auxiliary_loss.clone()
+        if self.plugin.pp_group is not None and self.plugin.stage_count > 1:
+            all_reduce_tensor(global_auxiliary_loss, op=dist.ReduceOp.SUM, group=self.plugin.pp_group)
+        last_stage_auxiliary_loss = stage_auxiliary_loss if self.plugin.next_global_rank is None else torch.zeros_like(loss)
+        if self.plugin.pp_group is not None and self.plugin.stage_count > 1:
+            all_reduce_tensor(last_stage_auxiliary_loss, op=dist.ReduceOp.SUM, group=self.plugin.pp_group)
+        ce_loss = loss - last_stage_auxiliary_loss
+        total = ce_loss + global_auxiliary_loss
+        coeff = getattr(runtime.model, "moe_aux_loss_coef", 0.0)
+        runtime.state.metadata["model_metrics"] = {
+            "loss/ce": float(ce_loss.item()),
+            "moe/load_balance_loss": float((global_auxiliary_loss / coeff).item()) if coeff > 0 else 0.0,
+            "loss/total": float(total.item()),
+        }
+        return total
         return loss
 
     def recv_activation_async(self, runtime, batch) -> tuple[torch.Tensor, object]:

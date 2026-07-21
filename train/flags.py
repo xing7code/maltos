@@ -19,6 +19,7 @@ _RUNTIME_SPEC_MODEL_FIELDS = (
     "hidden_size",
     "n_layers",
     "num_experts",
+    "moe_aux_loss_coef",
     "vocab_size",
     "eps",
     "seq_len",
@@ -79,6 +80,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-size", type=int, default=1024)
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--num-experts", type=int, default=8)
+    parser.add_argument("--moe-aux-loss-coef", type=float, default=0.0)
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument("--eps", type=float, default=1e-5)
     parser.add_argument(
@@ -249,6 +251,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("model", "num_layers"): "n_layers",
         ("model", "n_layers"): "n_layers",
         ("model", "num_experts"): "num_experts",
+        ("model", "moe_aux_loss_coef"): "moe_aux_loss_coef",
         ("model", "num_heads"): "n_heads",
         ("model", "n_heads"): "n_heads",
         ("model", "num_kv_heads"): "n_kv_heads",

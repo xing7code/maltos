@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from parallel.expert_interfaces import ExpertParallelMoEModule
 from parallel.specs import ContextParallelSpec, ExpertParallelSpec, PipelineParallelSpec
 from parallel.specs import TpSpComm, TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
+from runtime.types import LossOutput, PipelineOutput
 from models.tiny_transformer import CausalSelfAttention, RmsNorm, RoPE, MLP
 from utils.attention_backend import AttentionBackend
 from utils.constants import (
@@ -42,7 +43,7 @@ class Top1MoE(nn.Module):
     def num_experts(self) -> int:
         return self._num_experts
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, return_aux_loss: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         batch, seq_len, hidden = x.shape
         flat = x.reshape(-1, hidden)
         router_logits = self.router(flat)
@@ -55,7 +56,11 @@ class Top1MoE(nn.Module):
             if not torch.any(mask):
                 continue
             out[mask] = expert(flat[mask]) * expert_weight[mask].unsqueeze(1)
-        return out.view(batch, seq_len, hidden)
+        output = out.view(batch, seq_len, hidden)
+        if not return_aux_loss:
+            return output
+        aux_loss = _top1_load_balance_loss(router_logits, expert_idx)
+        return output, aux_loss
 
 
 class MoETransformerBlock(nn.Module):
@@ -83,7 +88,8 @@ class MoETransformerBlock(nn.Module):
         position_offset: int = 0,
         position_ids: torch.Tensor | None = None,
         sequence_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_aux_loss: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         x = self.attn(
             self.norm1(x),
             cos,
@@ -92,8 +98,11 @@ class MoETransformerBlock(nn.Module):
             position_ids=position_ids,
             sequence_ids=sequence_ids,
         ) + x
-        x = self.moe(self.norm2(x)) + x
-        return x
+        moe_out = self.moe(self.norm2(x), return_aux_loss=return_aux_loss)
+        if not return_aux_loss:
+            return moe_out + x
+        moe_output, aux_loss = moe_out
+        return moe_output + x, aux_loss
 
 
 class TinyMoETransformer(nn.Module):
@@ -108,6 +117,7 @@ class TinyMoETransformer(nn.Module):
         vocab_size: int,
         max_seq_len: int,
         num_experts: int,
+        moe_aux_loss_coef: float = 0.0,
         attention_backend: str = AttentionBackend.EAGER,
     ) -> None:
         super().__init__()
@@ -129,6 +139,10 @@ class TinyMoETransformer(nn.Module):
         )
         self.norm = RmsNorm(dim, eps)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        if moe_aux_loss_coef < 0:
+            raise ValueError("moe_aux_loss_coef must be >= 0")
+        self.moe_aux_loss_coef = float(moe_aux_loss_coef)
+        self._total_moe_layers = n_layers
 
     def forward(self, batch):
         if isinstance(batch, dict):
@@ -168,16 +182,38 @@ class TinyMoETransformer(nn.Module):
             cos, sin = self.rope(position_offset, position_offset + seq_len)
         else:
             cos, sin = self.rope(position_ids=position_ids)
+        aux_losses: list[torch.Tensor] = []
+        collect_aux_loss = self.moe_aux_loss_coef > 0
         for layer in self.layers:
-            x = layer(
+            layer_out = layer(
                 x,
                 cos,
                 sin,
                 position_offset=position_offset,
                 position_ids=position_ids,
                 sequence_ids=sequence_ids,
+                return_aux_loss=collect_aux_loss,
             )
+            if collect_aux_loss:
+                if isinstance(layer_out, tuple):
+                    x, aux_loss = layer_out
+                    aux_losses.append(aux_loss)
+                else:
+                    # PP replaces layers owned by another stage with identity
+                    # modules. They intentionally carry no router loss.
+                    x = layer_out
+            else:
+                x = layer_out
+        if collect_aux_loss:
+            balance_loss = (
+                torch.stack(aux_losses).sum() / float(self._total_moe_layers)
+                if aux_losses
+                else x.new_zeros(())
+            )
+            auxiliary_loss = self.moe_aux_loss_coef * balance_loss
         if self.norm is None or self.lm_head is None:
+            if collect_aux_loss:
+                return PipelineOutput(activation=x, auxiliary_loss=auxiliary_loss)
             return x
         logits = self.lm_head(self.norm(x))
         if labels is None:
@@ -191,7 +227,18 @@ class TinyMoETransformer(nn.Module):
         )
         if loss_weight is not None:
             loss = loss * float(loss_weight)
-        return loss
+        if not collect_aux_loss:
+            return loss
+        total_loss = loss + auxiliary_loss
+        return LossOutput(
+            loss=total_loss,
+            metrics={
+                "loss/ce": float(loss.detach().float().item()),
+                "moe/load_balance_loss": float(balance_loss.detach().float().item()),
+                "loss/total": float(total_loss.detach().float().item()),
+            },
+            auxiliary_loss=auxiliary_loss,
+        )
 
     def expert_parallel_spec(self) -> ExpertParallelSpec:
         return ExpertParallelSpec(
@@ -253,3 +300,16 @@ class TinyMoETransformerTpSp(TinyMoETransformer):
 
 
 ExpertParallelMoEModule.register(Top1MoE)
+
+
+def _top1_load_balance_loss(router_logits: torch.Tensor, expert_idx: torch.Tensor) -> torch.Tensor:
+    """Switch-style top-1 router balance loss for one MoE layer.
+
+    The hard assignment fraction is deliberately detached; gradients flow only
+    through the mean router probabilities back into the router weights.
+    """
+    num_experts = router_logits.size(-1)
+    router_probs = router_logits.float().softmax(dim=-1)
+    expert_fraction = torch.nn.functional.one_hot(expert_idx, num_classes=num_experts).float().mean(dim=0).detach()
+    mean_router_prob = router_probs.mean(dim=0)
+    return num_experts * torch.sum(expert_fraction * mean_router_prob)

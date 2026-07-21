@@ -10,6 +10,23 @@ import torch
 MetricValue = float | int | str | bool | None
 
 
+@dataclass(frozen=True)
+class LossOutput:
+    """A differentiable training loss plus detached model-owned metrics."""
+
+    loss: torch.Tensor
+    metrics: dict[str, MetricValue]
+    auxiliary_loss: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class PipelineOutput:
+    """A pipeline-stage activation and its stage-local auxiliary loss."""
+
+    activation: torch.Tensor
+    auxiliary_loss: torch.Tensor
+
+
 class SetupPhase(str, Enum):
     # Structural rewrite only: plugins may replace/prune modules or swap
     # attention/parallel layer implementations, but should not allocate final

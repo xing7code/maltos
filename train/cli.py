@@ -103,6 +103,10 @@ def main() -> None:
         raise ValueError("--ep-size must divide --dp-size")
     if args.ep_size > 1 and args.model != "tiny_moe":
         raise ValueError("--ep-size > 1 requires --model tiny_moe")
+    if args.moe_aux_loss_coef < 0:
+        raise ValueError("--moe-aux-loss-coef must be >= 0")
+    if args.moe_aux_loss_coef > 0 and args.model != "tiny_moe":
+        raise ValueError("--moe-aux-loss-coef requires --model tiny_moe")
     if args.zero_stage > 0 and args.dp_size <= 1:
         raise ValueError("--zero-stage > 0 requires --dp-size > 1")
     if args.zero_stage > 0 and args.ddp_mode is not None:
@@ -231,6 +235,7 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
             vocab_size=args.vocab_size,
             max_seq_len=args.seq_len,
             num_experts=args.num_experts,
+            moe_aux_loss_coef=args.moe_aux_loss_coef,
             attention_backend=args.attention_backend,
         )
     cls = TinyTransformerTpSp if args.use_sp else TinyTransformerTp if args.tp_size > 1 else TinyTransformer

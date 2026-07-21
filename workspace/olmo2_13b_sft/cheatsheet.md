@@ -88,6 +88,28 @@ once. No checkpoint artifact upload is configured or enabled.
 wandb login
 ```
 
+## 1a. Full Distributed Regression Gate
+
+Run this while the SFT data is preparing in another shell. It uses all eight
+GPUs, but data preparation is CPU/network/disk-bound, so the two jobs can run
+concurrently. The repository's checked-in `matrix_whitelist.txt` intentionally
+contains a focused regression case; pass `/dev/null` explicitly here so this
+command runs the complete matrix rather than that one-case subset.
+
+```bash
+set -o pipefail
+
+BACKEND=nccl MERGE=1 CASE_TIMEOUT_SEC=180 \
+  WHITELIST=/dev/null BLACKLIST=/dev/null \
+  bash tests/run_matrix.sh 2>&1 | tee "$LOG_DIR/test_matrix.log"
+
+PYTHON_BIN=.venv/bin/python \
+  bash tests/run_smoke_regressions.sh 2>&1 | tee "$LOG_DIR/test_smoke.log"
+```
+
+Proceed only if both commands end in `PASS`. Merged matrix workers are bounded
+to eight cases, so the 16-case resume groups run as two isolated 8-case chunks.
+
 ## 2. Prepare the Exact SFT Data Snapshot
 
 The data preparation order is deterministic for the configured seed. Keep the

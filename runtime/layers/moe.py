@@ -68,7 +68,7 @@ class ExpertParallelMoE(nn.Module):
             ep_group=ep_group,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, return_aux_loss: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         batch, seq_len, hidden_size = x.shape
         flat = x.reshape(-1, hidden_size)
         router_logits = self.router(flat)
@@ -135,7 +135,11 @@ class ExpertParallelMoE(nn.Module):
 
         out = torch.zeros_like(flat)
         out.index_copy_(0, order, returned_outputs)
-        return out.view(batch, seq_len, hidden_size)
+        output = out.view(batch, seq_len, hidden_size)
+        if not return_aux_loss:
+            return output
+        aux_loss = _top1_load_balance_loss(router_logits, expert_idx)
+        return output, aux_loss
 
 
 def _exchange_counts(send_counts: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
@@ -149,3 +153,11 @@ def _exchange_counts(send_counts: torch.Tensor, group: dist.ProcessGroup) -> tor
         group=group,
     )
     return recv_counts
+
+
+def _top1_load_balance_loss(router_logits: torch.Tensor, expert_idx: torch.Tensor) -> torch.Tensor:
+    num_experts = router_logits.size(-1)
+    router_probs = router_logits.float().softmax(dim=-1)
+    expert_fraction = torch.nn.functional.one_hot(expert_idx, num_classes=num_experts).float().mean(dim=0).detach()
+    mean_router_prob = router_probs.mean(dim=0)
+    return num_experts * torch.sum(expert_fraction * mean_router_prob)

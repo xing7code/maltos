@@ -396,6 +396,14 @@ class RuntimeCore:
         metrics.update(self.state.static_metrics)
         if self.state.loss is not None:
             metrics["loss"] = float(self.state.loss.detach().float().item())
+        model_metrics = self.state.metadata.get("model_metrics")
+        if model_metrics is not None:
+            if not isinstance(model_metrics, dict):
+                raise TypeError("runtime model_metrics metadata must be a dict")
+            for key, value in model_metrics.items():
+                if key in metrics:
+                    raise ValueError(f"duplicate model metric key={key}")
+                metrics[key] = value
         tokens = self.state.metadata.get("tokens")
         if tokens is not None:
             metrics["train/tokens"] = _global_token_contribution(int(tokens), self.mesh)

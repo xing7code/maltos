@@ -59,6 +59,9 @@ echo "=== tiny model zero equivalence ==="
 "${PYTHON_BIN}" tests/tiny_model_zero_runtime_core_equivalence.py --zero-stage 3 --master-port 29522
 "${PYTHON_BIN}" tests/tiny_model_zero_runtime_core_equivalence.py --zero-stage 3 --grad-accum-steps 2 --master-port 29523
 
+echo "=== tiny MoE auxiliary loss ==="
+"${PYTHON_BIN}" tests/tiny_moe_aux_loss.py
+
 echo "=== grad clip global norm equivalence ==="
 "${PYTHON_BIN}" tests/tiny_model_zero_grad_clip_equivalence.py --zero-stage 1 --master-port 29545
 "${PYTHON_BIN}" tests/tiny_model_zero_grad_clip_equivalence.py --zero-stage 2 --master-port 29548
