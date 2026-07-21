@@ -112,3 +112,5 @@ jobs:
 
           python tests/tiny_transformer_tp_checkpoint_manifest.py \
             --master-port 29618
+
+          python tests/tiny_moe_aux_loss.py

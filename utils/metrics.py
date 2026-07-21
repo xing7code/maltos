@@ -228,7 +228,9 @@ def _sanitize_artifact_name(name: str) -> str:
 def _rule_for_key(key: str, rules: dict[str, MetricRule]) -> MetricRule:
     if key in rules:
         return rules[key]
-    if key == "loss" or key.endswith("/loss"):
+    # Keep loss namespaces (for example, loss/ce and loss/total) globally
+    # comparable instead of logging the last value from rank 0.
+    if key == "loss" or key.startswith("loss/") or key.endswith("/loss"):
         return MetricRule(MetricReduction.MEAN, MetricReduction.MEAN)
     if key == "lr" or key.endswith("/lr"):
         return MetricRule(MetricReduction.LAST, MetricReduction.RANK0)

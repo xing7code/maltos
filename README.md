@@ -518,7 +518,7 @@ PYTHONPATH=. .venv/bin/python tools/train.py \
 
 ## Current Boundaries
 
-- The runtime supports PP/CP/EP, but the current training CLI only exposes PP and CP. EP is exercised through tests, not recipe flags yet.
+- The training CLI exposes PP, CP, and EP. EP is currently supported for the `tiny_moe` model through `--ep-size`; other model families remain dense.
 - PP support is currently focused on decoder-only TinyTransformer/LLaMA partitioning and the maintained schedules in the test matrix.
 - CP is currently a v0 implementation with sequence-length divisibility requirements, and some gradient-sync logic is still coupled to the current ZeRO implementations.
 - Activation checkpointing is implemented for the LLaMA path; tiny models keep the simpler eager path.

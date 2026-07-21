@@ -11,7 +11,7 @@ from data import SimpleTensorDataLoader
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
 from train import Trainer, TrainerConfig
-from utils.metrics import MetricAggregator, MetricLogger, MetricReduction, MetricRule
+from utils.metrics import MetricAggregator, MetricLogger, MetricReduction, MetricRule, _rule_for_key
 
 
 class LossModel(nn.Module):
@@ -52,6 +52,12 @@ class CaptureCheckpointUploader:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_loss_namespace_metrics_use_global_mean_rule() -> None:
+    for key in ("loss", "loss/ce", "loss/total", "moe/load_balance_loss"):
+        rule = _rule_for_key(key, {})
+        assert rule == MetricRule(MetricReduction.MEAN, MetricReduction.MEAN)
 
 
 def _make_runtime(seed: int = 1234, grad_accum_steps: int = 1) -> RuntimeCore:
