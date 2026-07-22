@@ -20,6 +20,7 @@ __pycache__/
 # editor / agent config
 .claude/
 .cursor/
+.codex/
 
 # nccl debug logs (local triage artifacts)
 nccl_logs/
