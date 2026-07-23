@@ -130,6 +130,9 @@ _BASE_ARGS: dict[str, dict[str, object]] = {
         "seq_len": 32,
         "seed": 42,
         "packed_batch": False,
+        # Keep this parser default in the namespace: merged mode invokes
+        # run_case() directly instead of going through argparse.
+        "moe_aux_loss_coef": 0.0,
         "attention_backend": "auto",
     },
     "ep_full_resume": {
