@@ -38,7 +38,13 @@ class MetricPlugin(RuntimePlugin):
                 self._metrics.update(_cuda_memory_metrics())
 
     def collect_metrics(self) -> dict[str, MetricValue]:
-        return dict(self._metrics)
+        # RuntimeCore collects metrics after every microbatch. Step-scoped
+        # measurements are produced only after the optimizer update, so retain
+        # them for exactly that collection rather than replaying the previous
+        # step's value through the next accumulation window.
+        metrics = dict(self._metrics)
+        self._metrics.clear()
+        return metrics
 
 
 def _cuda_memory_metrics() -> dict[str, float]:
