@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.distributed as dist
@@ -323,6 +324,21 @@ class ZeroPluginBase(RuntimePlugin):
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
         global_norm = float(local_sq.sqrt().item())
+        if not math.isfinite(global_norm):
+            bad_buckets = []
+            for bucket in self.buckets:
+                grad = getattr(bucket.local_param, "grad", None)
+                if grad is None or torch.isfinite(grad).all():
+                    continue
+                names = list(getattr(bucket, "logical_names", ()))
+                bad_buckets.append(
+                    f"bucket={getattr(bucket, 'index', '?')} names={names[:4]}"
+                )
+            details = "; ".join(bad_buckets[:8]) or "no local non-finite shard found"
+            raise FloatingPointError(
+                "non-finite ZeRO gradient norm; refusing optimizer step to avoid inf * 0 -> NaN. "
+                f"Affected local shards: {details}"
+            )
         clip_coef = float(max_norm) / (global_norm + 1e-6)
         if clip_coef < 1.0:
             for bucket in self.buckets:
