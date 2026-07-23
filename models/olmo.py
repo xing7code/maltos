@@ -244,7 +244,7 @@ class OlmoForCausalLM(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             if self.training and self.config.activation_checkpointing.should_checkpoint_layer(layer_idx):
                 x = checkpoint(
-                    lambda y: layer(
+                    lambda y, layer=layer: layer(
                         y,
                         position_offset=position_offset,
                         position_ids=position_ids,
