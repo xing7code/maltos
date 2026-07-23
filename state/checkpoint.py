@@ -286,6 +286,10 @@ def load_sharded_checkpoint(
             else None
         )
     state_manager.import_model_state(model_state)
+    optimizer, _ = runtime.get_optimizer_and_scheduler()
+    sync_master_params = getattr(optimizer, "sync_master_params_from_model", None)
+    if callable(sync_master_params):
+        sync_master_params()
     if optim_state is not None:
         state_manager.import_optimizer_state(OptimizerState(state=optim_state))
     if trainer_state is not None:

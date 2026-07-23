@@ -55,6 +55,13 @@ class MasterWeightsOptimizer(torch.optim.Optimizer):
                 master_param.grad.copy_(master_grad)
         self._master_grads_copied = True
 
+    def sync_master_params_from_model(self) -> None:
+        """Refresh FP32 masters after model parameters were loaded externally."""
+        with torch.no_grad():
+            for model_param, master_param in zip(self.model_params, self.master_params, strict=True):
+                master_param.copy_(model_param.to(device=master_param.device, dtype=master_param.dtype))
+        self._master_grads_copied = False
+
     def step(self, closure=None):
         self.copy_master_params()
         loss = self._optimizer.step(closure)
