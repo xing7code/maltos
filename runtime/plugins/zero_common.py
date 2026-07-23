@@ -342,28 +342,6 @@ class ZeroPluginBase(RuntimePlugin):
                 "non-finite ZeRO gradient norm; refusing optimizer step to avoid inf * 0 -> NaN. "
                 f"Affected local shards: {details}"
             )
-        if global_norm > 1e20:
-            largest_local_grads: list[tuple[float, object, list[str]]] = []
-            for bucket in self.buckets:
-                grad = getattr(bucket.local_param, "grad", None)
-                if grad is None:
-                    continue
-                largest_local_grads.append(
-                    (
-                        float(grad.detach().abs().max().item()),
-                        getattr(bucket, "index", "?"),
-                        list(getattr(bucket, "logical_names", ())),
-                    )
-                )
-            largest_local_grads.sort(reverse=True, key=lambda item: item[0])
-            details = "; ".join(
-                f"bucket={index} max_abs={maximum:.3e} names={names[:4]}"
-                for maximum, index, names in largest_local_grads[:4]
-            )
-            raise FloatingPointError(
-                f"implausibly large ZeRO gradient norm={global_norm:.3e}; refusing optimizer step. "
-                f"Largest local shards: {details or 'none'}"
-            )
         clip_coef = float(max_norm) / (global_norm + 1e-6)
         if clip_coef < 1.0:
             for bucket in self.buckets:

@@ -24,6 +24,7 @@ from utils.constants import (
     POSITION_OFFSET_KEY,
     SEQUENCE_IDS_KEY,
 )
+from utils.losses import causal_cross_entropy
 
 
 @dataclass(frozen=True)
@@ -294,11 +295,7 @@ class LlamaForCausalLM(nn.Module):
             return logits
         if input_ids is not None and labels.shape != input_ids.shape:
             raise ValueError(f"labels shape must match input_ids shape, got {labels.shape} vs {input_ids.shape}")
-        loss = F.cross_entropy(
-            logits.contiguous().view(-1, logits.size(-1)),
-            labels.contiguous().view(-1),
-            ignore_index=IGNORE_INDEX,
-        )
+        loss = causal_cross_entropy(logits, labels)
         if loss_weight is not None:
             loss = loss * float(loss_weight)
         return loss

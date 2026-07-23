@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from parallel.expert_interfaces import ExpertParallelMoEModule
 from parallel.specs import ContextParallelSpec, ExpertParallelSpec, PipelineParallelSpec
@@ -20,6 +19,7 @@ from utils.constants import (
     POSITION_OFFSET_KEY,
     SEQUENCE_IDS_KEY,
 )
+from utils.losses import causal_cross_entropy
 
 
 class Top1MoE(nn.Module):
@@ -220,11 +220,7 @@ class TinyMoETransformer(nn.Module):
             return logits
         if input_ids is not None and labels.shape != input_ids.shape:
             raise ValueError(f"labels shape must match input_ids shape, got {labels.shape} vs {input_ids.shape}")
-        loss = F.cross_entropy(
-            logits.contiguous().view(-1, logits.size(-1)),
-            labels.contiguous().view(-1),
-            ignore_index=IGNORE_INDEX,
-        )
+        loss = causal_cross_entropy(logits, labels)
         if loss_weight is not None:
             loss = loss * float(loss_weight)
         if not collect_aux_loss:

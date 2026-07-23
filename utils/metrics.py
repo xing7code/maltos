@@ -210,14 +210,40 @@ class WandbCheckpointUploader:
 
 
 def _format_metrics(metrics: dict[str, MetricValue]) -> str:
-    parts = []
-    for key in sorted(metrics):
-        value = metrics[key]
-        if isinstance(value, float):
-            parts.append(f"{key}={value:.6g}")
-        else:
-            parts.append(f"{key}={value}")
-    return " ".join(parts)
+    """Render the common training metrics as one easy-to-scan console line.
+
+    Metrics are still recorded in full to JSONL and W&B.  Console output
+    deliberately prioritizes the values needed while watching a live run.
+    """
+    step = metrics.get("step")
+    prefix = f"step {int(step):05d}" if isinstance(step, int) else "step"
+    fields: list[str] = []
+
+    def add(key: str, label: str, formatter) -> None:
+        value = metrics.get(key)
+        if isinstance(value, (float, int)) and not isinstance(value, bool):
+            fields.append(f"{label} {formatter(float(value))}")
+
+    add("loss", "loss", lambda value: f"{value:.6g}")
+    add("lr", "lr", lambda value: f"{value:.2e}")
+    add("perf/step_sec", "step", lambda value: f"{value:.2f}s")
+    add("train/tokens_per_sec", "throughput", lambda value: f"{value:,.0f} tok/s")
+    add("perf/tflops_per_gpu", "compute", lambda value: f"{value:.1f} TF/GPU")
+    add("zero3/grad_norm", "grad-norm", lambda value: f"{value:.4g}")
+
+    allocated = metrics.get("memory/allocated_gb")
+    peak = metrics.get("memory/max_allocated_gb")
+    if isinstance(allocated, (float, int)) and isinstance(peak, (float, int)):
+        fields.append(f"memory {float(allocated):.1f}/{float(peak):.1f} GiB")
+
+    if fields:
+        return f"[{prefix}] " + " | ".join(fields)
+
+    return " ".join(f"{key}={_format_metric_value(value)}" for key, value in sorted(metrics.items()))
+
+
+def _format_metric_value(value: MetricValue) -> str:
+    return f"{value:.6g}" if isinstance(value, float) else str(value)
 
 
 def _sanitize_artifact_name(name: str) -> str:
