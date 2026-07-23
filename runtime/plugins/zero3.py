@@ -193,8 +193,8 @@ class Zero3Plugin(ZeroPluginBase):
     def _bucket_local_sq(self, bucket: _Bucket) -> torch.Tensor:
         assert self.runtime is not None
         if bucket.local_param.grad is None:
-            return torch.zeros((), dtype=torch.float32, device=bucket.local_param.device)
-        shard_sq = torch.zeros((), dtype=torch.float32, device=bucket.local_param.grad.device)
+            return torch.zeros((), dtype=torch.float64, device=bucket.local_param.device)
+        shard_sq = torch.zeros((), dtype=torch.float64, device=bucket.local_param.grad.device)
         local_shard_start = bucket.group_context.rank * bucket.local_param.numel()
         local_shard_end = local_shard_start + bucket.local_param.numel()
         offset = 0
@@ -207,7 +207,7 @@ class Zero3Plugin(ZeroPluginBase):
                 local_start = overlap_start - local_shard_start
                 local_end = overlap_end - local_shard_start
                 factor = self.runtime.grad_norm_replica_factor(param)
-                shard_sq.add_(bucket.local_param.grad[local_start:local_end].detach().float().pow(2).sum() / float(factor))
+                shard_sq.add_(bucket.local_param.grad[local_start:local_end].detach().double().pow(2).sum() / float(factor))
             offset = seg_end
         return shard_sq
 

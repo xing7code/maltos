@@ -318,7 +318,10 @@ class ZeroPluginBase(RuntimePlugin):
         if grad_device is None:
             return
 
-        local_sq = torch.zeros((), dtype=torch.float32, device=grad_device)
+        # A 13B model can overflow a float32 sum of otherwise finite squared
+        # gradients. Keep the norm accumulator in float64; NCCL supports the
+        # corresponding all-reduce and this runs once per optimizer step.
+        local_sq = torch.zeros((), dtype=torch.float64, device=grad_device)
         for bucket in self.buckets:
             local_sq.add_(self._bucket_local_sq(bucket))
         if dist.is_initialized() and dist.get_world_size() > 1:

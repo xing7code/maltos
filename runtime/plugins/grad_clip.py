@@ -62,14 +62,14 @@ class GradClipPlugin(RuntimePlugin):
     def _global_grad_norm(self, optimizer: torch.optim.Optimizer, params: list[torch.nn.Parameter]) -> float:
         assert self.runtime is not None
         device = params[0].grad.device
-        local_sq = torch.zeros((), dtype=torch.float32, device=device)
+        local_sq = torch.zeros((), dtype=torch.float64, device=device)
         model_param_for = getattr(optimizer, "model_param_for", None)
         for p in params:
             if p.grad is None:
                 continue
             logical_param = model_param_for(p) if callable(model_param_for) else p
             replica_factor = float(self.runtime.grad_norm_replica_factor(logical_param))
-            local_sq.add_(p.grad.detach().float().pow(2).sum() / replica_factor)
+            local_sq.add_(p.grad.detach().double().pow(2).sum() / replica_factor)
 
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
