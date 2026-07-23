@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from models.activation_checkpointing import ActivationCheckpointConfig
-from models.llama import LlamaMLP, LlamaRMSNorm, LlamaRotaryEmbedding, _LlamaAttentionCore, _apply_rotary, _repeat_kv
+from models.llama import LlamaMLP, LlamaRMSNorm, _LlamaAttentionCore, _repeat_kv
 from parallel.specs import ContextParallelSpec
 from parallel.specs import PipelineParallelSpec
 from parallel.specs import TpSpParallelSpec, TpSpShardAxis, TpSpShardRule
@@ -51,6 +51,51 @@ class OlmoRMSNorm(LlamaRMSNorm):
     pass
 
 
+class OlmoRotaryEmbedding(nn.Module):
+    """OLMo/OLMo2 RoPE using the Hugging Face ``rotate_half`` convention.
+
+    The frequencies are duplicated across the two halves of each attention
+    head, then rotation pairs the first half with the second half.  This is
+    intentionally distinct from the interleaved even/odd convention used by
+    some GPT-NeoX-family checkpoints: the two conventions have identical
+    tensor shapes but are not weight-compatible.
+    """
+
+    def __init__(self, head_dim: int, max_position_embeddings: int, base: float) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        positions = torch.arange(max_position_embeddings, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos", emb.cos(), persistent=False)
+        self.register_buffer("sin", emb.sin(), persistent=False)
+
+    def forward(
+        self,
+        start: int | None = None,
+        end: int | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if position_ids is not None:
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+            flat = position_ids.to(device=self.cos.device, dtype=torch.long).reshape(-1)
+            cos = self.cos.index_select(0, flat).view(*position_ids.shape, -1).unsqueeze(1)
+            sin = self.sin.index_select(0, flat).view(*position_ids.shape, -1).unsqueeze(1)
+            return cos, sin
+        if start is None or end is None:
+            raise ValueError("OlmoRotaryEmbedding requires either position_ids or start/end")
+        return self.cos[start:end].unsqueeze(0).unsqueeze(0), self.sin[start:end].unsqueeze(0).unsqueeze(0)
+
+
+def _apply_olmo_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    if x.size(-1) % 2 != 0:
+        raise ValueError(f"OLMo RoPE head dimension must be even, got {x.size(-1)}")
+    first, second = x.chunk(2, dim=-1)
+    rotate_half = torch.cat((-second, first), dim=-1)
+    return x * cos + rotate_half * sin
+
+
 class OlmoAttention(nn.Module):
     def __init__(self, config: OlmoConfig) -> None:
         super().__init__()
@@ -63,7 +108,7 @@ class OlmoAttention(nn.Module):
         if self.num_heads % self.num_kv_heads != 0:
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.rotary_emb = LlamaRotaryEmbedding(
+        self.rotary_emb = OlmoRotaryEmbedding(
             self.head_dim,
             config.max_position_embeddings,
             config.rope_theta,
@@ -110,8 +155,8 @@ class OlmoAttention(nn.Module):
         q = self.q_norm(self.q_proj(x)).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         k = self.k_norm(self.k_proj(x)).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
-        q = _apply_rotary(q, cos, sin)
-        k = _apply_rotary(k, cos, sin)
+        q = _apply_olmo_rotary(q, cos, sin)
+        k = _apply_olmo_rotary(k, cos, sin)
         repeats = q.size(1) // k.size(1)
         k = _repeat_kv(k, repeats)
         v = _repeat_kv(v, repeats)
