@@ -49,6 +49,8 @@ def test_manifest_includes_runtime_spec_and_convert_works_without_config() -> No
                 "1",
                 "--micro-batch-size",
                 "1",
+                "--grad-accum-steps",
+                "3",
             ],
             require_data=False,
         )
@@ -56,6 +58,8 @@ def test_manifest_includes_runtime_spec_and_convert_works_without_config() -> No
         runtime = _build_runtime(args, model, torch.device("cpu"))
         runtime.setup()
         try:
+            assert runtime.grad_accum_steps == 3
+            assert runtime.state.step_context.grad_accum_steps == 3
             save_runtime_spec(checkpoint_root, build_runtime_spec(args))
             save_sharded_checkpoint(runtime.state_manager, checkpoint_dir)
         finally:

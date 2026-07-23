@@ -325,6 +325,7 @@ def _build_runtime(
         device=device,
         dtype=runtime_dtype,
         model=model,
+        grad_accum_steps=args.grad_accum_steps,
         grad_clip_max_norm=grad_clip_max_norm,
         optimizer_factory=optimizer_factory,
         scheduler_factory=scheduler_factory,
