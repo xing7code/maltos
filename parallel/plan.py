@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .context_interfaces import ContextParallelAttentionCoreType
+from .context_token_planner import ContextTokenPlannerConfig
 
 
 class PipelineScheduleType(str, Enum):
@@ -23,6 +24,9 @@ class PipelineScheduleConfig:
 @dataclass(frozen=True)
 class ParallelPlan:
     cp_attn_core: ContextParallelAttentionCoreType = ContextParallelAttentionCoreType.ALL_GATHER_KV
+    # Placement policy is intentionally independent from the attention core.
+    # None preserves the pre-planner defaults for existing configurations.
+    cp_token_planner: ContextTokenPlannerConfig | None = None
     pp_schedule: PipelineScheduleConfig = field(default_factory=PipelineScheduleConfig)
     # EP dimension reuse: whether EP groups borrow TP/CP ranks before spilling into DP.
     # reuse_tp_for_ep requires SP to be enabled (TP ranks hold duplicate tokens otherwise).

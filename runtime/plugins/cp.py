@@ -14,6 +14,12 @@ from parallel.context_interfaces import (
     ContextParallelAttentionCore,
     ContextParallelAttentionCoreType,
 )
+from parallel.context_token_planner import (
+    ContextTokenPlanner,
+    FixedContiguousTokenPlanner,
+    FixedZigzagTokenPlanner,
+    build_context_token_planner,
+)
 from runtime.layers.all_gather_attention import AllGatherKvAttentionCore
 from runtime.layers.ring_attention import RingAttentionCore
 from runtime.mesh import MeshAxis
@@ -43,6 +49,7 @@ class ContextParallelPlugin(RuntimePlugin):
         )
         self._grad_sync_handles: list[object] = []
         self._use_param_hook_sync = False
+        self._token_planner: ContextTokenPlanner | None = None
 
     @property
     def cp_group(self) -> dist.ProcessGroup:
@@ -70,6 +77,7 @@ class ContextParallelPlugin(RuntimePlugin):
             and PluginId.ZERO2 not in active
             and PluginId.ZERO3 not in active
         )
+        self._token_planner = _resolve_context_token_planner(runtime.plan)
         self._validate_runtime_support()
 
     def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
@@ -177,7 +185,7 @@ class ContextParallelPlugin(RuntimePlugin):
                 self.runtime.state.batch,
                 rank=self.rank,
                 world_size=self.world_size,
-                attention_core_type=self.runtime.plan.cp_attn_core,
+                planner=self._token_planner,
             )
             return
         if phase == RuntimePhase.POST_BACKWARD:
@@ -257,17 +265,18 @@ def _shard_batch_for_cp(
     *,
     rank: int,
     world_size: int,
-    attention_core_type: ContextParallelAttentionCoreType,
+    attention_core_type: ContextParallelAttentionCoreType | None = None,
+    planner: ContextTokenPlanner | None = None,
 ) -> Any:
     if world_size == 1:
         return batch
     seq_len = _infer_seq_len(batch)
-    local_positions = _local_position_ids(
-        seq_len,
-        rank=rank,
-        world_size=world_size,
-        attention_core_type=attention_core_type,
-    )
+    if planner is None:
+        if attention_core_type is None:
+            raise ValueError("_shard_batch_for_cp requires a planner or attention_core_type")
+        planner = _legacy_context_token_planner(attention_core_type)
+    plan = planner.plan(seq_len=seq_len, world_size=world_size)
+    local_positions = plan.local_positions(rank)
     if isinstance(batch, dict):
         sharded = dict(batch)
         for key in (INPUT_IDS_KEY, LABELS_KEY, HIDDEN_STATES_KEY, POSITION_IDS_KEY, SEQUENCE_IDS_KEY):
@@ -344,37 +353,21 @@ def _infer_seq_len_from_sequence(batch: tuple[Any, ...] | list[Any]) -> int:
     raise TypeError("ContextParallelPlugin could not infer sequence length from tuple/list batch")
 
 
-def _local_seq_range(seq_len: int, rank: int, world_size: int) -> tuple[int, int]:
-    if seq_len % world_size != 0:
-        raise ValueError(
-            "ContextParallelPlugin v0 requires sequence length divisible by cp world size, "
-            f"got seq_len={seq_len}, cp={world_size}"
-        )
-    shard_len = seq_len // world_size
-    return rank * shard_len, shard_len
+def _resolve_context_token_planner(plan: Any) -> ContextTokenPlanner:
+    config = plan.cp_token_planner
+    if config is not None:
+        return build_context_token_planner(config)
+    return _legacy_context_token_planner(plan.cp_attn_core)
 
 
-def _local_position_ids(
-    seq_len: int,
-    *,
-    rank: int,
-    world_size: int,
+def _legacy_context_token_planner(
     attention_core_type: ContextParallelAttentionCoreType,
-) -> torch.Tensor:
-    if attention_core_type != ContextParallelAttentionCoreType.RING:
-        start, length = _local_seq_range(seq_len, rank, world_size)
-        return torch.arange(start, start + length, dtype=torch.long)
-    if seq_len % (2 * world_size) != 0:
-        raise ValueError(
-            "CP ring zigzag requires sequence length divisible by 2 * cp world size, "
-            f"got seq_len={seq_len}, cp={world_size}"
-        )
-    half_len = seq_len // (2 * world_size)
-    front_start = rank * half_len
-    back_start = (2 * world_size - rank - 1) * half_len
-    front = torch.arange(front_start, front_start + half_len, dtype=torch.long)
-    back = torch.arange(back_start, back_start + half_len, dtype=torch.long)
-    return torch.cat([front, back], dim=0)
+) -> ContextTokenPlanner:
+    if attention_core_type == ContextParallelAttentionCoreType.RING:
+        return FixedZigzagTokenPlanner()
+    if attention_core_type == ContextParallelAttentionCoreType.ALL_GATHER_KV:
+        return FixedContiguousTokenPlanner()
+    raise ValueError(f"unsupported CP attention_core={attention_core_type!r}")
 
 
 def _batch_reference_tensor(batch: dict[str, Any]) -> torch.Tensor | None:

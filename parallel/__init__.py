@@ -2,6 +2,16 @@ from .context_interfaces import (
     ContextParallelAttentionCore,
     ContextParallelAttentionCoreType,
 )
+from .context_token_planner import (
+    ContextTokenPlan,
+    ContextTokenPlanner,
+    ContextTokenPlannerConfig,
+    ContextTokenPlannerPhase,
+    ContextTokenPlannerType,
+    FixedContiguousTokenPlanner,
+    FixedZigzagTokenPlanner,
+    build_context_token_planner,
+)
 from .expert_interfaces import ExpertParallelMoEModule
 from .plan import ParallelPlan, PipelineScheduleConfig, PipelineScheduleType
 from .protocols import (
@@ -25,11 +35,19 @@ __all__ = [
     "ContextParallelSpec",
     "ContextParallelAttentionCore",
     "ContextParallelAttentionCoreType",
+    "ContextTokenPlan",
+    "ContextTokenPlanner",
+    "ContextTokenPlannerConfig",
+    "ContextTokenPlannerPhase",
+    "ContextTokenPlannerType",
     "ExpertParallelMoEModule",
     "ExpertParallelSpec",
     "ContextParallelizableModule",
     "ExpertParallelizableModule",
     "FlopsEstimatableModule",
+    "FixedContiguousTokenPlanner",
+    "FixedZigzagTokenPlanner",
+    "build_context_token_planner",
     "ParallelPlan",
     "PipelineParallelSpec",
     "PipelineScheduleConfig",
