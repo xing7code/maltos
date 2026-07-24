@@ -9,9 +9,10 @@ from typing import Any, Protocol
 import torch.distributed as dist
 
 from data.protocols import StatefulDataLoaderProtocol
+from data.prefetch import PrefetchDataLoader
 from runtime.core import RuntimeCore
 from state.checkpoint import save_runtime_spec, save_sharded_checkpoint
-from utils.metrics import MetricAggregator, MetricLogger
+from utils.metrics import MetricAggregator, MetricLogger, PendingMetricFlush
 
 
 class CheckpointUploader(Protocol):
@@ -30,6 +31,7 @@ class TrainerConfig:
     checkpoint_keep_last: int | None = None
     checkpoint_keep_every_n_steps: int | None = None
     checkpoint_min_free_gb: float | None = None
+    data_prefetch_batches: int = 0
 
 
 class Trainer:
@@ -63,14 +65,20 @@ class Trainer:
             )
         if config.checkpoint_min_free_gb is not None and config.checkpoint_min_free_gb < 0:
             raise ValueError(f"checkpoint_min_free_gb must be >= 0, got {config.checkpoint_min_free_gb}")
+        if config.data_prefetch_batches not in {0, 1}:
+            raise ValueError("data_prefetch_batches currently supports only 0 or 1")
         self.runtime = runtime
-        self.dataloader = dataloader
+        self.dataloader = PrefetchDataLoader(dataloader) if config.data_prefetch_batches else dataloader
         self.config = config
         self.loggers = _normalize_loggers(logger)
         self.metric_aggregator = metric_aggregator or MetricAggregator()
         self.checkpoint_uploader = checkpoint_uploader
         self.runtime_spec = runtime_spec
         self._last_logged_step = 0
+        # Metric collectives are launched at a logging boundary and consumed at
+        # the next one.  This keeps bookkeeping from forcing the GPU to idle
+        # before the next optimizer step while preserving the recorded step.
+        self._pending_log: PendingMetricFlush | None = None
 
     def setup(self) -> None:
         self.runtime.state_manager.bind_dataloader(self.dataloader)
@@ -94,14 +102,20 @@ class Trainer:
                 _, should_step = self.runtime.run_step(batch)
                 if should_step:
                     self.runtime.step_optimizer()
-                metrics = self.runtime.collect_metrics()
-                self.metric_aggregator.update(metrics)
                 if not should_step:
                     continue
+                # Step-scoped metrics are meaningful only here.  Avoiding the
+                # old per-microbatch collection removes 15/16 loss .item()
+                # synchronizations for a 16-way accumulation run.
+                self.metric_aggregator.update(self.runtime.collect_metrics())
                 self._maybe_log()
                 self._maybe_checkpoint()
+            self._flush_pending_log()
         finally:
             self.runtime.close()
+            close_dataloader = getattr(self.dataloader, "close", None)
+            if callable(close_dataloader):
+                close_dataloader()
             if self.checkpoint_uploader is not None:
                 self.checkpoint_uploader.close()
 
@@ -110,8 +124,20 @@ class Trainer:
         if step == 0 or step % self.config.log_every != 0:
             return
         step_delta = step - self._last_logged_step
-        metrics = self.metric_aggregator.flush(step_delta=step_delta)
         self._last_logged_step = step
+        pending = self.metric_aggregator.flush_async(step_delta=step_delta)
+        previous = self._pending_log
+        self._pending_log = pending
+        if previous is not None:
+            self._emit_metrics(previous.wait())
+
+    def _flush_pending_log(self) -> None:
+        pending = self._pending_log
+        self._pending_log = None
+        if pending is not None:
+            self._emit_metrics(pending.wait())
+
+    def _emit_metrics(self, metrics: dict[str, Any]) -> None:
         if not self.loggers:
             return
         if not _is_log_rank():

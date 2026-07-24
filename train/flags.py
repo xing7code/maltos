@@ -59,6 +59,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-dtype", type=str, default="uint32", choices=("uint16", "uint32", "int64"))
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--micro-batch-size", type=int, default=1)
+    parser.add_argument("--data-prefetch-batches", type=int, default=0, choices=(0, 1))
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
@@ -244,6 +245,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("data", "format"): "data_format",
         ("data", "seq_len"): "seq_len",
         ("data", "micro_batch_size"): "micro_batch_size",
+        ("data", "prefetch_batches"): "data_prefetch_batches",
         ("model", "type"): "model",
         ("model", "hidden_size"): "dim",
         ("model", "dim"): "dim",

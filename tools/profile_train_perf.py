@@ -60,6 +60,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from runtime.core import RuntimeCore
 from runtime.mesh import MeshConfig
+from data import PrefetchDataLoader
 from train import cli as train_cli
 from train.flags import build_arg_parser, build_runtime_spec, parse_args_from, parse_runtime_spec_args
 from utils.constants import (
@@ -643,6 +644,8 @@ def _run(train_args: argparse.Namespace, tool_args: argparse.Namespace, case: Ca
             if not train_args.data:
                 raise ValueError("--data-source recipe requires recipe --data (or pass it after --)")
             data_paths, batches, data_format = train_cli._build_dataloader(train_args, dp_rank=dp_rank)
+            if train_args.data_prefetch_batches:
+                batches = PrefetchDataLoader(batches)
             if rank == 0:
                 print(
                     f"real data loader: format={data_format} paths={len(data_paths)} first={data_paths[0]}",
@@ -705,6 +708,10 @@ def _run(train_args: argparse.Namespace, tool_args: argparse.Namespace, case: Ca
                 profiled=tool_args.profile,
             )
     finally:
+        close_batches = locals().get("batches")
+        close_loader = getattr(close_batches, "close", None)
+        if callable(close_loader):
+            close_loader()
         if core is not None:
             core.close()
         if dist.is_initialized():

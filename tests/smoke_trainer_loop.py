@@ -181,7 +181,10 @@ def test_trainer_collects_each_microbatch_metric() -> None:
 
     assert len(logger.records) == 1
     assert logger.records[0]["step"] == 1
-    assert abs(float(logger.records[0]["loss"]) - 1.0) < 1e-8
+    # Logging preserves the *unscaled* mean loss.  The backward pass divides
+    # each microbatch by grad_accum_steps, but that implementation detail must
+    # not leak into telemetry.
+    assert abs(float(logger.records[0]["loss"]) - 2.0) < 1e-8
 
 
 def test_trainer_checkpoint_resume_matches_continuous() -> None:
@@ -224,6 +227,54 @@ def test_trainer_checkpoint_resume_matches_continuous() -> None:
             actual = _params(restored.model)[name]
             if not torch.allclose(actual, expected, atol=1e-6, rtol=0):
                 raise AssertionError(f"param mismatch for {name}: max_diff={(actual - expected).abs().max().item()}")
+
+
+def test_trainer_prefetch_checkpoint_resume_matches_continuous() -> None:
+    """A checkpoint must not skip the batch already being prefetched."""
+    with tempfile.TemporaryDirectory() as tmp:
+        checkpoint_dir = Path(tmp) / "ckpts"
+
+        continuous = _make_runtime()
+        continuous_trainer = Trainer(
+            runtime=continuous,
+            dataloader=_make_loader(),
+            config=TrainerConfig(max_steps=3, data_prefetch_batches=1),
+        )
+        continuous_trainer.setup()
+        continuous_trainer.fit()
+
+        interrupted = _make_runtime()
+        interrupted_trainer = Trainer(
+            runtime=interrupted,
+            dataloader=_make_loader(),
+            config=TrainerConfig(
+                max_steps=2,
+                checkpoint_every=2,
+                checkpoint_dir=checkpoint_dir,
+                data_prefetch_batches=1,
+            ),
+            runtime_spec=test_runtime_spec("trainer_prefetch_resume"),
+        )
+        interrupted_trainer.setup()
+        interrupted_trainer.fit()
+
+        restored = _make_runtime(seed=9999)
+        restored_trainer = Trainer(
+            runtime=restored,
+            dataloader=_make_loader(),
+            config=TrainerConfig(
+                max_steps=3,
+                resume_from=checkpoint_dir / "step_00000002",
+                data_prefetch_batches=1,
+            ),
+        )
+        restored_trainer.setup()
+        restored_trainer.fit()
+
+        for name, expected in _params(continuous.model).items():
+            actual = _params(restored.model)[name]
+            if not torch.allclose(actual, expected, atol=1e-6, rtol=0):
+                raise AssertionError(f"prefetch resume mismatch for {name}: max_diff={(actual - expected).abs().max().item()}")
 
 
 def test_trainer_checkpoint_uploader_follows_upload_cadence() -> None:
@@ -314,6 +365,7 @@ def main() -> None:
     test_trainer_aggregates_metrics_over_log_interval()
     test_trainer_collects_each_microbatch_metric()
     test_trainer_checkpoint_resume_matches_continuous()
+    test_trainer_prefetch_checkpoint_resume_matches_continuous()
     test_trainer_checkpoint_uploader_follows_upload_cadence()
     test_trainer_checkpoint_retention()
     test_trainer_checkpoint_min_free_space_raises()

@@ -54,18 +54,19 @@ class MetricAggregator:
             self._values.setdefault(key, []).append(value)
 
     def flush(self, *, step_delta: int | None = None) -> dict[str, MetricValue]:
+        return self.flush_async(step_delta=step_delta).wait()
+
+    def flush_async(self, *, step_delta: int | None = None) -> "PendingMetricFlush":
         local_metrics = {
             key: _reduce_local(values, _rule_for_key(key, self.rules).local)
             for key, values in self._values.items()
         }
         self._values.clear()
-        metrics = {
-            key: self.syncer.reduce_value(value, _rule_for_key(key, self.rules).distributed)
-            for key, value in local_metrics.items()
-        }
-        _apply_step_reductions(metrics, self.rules, step_delta=step_delta)
-        _add_derived_metrics(metrics)
-        return metrics
+        pending = self.syncer.reduce_metrics_async(
+            local_metrics,
+            {key: _rule_for_key(key, self.rules).distributed for key in local_metrics},
+        )
+        return PendingMetricFlush(pending, self.rules, step_delta)
 
     def has_values(self) -> bool:
         return bool(self._values)
@@ -97,6 +98,82 @@ class DistributedMetricSync:
         if reduction == MetricReduction.LAST:
             return value
         raise ValueError(f"unsupported distributed metric reduction={reduction.value}")
+
+    def reduce_metrics_async(
+        self, metrics: dict[str, MetricValue], reductions: dict[str, MetricReduction]
+    ) -> "PendingMetricSync":
+        result: dict[str, MetricValue] = {}
+        pending: list[tuple[torch.Tensor, object, list[tuple[str, float]], bool]] = []
+        numeric: dict[MetricReduction, list[tuple[str, float]]] = {MetricReduction.SUM: [], MetricReduction.MAX: []}
+        any_values: list[tuple[str, float]] = []
+        if not dist.is_initialized():
+            return PendingMetricSync({key: self.reduce_value(value, reductions[key]) for key, value in metrics.items()}, pending, reductions)
+        for key, value in metrics.items():
+            reduction = reductions[key]
+            if reduction in {MetricReduction.NONE, MetricReduction.RANK0, MetricReduction.LAST} or value is None or not isinstance(value, (float, int, bool)):
+                result[key] = value
+            elif reduction == MetricReduction.MEAN:
+                numeric[MetricReduction.SUM].append((key, float(value)))
+            elif reduction in numeric:
+                numeric[reduction].append((key, float(value)))
+            elif reduction == MetricReduction.ANY:
+                any_values.append((key, float(bool(value))))
+            else:
+                raise ValueError(f"unsupported distributed metric reduction={reduction.value}")
+        for reduction, values in numeric.items():
+            if values:
+                packed = torch.tensor([v for _, v in values], dtype=torch.float64, device=_distributed_metric_device())
+                work = dist.all_reduce(packed, op=dist.ReduceOp.SUM if reduction == MetricReduction.SUM else dist.ReduceOp.MAX, async_op=True)
+                pending.append((packed, work, values, False))
+        if any_values:
+            packed_any = torch.tensor(
+                [int(value) for _, value in any_values],
+                dtype=torch.int64,
+                device=_distributed_metric_device(),
+            )
+            work = dist.all_reduce(packed_any, op=dist.ReduceOp.MAX, async_op=True)
+            pending.append((packed_any, work, any_values, True))
+        return PendingMetricSync(result, pending, reductions)
+
+    def reduce_metrics(
+        self,
+        metrics: dict[str, MetricValue],
+        reductions: dict[str, MetricReduction],
+    ) -> dict[str, MetricValue]:
+        """Compatibility wrapper for callers that need metrics immediately."""
+        return self.reduce_metrics_async(metrics, reductions).wait()
+
+
+@dataclass
+class PendingMetricSync:
+    result: dict[str, MetricValue]
+    pending: list[tuple[torch.Tensor, object, list[tuple[str, float]], bool]]
+    reductions: dict[str, MetricReduction]
+
+    def wait(self) -> dict[str, MetricValue]:
+        for packed, work, values, as_bool in self.pending:
+            work.wait()
+            for (key, _), value in zip(values, packed.tolist(), strict=True):
+                reduction = self.reductions[key]
+                if as_bool:
+                    self.result[key] = bool(value)
+                else:
+                    self.result[key] = value / dist.get_world_size() if reduction == MetricReduction.MEAN else value
+        self.pending.clear()
+        return self.result
+
+
+@dataclass
+class PendingMetricFlush:
+    sync: PendingMetricSync
+    rules: dict[str, MetricRule]
+    step_delta: int | None
+
+    def wait(self) -> dict[str, MetricValue]:
+        metrics = self.sync.wait()
+        _apply_step_reductions(metrics, self.rules, step_delta=self.step_delta)
+        _add_derived_metrics(metrics)
+        return metrics
 
 
 def _distributed_metric_device() -> torch.device:

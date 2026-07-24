@@ -27,6 +27,9 @@ echo "=== smoke/runtime core ==="
 echo "=== smoke/trainer loop ==="
 "${PYTHON_BIN}" tests/smoke_trainer_loop.py
 
+echo "=== async distributed metrics ==="
+"${PYTHON_BIN}" tests/metric_async_distributed.py
+
 echo "=== smoke/train cli ==="
 "${PYTHON_BIN}" tests/smoke_train_cli.py
 

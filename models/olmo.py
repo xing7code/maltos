@@ -144,14 +144,18 @@ class OlmoAttention(nn.Module):
         position_offset: int = 0,
         position_ids: torch.Tensor | None = None,
         sequence_ids: torch.Tensor | None = None,
+        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
-        if position_ids is None:
-            cos, sin = self.rotary_emb(position_offset, position_offset + seq_len)
+        if rotary is None:
+            if position_ids is None:
+                cos, sin = self.rotary_emb(position_offset, position_offset + seq_len)
+            else:
+                cos, sin = self.rotary_emb(position_ids=position_ids)
+            cos = cos.to(device=x.device, dtype=x.dtype)
+            sin = sin.to(device=x.device, dtype=x.dtype)
         else:
-            cos, sin = self.rotary_emb(position_ids=position_ids)
-        cos = cos.to(device=x.device, dtype=x.dtype)
-        sin = sin.to(device=x.device, dtype=x.dtype)
+            cos, sin = rotary
         q = self.q_norm(self.q_proj(x)).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         k = self.k_norm(self.k_proj(x)).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
@@ -179,6 +183,7 @@ class OlmoDecoderLayer(nn.Module):
         position_offset: int = 0,
         position_ids: torch.Tensor | None = None,
         sequence_ids: torch.Tensor | None = None,
+        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         residual = x
         x = self.self_attn(
@@ -186,6 +191,7 @@ class OlmoDecoderLayer(nn.Module):
             position_offset=position_offset,
             position_ids=position_ids,
             sequence_ids=sequence_ids,
+            rotary=rotary,
         )
         x = self.post_attention_layernorm(x)
         x = residual + x
@@ -202,6 +208,15 @@ class OlmoForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # RoPE values depend only on the current positions and head dimension,
+        # not on the transformer layer.  Keep one cache at model scope so a
+        # packed SFT forward does two gathers total, rather than two gathers
+        # per decoder layer.
+        self.rotary_emb = OlmoRotaryEmbedding(
+            config.hidden_size // config.num_attention_heads,
+            config.max_position_embeddings,
+            config.rope_theta,
+        )
         self.layers = nn.ModuleList([OlmoDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = OlmoRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -241,6 +256,14 @@ class OlmoForCausalLM(nn.Module):
                 raise ValueError("OlmoForCausalLM PP non-first stage requires hidden_states input")
             x = self.embed_tokens(input_ids)
 
+        rotary: tuple[torch.Tensor, torch.Tensor] | None = None
+        if position_ids is not None:
+            cos, sin = self.rotary_emb(position_ids=position_ids)
+            rotary = (
+                cos.to(device=x.device, dtype=x.dtype),
+                sin.to(device=x.device, dtype=x.dtype),
+            )
+
         for layer_idx, layer in enumerate(self.layers):
             if self.training and self.config.activation_checkpointing.should_checkpoint_layer(layer_idx):
                 x = checkpoint(
@@ -249,13 +272,20 @@ class OlmoForCausalLM(nn.Module):
                         position_offset=position_offset,
                         position_ids=position_ids,
                         sequence_ids=sequence_ids,
+                        rotary=rotary,
                     ),
                     x,
                     use_reentrant=False,
                     context_fn=activation_checkpoint_context_fn,
                 )
             else:
-                x = layer(x, position_offset=position_offset, position_ids=position_ids, sequence_ids=sequence_ids)
+                x = layer(
+                    x,
+                    position_offset=position_offset,
+                    position_ids=position_ids,
+                    sequence_ids=sequence_ids,
+                    rotary=rotary,
+                )
         if self.norm is None or self.lm_head is None:
             return x
         logits = self.lm_head(self.norm(x))

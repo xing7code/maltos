@@ -51,6 +51,10 @@ class DefaultStepRunner:
         if grad_output is None:
             if runtime.state.loss is None:
                 raise TypeError("RuntimeCore expected runtime.state.loss to be a Tensor before backward()")
+            # Keep the unscaled loss for telemetry.  ``state.loss`` is divided
+            # by grad accumulation below, so reading it after backward reports
+            # a misleading loss/grad_accum value.
+            runtime.state.metadata["raw_loss_for_metrics"] = runtime.state.loss.detach().float()
             divisor = runtime.state.step_context.loss_divisor
             if divisor != 1:
                 runtime.state.loss = runtime.state.loss / divisor

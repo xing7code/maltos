@@ -143,6 +143,7 @@ def main() -> None:
             checkpoint_keep_last=args.checkpoint_keep_last,
             checkpoint_keep_every_n_steps=args.checkpoint_keep_every_n_steps,
             checkpoint_min_free_gb=args.checkpoint_min_free_gb,
+            data_prefetch_batches=args.data_prefetch_batches,
         ),
         logger=logger,
         checkpoint_uploader=checkpoint_uploader,

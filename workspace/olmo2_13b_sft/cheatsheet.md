@@ -361,7 +361,8 @@ torchrun --nproc_per_node=8 \
   tools/profile_train_perf.py \
   --case olmo2_13b_sft_real_data \
   --warmup 40 --steps 5 --profile \
-  --output-dir "$PROJECT_DIR/profiles/real-data-profile"
+  --output-dir "$PROJECT_DIR/profiles/real-data-profile" \
+  -- --data-prefetch-batches 1
 
 # A tiny compatible packed SFT dataset is enough: override the recipe source
 # with its meta.json. SFTDataLoader automatically wraps when it reaches the

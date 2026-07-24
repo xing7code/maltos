@@ -156,6 +156,7 @@ class RuntimeCore:
         context = self.state.step_context
         self._run_step_phase(RuntimePhase.PRE_STEP_RUNNER)
         loss = self._step_runner.run(self, self.state.batch)
+        self._accumulate_loss_metric()
         should_step = context.advance_micro_step()
         return loss, should_step
 
@@ -394,7 +395,14 @@ class RuntimeCore:
             "step": context.step,
         }
         metrics.update(self.state.static_metrics)
-        if self.state.loss is not None:
+        metric_loss = self.state.metadata.get("loss_sum_for_metrics")
+        metric_loss_count = self.state.metadata.get("loss_count_for_metrics", 0)
+        if torch.is_tensor(metric_loss) and isinstance(metric_loss_count, int) and metric_loss_count > 0:
+            # This is intentionally the sole host read for loss per optimizer
+            # step.  The individual micro-batch losses stay on device and are
+            # averaged before being observed by the logger.
+            metrics["loss"] = float((metric_loss / metric_loss_count).item())
+        elif self.state.loss is not None:
             metrics["loss"] = float(self.state.loss.detach().float().item())
         model_metrics = self.state.metadata.get("model_metrics")
         if model_metrics is not None:
@@ -421,6 +429,27 @@ class RuntimeCore:
                     raise ValueError(f"duplicate metric key={metric_key}")
                 metrics[metric_key] = value
         return metrics
+
+    def _accumulate_loss_metric(self) -> None:
+        raw_loss = self.state.metadata.pop("raw_loss_for_metrics", None)
+        if not torch.is_tensor(raw_loss):
+            return
+        context = self.state.step_context
+        if context.accum_start:
+            self.state.metadata["loss_sum_for_metrics"] = raw_loss.clone()
+            self.state.metadata["loss_count_for_metrics"] = 1
+            return
+        loss_sum = self.state.metadata.get("loss_sum_for_metrics")
+        loss_count = self.state.metadata.get("loss_count_for_metrics")
+        if not torch.is_tensor(loss_sum) or not isinstance(loss_count, int):
+            # The runtime state checkpoint deliberately excludes ephemeral
+            # telemetry.  A mid-accumulation resume therefore starts a fresh
+            # reporting window rather than affecting training correctness.
+            self.state.metadata["loss_sum_for_metrics"] = raw_loss.clone()
+            self.state.metadata["loss_count_for_metrics"] = 1
+            return
+        loss_sum.add_(raw_loss)
+        self.state.metadata["loss_count_for_metrics"] = loss_count + 1
 
     def build_step_runner(self) -> "StepRunner | None":
         return DefaultStepRunner()
