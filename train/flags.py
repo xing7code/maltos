@@ -42,6 +42,9 @@ _RUNTIME_SPEC_RUNTIME_FIELDS = (
     "ddp_mode",
     "precision",
     "use_sp",
+    "compile",
+    "compile_scope",
+    "compile_mode",
 )
 
 
@@ -110,6 +113,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ddp-mode", type=str, default=None, choices=("sync", "async", "bucket"))
     parser.add_argument("--precision", type=str, default="fp32", choices=("fp32", "bf16", "fp16"))
     parser.add_argument("--grad-clip", type=float, default=None)
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="experimental torch.compile of a model-declared scope",
+    )
+    parser.add_argument("--compile-scope", type=str, default="mlp")
+    parser.add_argument("--compile-mode", type=str, default="default")
     parser.add_argument("--disable-metrics", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--torch-profiler", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--torch-profiler-dir", type=str, default="traces/train")
@@ -288,6 +299,9 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("training", "min_lr"): "min_lr",
         ("training", "precision"): "precision",
         ("training", "grad_clip"): "grad_clip",
+        ("compile", "enabled"): "compile",
+        ("compile", "scope"): "compile_scope",
+        ("compile", "mode"): "compile_mode",
         ("training", "disable_metrics"): "disable_metrics",
         ("profiling", "torch_profiler"): "torch_profiler",
         ("profiling", "torch_profiler_dir"): "torch_profiler_dir",

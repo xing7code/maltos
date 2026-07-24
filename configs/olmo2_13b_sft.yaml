@@ -25,6 +25,12 @@ model:
   activation_checkpointing: true
   activation_checkpoint_every_n_layers: 1
 
+# Experimental: model-declared compile scopes run after TP/CP/ZeRO has
+# installed its module hooks. Keep this off for the reference run; enable it
+# only for an eager-vs-compile performance A/B.
+compile:
+  enabled: false
+
 parallel:
   dp_size: 4
   tp_size: 2

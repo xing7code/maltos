@@ -39,6 +39,7 @@ class PluginId(str, Enum):
     CHECKPOINT = "checkpoint"
     METRICS = "metrics"
     TORCH_PROFILER = "torch_profiler"
+    COMPILE = "compile"
 
 
 @runtime_checkable

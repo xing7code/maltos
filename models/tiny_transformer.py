@@ -294,6 +294,9 @@ class TinyTransformer(nn.Module):
             attention_paths=[f"layers.{i}.attn" for i in range(len(self.layers))],
         )
 
+    def compile_spec(self) -> dict[str, list[str]]:
+        return {"mlp": [f"layers.{i}.mlp" for i in range(len(self.layers))]}
+
 class TinyTransformerTp(TinyTransformer):
     
     def tpsp_parallelize_spec(self):

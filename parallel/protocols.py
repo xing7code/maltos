@@ -21,6 +21,11 @@ class ContextParallelizableModule(Protocol):
 
 
 @runtime_checkable
+class CompilableModule(Protocol):
+    def compile_spec(self) -> dict[str, list[str]]: ...
+
+
+@runtime_checkable
 class ExpertParallelizableModule(Protocol):
     def expert_parallel_spec(self) -> ExpertParallelSpec: ...
 

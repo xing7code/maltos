@@ -43,6 +43,7 @@ from runtime import MeshConfig, RuntimeCore
 from runtime.layers.distributed_rmsnorm import DistributedRMSNorm
 from runtime.plugins.ddp import BucketDataParallelPlugin, DataParallelPlugin
 from runtime.plugins.cp import ContextParallelPlugin
+from runtime.plugins.compile import CompilePlugin
 from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.metrics import MetricPlugin
@@ -291,6 +292,13 @@ def _build_runtime(
                 wrap_cls=_ZERO3_WRAP_CLS,
             )
         )
+    if args.compile:
+        plugins.append(
+            CompilePlugin(
+                scope=args.compile_scope,
+                mode=args.compile_mode,
+            )
+        )
     runtime_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
     if runtime_dtype == torch.float16:
         plugins.append(Fp16Plugin())
@@ -480,6 +488,11 @@ def _print_run_summary(
         f"activation_checkpointing={args.activation_checkpointing} "
         f"activation_checkpoint_every_n_layers={args.activation_checkpoint_every_n_layers}"
     )
+    print(
+        "compile="
+        f"enabled={args.compile} scope={args.compile_scope} "
+        f"backend=inductor mode={args.compile_mode}"
+    )
     print(f"tokens_per_step={global_batch_tokens:,} target_tokens={total_train_tokens:,}")
     print(
         "performance="
@@ -587,6 +600,12 @@ def _build_run_manifest(
                 "attention_backend": args.attention_backend,
                 "activation_checkpointing": args.activation_checkpointing,
                 "activation_checkpoint_every_n_layers": args.activation_checkpoint_every_n_layers,
+                "compile": {
+                    "enabled": args.compile,
+                    "scope": args.compile_scope,
+                    "backend": "inductor",
+                    "mode": args.compile_mode,
+                },
             },
             "optimizer": {
                 "type": type(optimizer).__name__ if optimizer is not None else None,

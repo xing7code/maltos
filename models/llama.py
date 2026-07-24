@@ -312,6 +312,9 @@ class LlamaForCausalLM(nn.Module):
             attention_paths=[f"layers.{i}.self_attn" for i in range(len(self.layers))],
         )
 
+    def compile_spec(self) -> dict[str, list[str]]:
+        return {"mlp": [f"layers.{i}.mlp" for i in range(len(self.layers))]}
+
     def flops_per_token(self) -> float:
         hidden = self.config.hidden_size
         intermediate = self.config.intermediate_size

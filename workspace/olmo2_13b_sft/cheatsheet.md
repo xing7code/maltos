@@ -334,6 +334,18 @@ torchrun --nproc_per_node=8 \
   --case olmo2_13b_sft_packed \
   --output-dir "$PROJECT_DIR/profiles/packed-baseline"
 
+# Experimental compiler A/B: same synthetic packed case and shape as above.
+# Compare summary.json against packed-baseline; compilation happens on the
+# first calls, so do not include startup/first-step latency in the comparison.
+torchrun --nproc_per_node=8 \
+  --master_addr 127.0.0.1 \
+  --master_port "$MASTER_PORT" \
+  tools/profile_train_perf.py \
+  --case olmo2_13b_sft_packed \
+  --warmup 20 --steps 10 \
+  --output-dir "$PROJECT_DIR/profiles/packed-compile-mlp" \
+  -- --compile --compile-scope mlp --compile-mode default
+
 # Capture rank 0 only (much smaller than an all-rank trace).
 torchrun --nproc_per_node=8 \
   --master_addr 127.0.0.1 \

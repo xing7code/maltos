@@ -15,6 +15,7 @@ from .context_token_planner import (
 from .expert_interfaces import ExpertParallelMoEModule
 from .plan import ParallelPlan, PipelineScheduleConfig, PipelineScheduleType
 from .protocols import (
+    CompilableModule,
     ContextParallelizableModule,
     ExpertParallelizableModule,
     FlopsEstimatableModule,
@@ -43,6 +44,7 @@ __all__ = [
     "ExpertParallelMoEModule",
     "ExpertParallelSpec",
     "ContextParallelizableModule",
+    "CompilableModule",
     "ExpertParallelizableModule",
     "FlopsEstimatableModule",
     "FixedContiguousTokenPlanner",
