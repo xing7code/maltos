@@ -21,6 +21,7 @@ from runtime.buffer_allocator import BufferPolicy, acquire_buffer
 from runtime.step_runners.base import DefaultStepRunner
 from runtime.types import LossOutput, PipelineOutput, PpStatus
 from utils.distributed import all_reduce_tensor, irecv_tensor_async, isend_tensor_async
+from utils.profiling import profiled
 
 if TYPE_CHECKING:
     from runtime.plugins.pp import PipelineParallelPlugin
@@ -53,6 +54,10 @@ class PipelineAction:
     kind: PipelineActionKind
     microbatch_idx: int
     backward_step_idx: int = 0
+
+
+def _profile_pp_action(_runner, *, action: PipelineAction, **_kwargs) -> str:
+    return f"maltos::pp.{action.kind.value}.microbatch_{action.microbatch_idx}"
 
 
 @dataclass(frozen=True)
@@ -159,6 +164,7 @@ class PipelineStepRunner:
             )
         return actions
 
+    @profiled(_profile_pp_action)
     def run_forward_action(
         self,
         *,
@@ -233,6 +239,7 @@ class PipelineStepRunner:
         state.activation_send_work = send_work
         return total_loss, total_auxiliary_loss
 
+    @profiled(_profile_pp_action)
     def run_backward_action(
         self,
         *,
@@ -281,6 +288,7 @@ class PipelineStepRunner:
             state.grad_send_buffer = send_buffer
             state.grad_send_work = send_work
 
+    @profiled("maltos::pp.broadcast_loss")
     def broadcast_loss(
         self,
         *,

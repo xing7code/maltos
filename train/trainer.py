@@ -6,6 +6,7 @@ import re
 import shutil
 from typing import Any, Protocol
 
+import torch
 import torch.distributed as dist
 
 from data.protocols import StatefulDataLoaderProtocol
@@ -98,16 +99,19 @@ class Trainer:
     def fit(self) -> None:
         try:
             while self.runtime.state.step_context.step < self.config.max_steps:
-                batch = self.dataloader.next_batch()
+                with torch.profiler.record_function("maltos::data.next_batch"):
+                    batch = self.dataloader.next_batch()
                 _, should_step = self.runtime.run_step(batch)
                 if should_step:
-                    self.runtime.step_optimizer()
+                    with torch.profiler.record_function("maltos::optimizer_step"):
+                        self.runtime.step_optimizer()
                 if not should_step:
                     continue
                 # Step-scoped metrics are meaningful only here.  Avoiding the
                 # old per-microbatch collection removes 15/16 loss .item()
                 # synchronizations for a 16-way accumulation run.
-                self.metric_aggregator.update(self.runtime.collect_metrics())
+                with torch.profiler.record_function("maltos::metrics.aggregate"):
+                    self.metric_aggregator.update(self.runtime.collect_metrics())
                 self._maybe_log()
                 self._maybe_checkpoint()
             self._flush_pending_log()
@@ -125,17 +129,20 @@ class Trainer:
             return
         step_delta = step - self._last_logged_step
         self._last_logged_step = step
-        pending = self.metric_aggregator.flush_async(step_delta=step_delta)
+        with torch.profiler.record_function("maltos::metrics.flush_async"):
+            pending = self.metric_aggregator.flush_async(step_delta=step_delta)
         previous = self._pending_log
         self._pending_log = pending
         if previous is not None:
-            self._emit_metrics(previous.wait())
+            with torch.profiler.record_function("maltos::metrics.wait_previous"):
+                self._emit_metrics(previous.wait())
 
     def _flush_pending_log(self) -> None:
         pending = self._pending_log
         self._pending_log = None
         if pending is not None:
-            self._emit_metrics(pending.wait())
+            with torch.profiler.record_function("maltos::metrics.wait_final"):
+                self._emit_metrics(pending.wait())
 
     def _emit_metrics(self, metrics: dict[str, Any]) -> None:
         if not self.loggers:
@@ -153,11 +160,12 @@ class Trainer:
             return
         assert self.config.checkpoint_dir is not None
         checkpoint_dir = _checkpoint_step_dir(self.config.checkpoint_dir, step)
-        save_sharded_checkpoint(
-            self.runtime.state_manager,
-            checkpoint_dir,
-            min_free_gb=self.config.checkpoint_min_free_gb,
-        )
+        with torch.profiler.record_function("maltos::checkpoint.save"):
+            save_sharded_checkpoint(
+                self.runtime.state_manager,
+                checkpoint_dir,
+                min_free_gb=self.config.checkpoint_min_free_gb,
+            )
         _apply_checkpoint_retention(
             self.config.checkpoint_dir,
             current_step=step,

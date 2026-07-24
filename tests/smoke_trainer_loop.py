@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from checkpoint_test_utils import test_runtime_spec
 from data import SimpleTensorDataLoader
 from parallel import ParallelPlan
 from runtime import MeshConfig, RuntimeCore
+from runtime.plugins.torch_profiler import TorchProfilerPlugin
 from train import Trainer, TrainerConfig
 from utils.metrics import MetricAggregator, MetricLogger, MetricReduction, MetricRule, _rule_for_key
 
@@ -102,6 +104,36 @@ def test_trainer_logs_optimizer_steps() -> None:
     assert [record["step"] for record in logger.records] == [1, 2, 3]
     assert all("loss" in record for record in logger.records)
     assert all(record["lr"] == 0.01 for record in logger.records)
+
+
+def test_trainer_profiler_annotations() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime = RuntimeCore(
+            mesh=MeshConfig(),
+            plan=ParallelPlan(),
+            model=LossModel(),
+            optimizer_factory=lambda params: torch.optim.SGD(params, lr=0.01),
+            plugins=[TorchProfilerPlugin(trace_dir=tmp, wait=0, warmup=1, active=1)],
+        )
+        trainer = Trainer(
+            runtime=runtime,
+            dataloader=_make_loader(),
+            config=TrainerConfig(max_steps=2, log_every=1),
+        )
+        trainer.setup()
+        trainer.fit()
+
+        trace_files = list((Path(tmp) / "rank_00000").glob("*.pt.trace.json"))
+        assert trace_files
+        trace = json.loads(trace_files[0].read_text())
+        names = {event.get("name") for event in trace["traceEvents"]}
+        assert {
+            "maltos::data.next_batch",
+            "maltos::micro_step_runner",
+            "maltos::optimizer_step",
+            "maltos::metrics.aggregate",
+            "maltos::metrics.flush_async",
+        }.issubset(names)
 
 
 def test_trainer_aggregates_metrics_over_log_interval() -> None:
@@ -362,6 +394,7 @@ def test_metric_aggregator_step_reduction() -> None:
 
 def main() -> None:
     test_trainer_logs_optimizer_steps()
+    test_trainer_profiler_annotations()
     test_trainer_aggregates_metrics_over_log_interval()
     test_trainer_collects_each_microbatch_metric()
     test_trainer_checkpoint_resume_matches_continuous()

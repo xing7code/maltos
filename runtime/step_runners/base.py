@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import torch
 
 from runtime.types import LossOutput, PipelineOutput, RuntimePhase
+from utils.profiling import profiled
 
 if TYPE_CHECKING:
     from runtime.core import RuntimeCore
@@ -24,6 +25,7 @@ class DefaultStepRunner:
         return runtime.state.loss
 
     @staticmethod
+    @profiled("maltos::forward")
     def run_forward(runtime: "RuntimeCore", batch: Any) -> None:
         runtime._run_step_phase(RuntimePhase.PRE_FORWARD)
         try:
@@ -42,6 +44,7 @@ class DefaultStepRunner:
             runtime._run_step_phase(RuntimePhase.POST_FORWARD)
 
     @staticmethod
+    @profiled("maltos::backward")
     def run_backward(
         runtime: "RuntimeCore",
         *,
@@ -66,6 +69,7 @@ class DefaultStepRunner:
         runtime._run_step_phase(RuntimePhase.POST_BACKWARD)
 
     @staticmethod
+    @profiled("maltos::backward")
     def run_backward_many(
         runtime: "RuntimeCore",
         tensors: list[torch.Tensor],

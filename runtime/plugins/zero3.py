@@ -21,6 +21,7 @@ from runtime.types import ParamRole, RuntimePhase, SetupPhase
 from state.state import ModelStateMeta
 from utils.distributed import all_gather_single, reduce_scatter_single
 from utils.activation_checkpoint import is_activation_checkpoint_recompute
+from utils.profiling import profiled
 
 
 class _ExecDirection(str, Enum):
@@ -418,7 +419,11 @@ class Zero3Plugin(ZeroPluginBase):
             next_bucket.prev_bucket = prev_bucket
         self.bucket_order_checked = True
 
+    @profiled(lambda _self, _bucket, direction: f"maltos::zero3.materialize.{direction.value}")
     def _materialize_full_params(self, bucket: _Bucket, direction: _ExecDirection) -> None:
+        # This span is primarily the wait for an earlier all-gather prefetch.
+        # It tells a trace whether a gap at a module boundary is uncovered
+        # ZeRO-3 communication rather than model compute or input delivery.
         state = self._exec_state(bucket)
         is_fwd = direction == _ExecDirection.FORWARD
         handle = state.fwd_handle if is_fwd else state.bwd_handle
@@ -590,6 +595,7 @@ class Zero3Plugin(ZeroPluginBase):
             ).clone()
             self._free_full_params(bucket)
 
+    @profiled("maltos::zero3.grad_sync.wait")
     def _wait_grad_sync(self) -> None:
         for bucket in self.buckets:
             for state in bucket.exec_states:

@@ -322,6 +322,13 @@ For the exact end-to-end input path, select `data_source: recipe` (or pass
 pretraining dataloader and reads the recipe's configured shard(s); it is the
 right mode for determining whether data delivery causes GPU starvation.
 
+In Perfetto, search `maltos::` for runtime-level spans: `data.next_batch`,
+`batch_h2d`, `micro_step_runner`, `forward`, `backward`, `optimizer_step`,
+and `metrics.collect`.
+PP runs also show `pp.forward.microbatch_N`, `pp.backward.microbatch_N`, and
+`pp.broadcast_loss`. These organize the existing CUDA/NCCL kernels without
+masking their lower-level operator names.
+
 ```bash
 # Inspect reusable systems cases. They live in configs/profile_train_perf_cases.yaml.
 PYTHONPATH=. .venv/bin/python tools/profile_train_perf.py --list-cases

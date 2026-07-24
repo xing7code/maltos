@@ -6,6 +6,7 @@ pieces remain easy to validate in a single process.
 
 from __future__ import annotations
 
+import json
 import tempfile
 import warnings
 from pathlib import Path
@@ -700,7 +701,16 @@ def test_torch_profiler_plugin_writes_trace() -> None:
         assert metrics["torch_profiler/trace_dir"].endswith("rank_00000")
         trace_dir = Path(tmp) / "rank_00000"
         assert trace_dir.is_dir()
-        assert any(trace_dir.iterdir())
+        trace_files = list(trace_dir.glob("*.pt.trace.json"))
+        assert trace_files
+        trace = json.loads(trace_files[0].read_text())
+        names = {event.get("name") for event in trace["traceEvents"]}
+        assert {
+            "maltos::batch_h2d",
+            "maltos::micro_step_runner",
+            "maltos::forward",
+            "maltos::backward",
+        }.issubset(names)
 
 
 def test_precision_plugin_fp16_requires_cuda() -> None:

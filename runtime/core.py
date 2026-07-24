@@ -25,6 +25,7 @@ from runtime.plugin import (
 from runtime.step_runners import DefaultStepRunner
 from runtime.types import MetricValue, ParamRole, RuntimePhase, RuntimeState, SetupPhase, StepContext
 from state.state import ModelStateMeta, StateManager
+from utils.profiling import profiled
 from state.checkpoint import load_sharded_checkpoint
 from utils.constants import INPUT_IDS_KEY
 
@@ -148,14 +149,19 @@ class RuntimeCore:
     def run_step(self, batch: Any) -> tuple[torch.Tensor, bool]:
         assert self.device is not None, "Runtime device should not be None!"
         assert self._step_runner is not None, "RuntimeCore step runner is not initialized; call setup() first"
-        batch = _move_to_device(batch, torch.device(self.device))
+        # Keep host-to-device work separate from model execution in a trace.
+        # This makes input starvation/copy stalls distinguishable from a gap
+        # caused by the distributed runtime itself.
+        with torch.profiler.record_function("maltos::batch_h2d"):
+            batch = _move_to_device(batch, torch.device(self.device))
         self.state.batch = batch
         num_tokens = _count_batch_tokens(batch)
         if num_tokens is not None:
             self.state.metadata["tokens"] = num_tokens
         context = self.state.step_context
         self._run_step_phase(RuntimePhase.PRE_STEP_RUNNER)
-        loss = self._step_runner.run(self, self.state.batch)
+        with torch.profiler.record_function("maltos::micro_step_runner"):
+            loss = self._step_runner.run(self, self.state.batch)
         self._accumulate_loss_metric()
         should_step = context.advance_micro_step()
         return loss, should_step
@@ -389,11 +395,10 @@ class RuntimeCore:
     # Optimizer / scheduler methods: end
     # -------------------------------------
 
+    @profiled("maltos::metrics.collect")
     def collect_metrics(self) -> dict[str, MetricValue]:
         context = self.state.step_context
-        metrics: dict[str, MetricValue] = {
-            "step": context.step,
-        }
+        metrics: dict[str, MetricValue] = {"step": context.step}
         metrics.update(self.state.static_metrics)
         metric_loss = self.state.metadata.get("loss_sum_for_metrics")
         metric_loss_count = self.state.metadata.get("loss_count_for_metrics", 0)
