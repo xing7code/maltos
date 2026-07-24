@@ -297,7 +297,96 @@ torchrun --nproc_per_node=8 \
   2>&1 | tee "$MINI_LOG_DIR/profile50.log"
 ```
 
-## 6b. Short All-Rank Efficiency Trace (13B)
+## 6b. Synthetic Runtime Performance Sweeps
+
+For ML systems experiments, use the general synthetic benchmark before paying
+to prepare data or download a checkpoint. It builds the normal recipe-selected
+model and distributed runtime, but generates deterministic, valid synthetic
+causal-LM batches. `packed: true` cases generate variable-length packed SFT
+segments, variable supervision density, and realistic trailing padding;
+`packed: false` is dense pretraining with every non-final token supervised. By
+default its learning rate is zero: it still executes
+forward, backward, gradient clipping, and optimizer kernels, while preventing
+the repeated fake batch from drifting or diverging.
+
+This is the right tool for comparing micro-batch size, accumulation, TP/CP/PP,
+ZeRO, activation checkpointing, and attention backends. It is *not* a
+replacement for the real-data SFT smoke above: it cannot validate tokenizer,
+checkpoint restore, or loss quality. The default `delivery: host` creates a new
+CPU batch per micro-step and exercises RuntimeCore's usual H2D move; it does
+not emulate mmap/disk/network starvation. Use the real-data smoke if you need
+to diagnose that part of the pipeline.
+
+For the exact end-to-end input path, select `data_source: recipe` (or pass
+`--data-source recipe`). The tool then reuses `train/cli.py`'s own SFT or
+pretraining dataloader and reads the recipe's configured shard(s); it is the
+right mode for determining whether data delivery causes GPU starvation.
+
+```bash
+# Inspect reusable systems cases. They live in configs/profile_train_perf_cases.yaml.
+PYTHONPATH=. .venv/bin/python tools/profile_train_perf.py --list-cases
+
+# Recipe-faithful packed-SFT runtime benchmark: 5 warmup + 10 timed global steps.
+torchrun --nproc_per_node=8 \
+  --master_addr 127.0.0.1 \
+  --master_port "$MASTER_PORT" \
+  tools/profile_train_perf.py \
+  --case olmo2_13b_sft_packed \
+  --output-dir "$PROJECT_DIR/profiles/packed-baseline"
+
+# Capture rank 0 only (much smaller than an all-rank trace).
+torchrun --nproc_per_node=8 \
+  --master_addr 127.0.0.1 \
+  --master_port "$MASTER_PORT" \
+  tools/profile_train_perf.py \
+  --case olmo2_13b_sft_packed \
+  --warmup 40 --steps 5 --profile \
+  --output-dir "$PROJECT_DIR/profiles/packed-profile"
+
+# One experiment can override ordinary recipe arguments after `--`.
+# This keeps the global batch fixed while testing fewer micro-batch boundaries.
+torchrun --nproc_per_node=8 \
+  --master_addr 127.0.0.1 \
+  --master_port "$MASTER_PORT" \
+  tools/profile_train_perf.py \
+  --case olmo2_13b_sft_packed \
+  --output-dir "$PROJECT_DIR/profiles/packed-mb2" \
+  -- --micro-batch-size 2 --grad-accum-steps 8
+
+# Exact SFT data-path profile: same mmap shards, PackedSFTDataset,
+# SFTDataLoader DP stride, CPU stack, and H2D as train/cli.py.
+torchrun --nproc_per_node=8 \
+  --master_addr 127.0.0.1 \
+  --master_port "$MASTER_PORT" \
+  tools/profile_train_perf.py \
+  --case olmo2_13b_sft_real_data \
+  --warmup 40 --steps 5 --profile \
+  --output-dir "$PROJECT_DIR/profiles/real-data-profile"
+
+# A tiny compatible packed SFT dataset is enough: override the recipe source
+# with its meta.json. SFTDataLoader automatically wraps when it reaches the
+# final record, so the same small shard can feed an arbitrarily long profile.
+torchrun --nproc_per_node=8 \
+  --master_addr 127.0.0.1 \
+  --master_port "$MASTER_PORT" \
+  tools/profile_train_perf.py \
+  --case olmo2_13b_sft_real_data \
+  --output-dir "$PROJECT_DIR/profiles/tiny-real-data" \
+  -- --data "$PROJECT_DIR/data/tiny_profile_sft/meta.json"
+```
+
+Each output directory gets `summary.txt` and machine-readable `summary.json`,
+including the resolved runtime spec used for reproducibility.
+The reported step time is the maximum rank's latency for each global optimizer
+step, with mean/p50/p90 across the timed steps; this is the correct throughput
+critical path for a synchronous distributed run. `--profile` traces rank 0 by
+default; use `--profile-all-ranks` only when diagnosing imbalance, because the
+raw traces are large. The tool also accepts `--recipe path/to/recipe.yaml` or
+`--runtime-spec path/to/runtime_spec.json` directly. For a dense pretraining
+recipe, `--data-source recipe -- --data path/to/small_shard.bin` similarly
+reuses `PretrainingDataLoader`, which also wraps at the end of its shard list.
+
+## 6c. Short All-Rank Efficiency Trace (13B)
 
 Run profiling as a separate short job. The profiler records CPU, CUDA, and NCCL
 events for all eight ranks and writes Chrome/TensorBoard-compatible traces.

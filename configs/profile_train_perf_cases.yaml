@@ -1,0 +1,70 @@
+# Reusable synthetic-performance experiments for tools/profile_train_perf.py.
+#
+# A case selects a normal training recipe (or runtime_spec.json) and can add
+# ordinary train/cli flags. The profiler ignores recipe data/checkpoint/W&B
+# settings: it supplies deterministic synthetic causal-LM batches instead.
+# `packed: true` is a variable packed-SFT workload. `packed: false` is dense
+# pretraining. The tool uses lr=0 by default, so these are
+# stability/performance probes, not training-quality experiments.
+
+cases:
+  olmo2_13b_sft_packed:
+    description: Recipe-faithful packed-SFT systems baseline for 8xA100.
+    recipe: configs/olmo2_13b_sft.yaml
+    synthetic:
+      # packed=true is a packed-SFT workload; packed=false is dense pretraining.
+      packed: true
+      segment_count_min: 3
+      segment_count_max: 7
+      # Calibrated from this recipe's packed meta: 491,761,197 supervised
+      # targets / 786,268,160 physical tokens = 62.54%, with small per-example
+      # variation instead of a fixed mask.
+      supervised_fraction_min: 0.55
+      supervised_fraction_max: 0.70
+      # The same meta records 1.00% physical padding. Uniform [0, 2%] gives
+      # that mean while preserving variable packed rows.
+      max_padding_fraction: 0.02
+      # Trainer-like CPU batch creation and RuntimeCore's normal H2D move.
+      delivery: host
+      data_source: synthetic
+    warmup: 5
+    steps: 10
+
+  olmo2_13b_sft_dense:
+    description: Dense causal upper-bound comparison; unlike packed SFT it omits sequence_ids.
+    recipe: configs/olmo2_13b_sft.yaml
+    synthetic:
+      packed: false
+      delivery: host
+      data_source: synthetic
+    warmup: 5
+    steps: 10
+
+  olmo2_13b_sft_packed_mb2:
+    description: "Memory/throughput probe: double micro-batch and halve accumulation at fixed global batch."
+    recipe: configs/olmo2_13b_sft.yaml
+    recipe_overrides:
+      - --micro-batch-size
+      - "2"
+      - --grad-accum-steps
+      - "8"
+    synthetic:
+      packed: true
+      segment_count_min: 3
+      segment_count_max: 7
+      supervised_fraction_min: 0.55
+      supervised_fraction_max: 0.70
+      max_padding_fraction: 0.02
+      delivery: host
+      data_source: synthetic
+    warmup: 5
+    steps: 10
+
+  olmo2_13b_sft_real_data:
+    description: "Exact packed-SFT dataloader path: mmap shards, CPU stack, DP stride, and H2D."
+    recipe: configs/olmo2_13b_sft.yaml
+    synthetic:
+      # This mode ignores synthetic fields and reuses recipe data exactly.
+      data_source: recipe
+    warmup: 5
+    steps: 10
