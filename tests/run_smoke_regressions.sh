@@ -30,6 +30,9 @@ echo "=== smoke/trainer loop ==="
 echo "=== async distributed metrics ==="
 "${PYTHON_BIN}" tests/metric_async_distributed.py
 
+echo "=== zero3 buffer materialization ==="
+"${PYTHON_BIN}" tests/zero3_buffer_materialization.py
+
 echo "=== smoke/train cli ==="
 "${PYTHON_BIN}" tests/smoke_train_cli.py
 

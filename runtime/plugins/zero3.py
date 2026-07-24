@@ -93,6 +93,7 @@ class Zero3Plugin(ZeroPluginBase):
                 raise ValueError("Zero3Plugin requires mesh.dp > 1")
             self.world_size = dist.get_world_size(self.dp_group)
             self.rank = dist.get_rank(self.dp_group)
+            self._materialize_model_buffers(model)
             for cls in list(self.wrap_cls):
                 self.wrap_cls.update(self.runtime.get_module_replacements(cls))
             self._prepare_buckets(model)
@@ -103,6 +104,26 @@ class Zero3Plugin(ZeroPluginBase):
         if phase == SetupPhase.FINALIZE:
             self._add_hooks()
         return model
+
+    def _materialize_model_buffers(self, model: nn.Module) -> None:
+        """Move static model buffers when ZeRO-3 owns parameter materialization.
+
+        RuntimeCore normally calls ``model.to(device, dtype)`` during its
+        MATERIALIZE phase.  ZeRO-3 deliberately owns that phase for parameters
+        so it can replace them with local shards, but buffers are not sharded
+        and must still follow normal model placement.  Leaving (for example)
+        RoPE's non-persistent cos/sin caches on CPU creates a GPU->CPU gather
+        followed by CPU->GPU casts at every attention layer.
+        """
+        assert self.runtime is not None
+        device = torch.device(self.runtime.device)
+        dtype = self.runtime.dtype
+        for module in model.modules():
+            for name, buffer in module._buffers.items():
+                if buffer is None:
+                    continue
+                target_dtype = dtype if dtype is not None and buffer.is_floating_point() else buffer.dtype
+                module._buffers[name] = buffer.to(device=device, dtype=target_dtype)
 
     def on_step_phase(self, phase: RuntimePhase) -> None:
         if phase == RuntimePhase.PRE_FORWARD:
