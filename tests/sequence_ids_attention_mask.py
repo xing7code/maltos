@@ -7,7 +7,7 @@ from models.tiny_transformer import _LocalCausalAttentionCore
 from runtime.layers import functional as layer_functional
 from runtime.layers.flash_utils import pack_dense_varlen_qkv, pack_varlen_prefix_qkv, pack_varlen_qkv
 from runtime.layers.flash_utils import FlashAttnBlockOutput
-from runtime.layers.functional import _AsyncRingExchange, _flash_ring_backward, _flash_ring_forward
+from runtime.layers.functional import _AsyncRingExchange, _flash_packed_ring_forward, _flash_ring_backward, _flash_ring_forward
 from runtime.layers.ring_layout import expected_zigzag_ring_positions
 from utils.attention_backend import AttentionBackend, causal_attention
 from utils.constants import PAD_SEQUENCE_ID
@@ -202,6 +202,54 @@ def _global_dense_causal_attention(
     return out
 
 
+def _packed_prefix_block(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    q_positions: torch.Tensor,
+    k_positions: torch.Tensor,
+    q_sequence_ids: torch.Tensor,
+    k_sequence_ids: torch.Tensor,
+    allow_empty_kv: bool,
+) -> FlashAttnBlockOutput:
+    del allow_empty_kv
+    scores = torch.matmul(q, k.transpose(-2, -1)) * (q.size(-1) ** -0.5)
+    valid = (
+        (q_sequence_ids.unsqueeze(-1) == k_sequence_ids.unsqueeze(-2))
+        & (q_positions.unsqueeze(-1) >= k_positions.unsqueeze(-2))
+        & (q_sequence_ids.unsqueeze(-1) != PAD_SEQUENCE_ID)
+        & (k_sequence_ids.unsqueeze(-2) != PAD_SEQUENCE_ID)
+    )
+    scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+    lse = torch.logsumexp(scores.float(), dim=-1)
+    probs = torch.softmax(scores, dim=-1)
+    probs = torch.where(valid.unsqueeze(1), probs, torch.zeros_like(probs))
+    return FlashAttnBlockOutput(out=torch.matmul(probs, v), lse=lse)
+
+
+def _global_packed_causal_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    q_positions: torch.Tensor,
+    q_sequence_ids: torch.Tensor,
+    k_positions: torch.Tensor,
+    k_sequence_ids: torch.Tensor,
+) -> torch.Tensor:
+    return _packed_prefix_block(
+        q,
+        k,
+        v,
+        q_positions=q_positions,
+        k_positions=k_positions,
+        q_sequence_ids=q_sequence_ids,
+        k_sequence_ids=k_sequence_ids,
+        allow_empty_kv=True,
+    ).out
+
+
 def _expected_zigzag_calls(*, rank: int, world_size: int, local_seq_len: int) -> list[tuple[int, int, bool]]:
     half_seq_len = local_seq_len // 2
     calls = [(local_seq_len, local_seq_len, True)]
@@ -297,6 +345,76 @@ def test_flash_ring_forward_uses_dense_zigzag_half_schedule() -> None:
         layer_functional.dist.get_rank = original_get_rank
         layer_functional._ring_exchange_tensor_async = original_exchange
         layer_functional.flash_attn_dense_with_lse = original_dense
+
+
+def test_flash_ring_packed_forward_preserves_sequence_boundaries() -> None:
+    batch_size, num_heads, local_seq_len, head_dim, world_size = 1, 1, 4, 3, 2
+    total_seq_len = local_seq_len * world_size
+    all_q = torch.randn((batch_size, num_heads, total_seq_len, head_dim), generator=torch.Generator().manual_seed(21))
+    all_k = torch.randn((batch_size, num_heads, total_seq_len, head_dim), generator=torch.Generator().manual_seed(22))
+    all_v = torch.randn((batch_size, num_heads, total_seq_len, head_dim), generator=torch.Generator().manual_seed(23))
+    all_positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 0]], dtype=torch.long)
+    all_sequence_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, PAD_SEQUENCE_ID]], dtype=torch.long)
+    layouts = [
+        expected_zigzag_ring_positions(local_seq_len, rank=rank, world_size=world_size, device=torch.device("cpu"))
+        for rank in range(world_size)
+    ]
+    q_chunks = [all_q.index_select(2, positions) for positions in layouts]
+    k_chunks = [all_k.index_select(2, positions) for positions in layouts]
+    v_chunks = [all_v.index_select(2, positions) for positions in layouts]
+    position_chunks = [all_positions.index_select(1, positions) for positions in layouts]
+    sequence_id_chunks = [all_sequence_ids.index_select(1, positions) for positions in layouts]
+
+    original_get_world_size = layer_functional.dist.get_world_size
+    original_get_rank = layer_functional.dist.get_rank
+    original_exchange = layer_functional._ring_exchange_tensor_async
+    original_prefix = layer_functional.flash_attn_varlen_prefix_with_lse
+    try:
+        for rank in range(world_size):
+            group = _FakeGroup(rank=rank, world_size=world_size)
+
+            layer_functional.dist.get_world_size = lambda fake_group: fake_group.world_size
+            layer_functional.dist.get_rank = lambda fake_group: fake_group.rank
+
+            def fake_exchange(x, fake_group, send_to, recv_from, *, alloc_key):
+                step = int(alloc_key.split(".step_")[1].split(".")[0])
+                remote_rank = (rank - step - 1) % world_size
+                if alloc_key.endswith(".kv"):
+                    recv = torch.cat([k_chunks[remote_rank], v_chunks[remote_rank]], dim=-1)
+                elif alloc_key.endswith(".positions"):
+                    recv = position_chunks[remote_rank]
+                else:
+                    assert alloc_key.endswith(".sequence_ids")
+                    recv = sequence_id_chunks[remote_rank]
+                return _AsyncRingExchange(send_tensor=x, recv_tensor=recv, works=[])
+
+            layer_functional._ring_exchange_tensor_async = fake_exchange
+            layer_functional.flash_attn_varlen_prefix_with_lse = _packed_prefix_block
+            out, _ = _flash_packed_ring_forward(
+                q_chunks[rank],
+                k_chunks[rank],
+                v_chunks[rank],
+                q_positions=position_chunks[rank],
+                q_sequence_ids=sequence_id_chunks[rank],
+                group=group,
+                module_id=12,
+                mb_idx=0,
+            )
+            expected = _global_packed_causal_attention(
+                q_chunks[rank],
+                all_k,
+                all_v,
+                q_positions=position_chunks[rank],
+                q_sequence_ids=sequence_id_chunks[rank],
+                k_positions=all_positions,
+                k_sequence_ids=all_sequence_ids,
+            )
+            assert torch.allclose(out, expected, atol=1e-5)
+    finally:
+        layer_functional.dist.get_world_size = original_get_world_size
+        layer_functional.dist.get_rank = original_get_rank
+        layer_functional._ring_exchange_tensor_async = original_exchange
+        layer_functional.flash_attn_varlen_prefix_with_lse = original_prefix
 
 
 def test_flash_ring_backward_uses_dense_zigzag_half_schedule() -> None:
@@ -402,6 +520,7 @@ def main() -> None:
     test_expected_zigzag_ring_positions_match_cp_layout()
     test_pack_dense_varlen_qkv_builds_uniform_cu_seqlens()
     test_flash_ring_forward_uses_dense_zigzag_half_schedule()
+    test_flash_ring_packed_forward_preserves_sequence_boundaries()
     test_flash_ring_backward_uses_dense_zigzag_half_schedule()
     print("sequence_ids attention mask ok")
 

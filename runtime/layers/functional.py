@@ -5,7 +5,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from runtime.buffer_allocator import BufferPolicy, acquire_buffer
-from runtime.layers.flash_utils import flash_attn_dense_backward, flash_attn_dense_with_lse
+from runtime.layers.flash_utils import (
+    flash_attn_dense_backward,
+    flash_attn_dense_with_lse,
+    flash_attn_varlen_prefix_backward,
+    flash_attn_varlen_prefix_with_lse,
+)
 from utils.distributed import all_gather_single, all_reduce_tensor, pairwise_send_recv_async, reduce_scatter_single
 from utils.profiling import profiled
 
@@ -292,10 +297,26 @@ def flash_ring_attention(
     v: torch.Tensor,
     group: dist.ProcessGroup,
     *,
+    q_positions: torch.Tensor | None = None,
+    q_sequence_ids: torch.Tensor | None = None,
     module_id: int,
     mb_idx: int,
 ) -> torch.Tensor:
-    return _FlashRingAttentionFunc.apply(q, k, v, group, module_id, mb_idx)
+    if q_sequence_ids is None:
+        q_positions = q.new_empty((0,), dtype=torch.long)
+        q_sequence_ids = q.new_empty((0,), dtype=torch.long)
+    elif q_positions is None:
+        raise ValueError("packed Flash-Ring requires q_positions")
+    return _FlashRingAttentionFunc.apply(
+        q,
+        k,
+        v,
+        q_positions,
+        q_sequence_ids,
+        group,
+        module_id,
+        mb_idx,
+    )
 
 
 def _pairwise_send_recv(
@@ -408,19 +429,34 @@ class _FlashRingAttentionFunc(torch.autograd.Function):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        q_positions: torch.Tensor,
+        q_sequence_ids: torch.Tensor,
         group: dist.ProcessGroup,
         module_id: int,
         mb_idx: int,
     ) -> torch.Tensor:
-        out, softmax_lse = _flash_ring_forward(
-            q,
-            k,
-            v,
-            group=group,
-            module_id=module_id,
-            mb_idx=mb_idx,
-        )
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        packed = q_sequence_ids.numel() != 0
+        if not packed:
+            out, softmax_lse = _flash_ring_forward(
+                q,
+                k,
+                v,
+                group=group,
+                module_id=module_id,
+                mb_idx=mb_idx,
+            )
+        else:
+            out, softmax_lse = _flash_packed_ring_forward(
+                q,
+                k,
+                v,
+                q_positions=q_positions,
+                q_sequence_ids=q_sequence_ids,
+                group=group,
+                module_id=module_id,
+                mb_idx=mb_idx,
+            )
+        ctx.save_for_backward(q, k, v, out, softmax_lse, q_positions, q_sequence_ids)
         ctx.group = group
         ctx.module_id = module_id
         ctx.mb_idx = mb_idx
@@ -428,19 +464,223 @@ class _FlashRingAttentionFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
-        dq, dk, dv = _flash_ring_backward(
-            dout.contiguous(),
+        q, k, v, out, softmax_lse, q_positions, q_sequence_ids = ctx.saved_tensors
+        if q_sequence_ids.numel() == 0:
+            dq, dk, dv = _flash_ring_backward(
+                dout.contiguous(),
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                group=ctx.group,
+                module_id=ctx.module_id,
+                mb_idx=ctx.mb_idx,
+            )
+        else:
+            dq, dk, dv = _flash_packed_ring_backward(
+                dout.contiguous(),
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                q_positions=q_positions,
+                q_sequence_ids=q_sequence_ids,
+                group=ctx.group,
+                module_id=ctx.module_id,
+                mb_idx=ctx.mb_idx,
+            )
+        return dq, dk, dv, None, None, None, None, None
+
+
+def _flash_packed_ring_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    q_positions: torch.Tensor,
+    q_sequence_ids: torch.Tensor,
+    group: dist.ProcessGroup,
+    module_id: int,
+    mb_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accumulate each packed KV ring block with its valid query prefixes."""
+    world_size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    send_to = (rank + 1) % world_size
+    recv_from = (rank - 1 + world_size) % world_size
+    current_kv = torch.cat([k, v], dim=-1)
+    current_positions = q_positions
+    current_sequence_ids = q_sequence_ids
+    running_out = torch.zeros_like(v, dtype=torch.float32)
+    running_lse = torch.full(q.shape[:-1], float("-inf"), dtype=torch.float32, device=q.device)
+
+    for step in range(world_size):
+        next_kv_exchange = None
+        next_positions_exchange = None
+        next_sequence_ids_exchange = None
+        if step + 1 != world_size:
+            prefix = f"cp.flash_ring.packed.{module_id}.mb{mb_idx}.fwd.step_{step}"
+            next_kv_exchange = _ring_exchange_tensor_async(
+                current_kv,
+                group,
+                send_to,
+                recv_from,
+                alloc_key=f"{prefix}.kv",
+            )
+            next_positions_exchange = _ring_exchange_tensor_async(
+                current_positions,
+                group,
+                send_to,
+                recv_from,
+                alloc_key=f"{prefix}.positions",
+            )
+            next_sequence_ids_exchange = _ring_exchange_tensor_async(
+                current_sequence_ids,
+                group,
+                send_to,
+                recv_from,
+                alloc_key=f"{prefix}.sequence_ids",
+            )
+        current_k, current_v = current_kv.split(k.size(-1), dim=-1)
+        block = flash_attn_varlen_prefix_with_lse(
+            q,
+            current_k,
+            current_v,
+            q_positions=q_positions,
+            k_positions=current_positions,
+            q_sequence_ids=q_sequence_ids,
+            k_sequence_ids=current_sequence_ids,
+            allow_empty_kv=True,
+        )
+        running_out, running_lse = _merge_attention_blocks(
+            running_out,
+            running_lse,
+            block.out,
+            block.lse,
+        )
+        if step + 1 == world_size:
+            break
+        assert next_kv_exchange is not None
+        assert next_positions_exchange is not None
+        assert next_sequence_ids_exchange is not None
+        current_kv = next_kv_exchange.wait()
+        current_positions = next_positions_exchange.wait()
+        current_sequence_ids = next_sequence_ids_exchange.wait()
+    return running_out.to(dtype=v.dtype), running_lse
+
+
+def _flash_packed_ring_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    *,
+    q_positions: torch.Tensor,
+    q_sequence_ids: torch.Tensor,
+    group: dist.ProcessGroup,
+    module_id: int,
+    mb_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        return flash_attn_varlen_prefix_backward(
+            dout,
             q,
             k,
             v,
             out,
             softmax_lse,
-            group=ctx.group,
-            module_id=ctx.module_id,
-            mb_idx=ctx.mb_idx,
+            q_positions=q_positions,
+            k_positions=q_positions,
+            q_sequence_ids=q_sequence_ids,
+            k_sequence_ids=q_sequence_ids,
+            allow_empty_kv=True,
         )
-        return dq, dk, dv, None, None, None
+
+    rank = dist.get_rank(group)
+    send_to = (rank + 1) % world_size
+    recv_from = (rank - 1 + world_size) % world_size
+    current_kv = torch.cat([k, v], dim=-1)
+    current_positions = q_positions
+    current_sequence_ids = q_sequence_ids
+    current_dkv = torch.zeros_like(current_kv, dtype=torch.float32)
+    dq = torch.zeros_like(q, dtype=torch.float32)
+    pending_dkv_exchange: _AsyncRingExchange | None = None
+
+    for step in range(world_size):
+        next_kv_exchange = None
+        next_positions_exchange = None
+        next_sequence_ids_exchange = None
+        if step + 1 != world_size:
+            prefix = f"cp.flash_ring.packed.{module_id}.mb{mb_idx}.bwd.step_{step}"
+            next_kv_exchange = _ring_exchange_tensor_async(
+                current_kv,
+                group,
+                send_to,
+                recv_from,
+                alloc_key=f"{prefix}.kv",
+            )
+            next_positions_exchange = _ring_exchange_tensor_async(
+                current_positions,
+                group,
+                send_to,
+                recv_from,
+                alloc_key=f"{prefix}.positions",
+            )
+            next_sequence_ids_exchange = _ring_exchange_tensor_async(
+                current_sequence_ids,
+                group,
+                send_to,
+                recv_from,
+                alloc_key=f"{prefix}.sequence_ids",
+            )
+        current_k, current_v = current_kv.split(k.size(-1), dim=-1)
+        if pending_dkv_exchange is not None:
+            current_dkv = pending_dkv_exchange.wait()
+        block_dq, block_dk, block_dv = flash_attn_varlen_prefix_backward(
+            dout,
+            q,
+            current_k,
+            current_v,
+            out,
+            softmax_lse,
+            q_positions=q_positions,
+            k_positions=current_positions,
+            q_sequence_ids=q_sequence_ids,
+            k_sequence_ids=current_sequence_ids,
+            allow_empty_kv=True,
+        )
+        dq += block_dq.float()
+        current_dkv += torch.cat([block_dk, block_dv], dim=-1).float()
+        if step + 1 == world_size:
+            break
+        pending_dkv_exchange = _ring_exchange_tensor_async(
+            current_dkv,
+            group,
+            send_to,
+            recv_from,
+            alloc_key=f"cp.flash_ring.packed.{module_id}.mb{mb_idx}.bwd.step_{step}.grad",
+        )
+        assert next_kv_exchange is not None
+        assert next_positions_exchange is not None
+        assert next_sequence_ids_exchange is not None
+        current_kv = next_kv_exchange.wait()
+        current_positions = next_positions_exchange.wait()
+        current_sequence_ids = next_sequence_ids_exchange.wait()
+
+    local_dkv = ring_shift(
+        current_dkv,
+        group,
+        send_to,
+        recv_from,
+        alloc_key=f"cp.flash_ring.packed.{module_id}.mb{mb_idx}.bwd.return",
+    )
+    local_dk, local_dv = local_dkv.split(k.size(-1), dim=-1)
+    return dq.to(dtype=q.dtype), local_dk.to(dtype=k.dtype), local_dv.to(dtype=v.dtype)
 
 
 def _flash_ring_forward(

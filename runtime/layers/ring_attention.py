@@ -8,7 +8,7 @@ import torch.nn as nn
 from absl import logging
 
 from runtime.layers.attn_masking_utils import build_example_causal_mask, canonical_position_ids, canonical_sequence_ids
-from runtime.layers.flash_utils import flash_attn_dense_block_fallback_reason
+from runtime.layers.flash_utils import flash_attn_block_fallback_reason, flash_attn_dense_block_fallback_reason
 from runtime.layers.functional import flash_ring_attention, ring_shift
 from runtime.layers.ring_layout import has_zigzag_ring_layout
 from utils.attention_backend import AttentionBackend, validate_attention_backend
@@ -81,6 +81,8 @@ class RingAttentionCore(nn.Module):
                 k,
                 v,
                 self.group,
+                q_positions=q_positions,
+                q_sequence_ids=q_sequence_ids,
                 module_id=id(self),
                 mb_idx=mb_idx,
             )
@@ -275,11 +277,15 @@ def _flash_ring_fallback_reason(
     rank: int,
     world_size: int,
 ) -> str | None:
-    reason = flash_attn_dense_block_fallback_reason(q)
+    reason = (
+        flash_attn_block_fallback_reason(q)
+        if q_sequence_ids is not None
+        else flash_attn_dense_block_fallback_reason(q)
+    )
     if reason is not None:
         return reason
     if q_sequence_ids is not None:
-        return "flash ring fast path currently supports only dense sequences; packed sequence_ids use eager ring attention"
+        return None
     if not has_zigzag_ring_layout(
         q_positions,
         rank=rank,

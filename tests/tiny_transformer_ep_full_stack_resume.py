@@ -365,7 +365,7 @@ def run_case(rank: int, args: argparse.Namespace, device: torch.device | None = 
         dist_backend=args.backend,
         device=device,
         require_dense_block=args.cp_size > 1 and args.cp_attn_core == "ring",
-        allow_flash=not (args.packed_batch and args.cp_size > 1 and args.cp_attn_core == "ring"),
+        allow_flash=True,
     )
     if not _supports_bf16_autocast():
         if rank == 0:
