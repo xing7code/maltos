@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from runtime.buffer_allocator import BufferPolicy, acquire_buffer
 from runtime.layers.flash_utils import flash_attn_dense_backward, flash_attn_dense_with_lse
 from utils.distributed import all_gather_single, all_reduce_tensor, pairwise_send_recv_async, reduce_scatter_single
+from utils.profiling import profiled
 
 
 @dataclass
@@ -284,6 +285,7 @@ def ring_shift(
     return _RingShift.apply(x, group, send_to, recv_from, alloc_key)
 
 
+@profiled("maltos::cp.ring.flash")
 def flash_ring_attention(
     q: torch.Tensor,
     k: torch.Tensor,

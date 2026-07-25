@@ -7,6 +7,7 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 
+from parallel.context_batch import ContextParallelBatchSharder
 from utils.constants import INPUT_IDS_KEY, LABELS_KEY
 
 
@@ -70,6 +71,7 @@ class PretrainingDataLoader:
         dp_world_size: int = 1,
         seed: int = 1234,
         start_state: PretrainingDataState | None = None,
+        cp_batch_sharder: ContextParallelBatchSharder | None = None,
     ) -> None:
         if seq_len < 1:
             raise ValueError(f"seq_len must be >= 1, got {seq_len}")
@@ -89,10 +91,11 @@ class PretrainingDataLoader:
         self.shard_idx = 0
         self.token_offset = dp_rank * self._tokens_per_sample
         self.consumed_tokens = 0
+        self._cp_batch_sharder = cp_batch_sharder
         if start_state is not None:
             self.load_state_dict(asdict(start_state))
 
-    def next_batch(self) -> dict[str, torch.Tensor]:
+    def next_batch(self, cp_rank: int | None = None) -> dict[str, torch.Tensor]:
         samples = []
         for _ in range(self.micro_batch_size):
             sample, self.shard_idx, self.token_offset = self.dataset.read(
@@ -104,10 +107,15 @@ class PretrainingDataLoader:
             self._advance_to_next_dp_sample()
         tokens = torch.from_numpy(np.stack(samples).astype(np.int64, copy=False))
         self.consumed_tokens += self.micro_batch_size * self.seq_len
-        return {
+        batch = {
             INPUT_IDS_KEY: tokens[:, :-1].contiguous(),
             LABELS_KEY: tokens[:, 1:].contiguous(),
         }
+        if cp_rank is None:
+            return batch
+        if self._cp_batch_sharder is None:
+            raise RuntimeError("CP-local next_batch(cp_rank) requires constructor cp_batch_sharder")
+        return self._cp_batch_sharder.shard(batch, rank=cp_rank)
 
     def state_dict(self) -> PretrainingDataState:
         return PretrainingDataState(

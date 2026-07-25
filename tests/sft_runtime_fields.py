@@ -3,15 +3,10 @@ from __future__ import annotations
 import torch
 
 from models.tiny_transformer import TinyTransformer
-from parallel import (
-    ContextTokenPlannerConfig,
-    ContextTokenPlannerType,
-    ParallelPlan,
-)
-from parallel.context_interfaces import ContextParallelAttentionCoreType
+from parallel import ParallelPlan
+from parallel.context_batch import ContextParallelBatchSharder
 from parallel.context_token_planner import FixedContiguousTokenPlanner, FixedZigzagTokenPlanner
 from runtime import MeshConfig, RuntimeCore
-from runtime.plugins.cp import _resolve_context_token_planner, _shard_batch_for_cp
 from utils.constants import IGNORE_INDEX, INPUT_IDS_KEY, LABELS_KEY, POSITION_IDS_KEY, SEQUENCE_IDS_KEY
 
 
@@ -60,12 +55,10 @@ def test_cp_sharding_preserves_sequence_ids() -> None:
         SEQUENCE_IDS_KEY: torch.tensor([[7, 7, 7, 8, 8, 8]], dtype=torch.long),
     }
 
-    sharded = _shard_batch_for_cp(
-        batch,
-        rank=1,
+    sharded = ContextParallelBatchSharder(
+        planner=FixedContiguousTokenPlanner(),
         world_size=2,
-        attention_core_type=ContextParallelAttentionCoreType.ALL_GATHER_KV,
-    )
+    ).shard(batch, rank=1)
 
     assert sharded[INPUT_IDS_KEY].tolist() == [[13, 14, 15]]
     assert sharded[LABELS_KEY].tolist() == [[14, 15, IGNORE_INDEX]]
@@ -74,13 +67,20 @@ def test_cp_sharding_preserves_sequence_ids() -> None:
 
 
 def test_fixed_token_planners_preserve_legacy_cp_orders() -> None:
-    contiguous = FixedContiguousTokenPlanner().plan(seq_len=8, world_size=2)
-    zigzag = FixedZigzagTokenPlanner().plan(seq_len=8, world_size=2)
+    contiguous = FixedContiguousTokenPlanner().plan(sequence_lengths=[8], world_size=2)
+    zigzag = FixedZigzagTokenPlanner().plan(sequence_lengths=[8], world_size=2)
 
     assert contiguous.local_positions(0).tolist() == [0, 1, 2, 3]
     assert contiguous.local_positions(1).tolist() == [4, 5, 6, 7]
     assert zigzag.local_positions(0).tolist() == [0, 1, 6, 7]
     assert zigzag.local_positions(1).tolist() == [2, 3, 4, 5]
+
+    try:
+        FixedContiguousTokenPlanner().plan(sequence_lengths=[8, 6], world_size=2)
+    except ValueError as error:
+        assert "rectangular batch" in str(error)
+    else:
+        raise AssertionError("fixed planner must reject variable-length batch rows")
 
 
 def test_ring_cp_sharding_uses_fixed_zigzag_planner_order() -> None:
@@ -89,27 +89,13 @@ def test_ring_cp_sharding_uses_fixed_zigzag_planner_order() -> None:
         LABELS_KEY: torch.arange(8, dtype=torch.long).unsqueeze(0),
     }
 
-    sharded = _shard_batch_for_cp(
-        batch,
-        rank=0,
+    sharded = ContextParallelBatchSharder(
+        planner=FixedZigzagTokenPlanner(),
         world_size=2,
-        attention_core_type=ContextParallelAttentionCoreType.RING,
-    )
+    ).shard(batch, rank=0)
 
     assert sharded[INPUT_IDS_KEY].tolist() == [[0, 1, 6, 7]]
     assert sharded[POSITION_IDS_KEY].tolist() == [[0, 1, 6, 7]]
-
-
-def test_cp_token_planner_config_is_independent_of_attention_core() -> None:
-    planner = _resolve_context_token_planner(
-        ParallelPlan(
-            cp_attn_core=ContextParallelAttentionCoreType.ALL_GATHER_KV,
-            cp_token_planner=ContextTokenPlannerConfig(
-                planner_type=ContextTokenPlannerType.FIXED_ZIGZAG,
-            ),
-        )
-    )
-    assert planner.plan(seq_len=8, world_size=2).local_positions(0).tolist() == [0, 1, 6, 7]
 
 
 def main() -> None:
@@ -117,7 +103,6 @@ def main() -> None:
     test_cp_sharding_preserves_sequence_ids()
     test_fixed_token_planners_preserve_legacy_cp_orders()
     test_ring_cp_sharding_uses_fixed_zigzag_planner_order()
-    test_cp_token_planner_config_is_independent_of_attention_core()
     print("sft runtime fields ok")
 
 

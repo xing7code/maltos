@@ -12,6 +12,7 @@ import torch.distributed as dist
 from data.protocols import StatefulDataLoaderProtocol
 from data.prefetch import PrefetchDataLoader
 from runtime.core import RuntimeCore
+from runtime.mesh import MeshAxis
 from state.checkpoint import save_runtime_spec, save_sharded_checkpoint
 from utils.metrics import MetricAggregator, MetricLogger, PendingMetricFlush
 
@@ -100,7 +101,12 @@ class Trainer:
         try:
             while self.runtime.state.step_context.step < self.config.max_steps:
                 with torch.profiler.record_function("maltos::data.next_batch"):
-                    batch = self.dataloader.next_batch()
+                    cp_rank = None
+                    if self.runtime.plan.batch_data_cp_aware:
+                        cp_group = self.runtime.get_group(MeshAxis.CP)
+                        assert cp_group is not None
+                        cp_rank = dist.get_rank(cp_group)
+                    batch = self.dataloader.next_batch(cp_rank)
                 _, should_step = self.runtime.run_step(batch)
                 if should_step:
                     with torch.profiler.record_function("maltos::optimizer_step"):

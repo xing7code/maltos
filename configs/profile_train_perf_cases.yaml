@@ -68,3 +68,70 @@ cases:
       data_source: recipe
     warmup: 5
     steps: 10
+
+  llama50m_cp_ring_dense_smoke:
+    description: "Dense Flash-Ring correctness/performance smoke: 8 CP ranks, 1K local tokens/rank."
+    recipe: configs/llama_50m.yaml
+    recipe_overrides:
+      - --dp-size
+      - "1"
+      - --tp-size
+      - "1"
+      - --cp-size
+      - "8"
+      - --cp-attn-core
+      - ring
+      - --batch-data-cp-aware
+      - --cp-token-planner
+      - fixed_zigzag
+      - --no-use-sp
+      - --zero-stage
+      - "0"
+      - --attention-backend
+      - flash_attn
+      # CP owns a zigzag shard of this global sequence, so each rank sees
+      # 1,024 tokens. This is the inexpensive preflight for the 256K run.
+      - --seq-len
+      - "8192"
+      - --grad-accum-steps
+      - "1"
+    synthetic:
+      packed: false
+      delivery: host
+      data_source: synthetic
+    warmup: 3
+    steps: 5
+
+  llama50m_cp_ring_dense_256k:
+    description: "Paper-scale dense Flash-Ring baseline: 32K local tokens/rank across 8 CP ranks."
+    recipe: configs/llama_50m.yaml
+    recipe_overrides:
+      - --dp-size
+      - "1"
+      - --tp-size
+      - "1"
+      - --cp-size
+      - "8"
+      - --cp-attn-core
+      - ring
+      - --batch-data-cp-aware
+      - --cp-token-planner
+      - fixed_zigzag
+      - --no-use-sp
+      - --zero-stage
+      - "0"
+      - --attention-backend
+      - flash_attn
+      # 256K global / CP=8 = 32K local tokens, matching FCP's reported
+      # per-worker workload contract. It is a dense sanity baseline, not the
+      # final packed long-tailed workload.
+      - --seq-len
+      - "262144"
+      - --grad-accum-steps
+      - "1"
+    synthetic:
+      packed: false
+      delivery: host
+      data_source: synthetic
+    warmup: 3
+    steps: 10

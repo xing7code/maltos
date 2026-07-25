@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 
+from parallel.context_batch import ContextParallelBatchSharder
 
 @dataclass(frozen=True)
 class SimpleDataLoaderState:
@@ -16,7 +17,14 @@ class SimpleDataLoaderState:
 class SimpleTensorDataLoader:
     """Tiny deterministic tensor batcher for tests with checkpointable cursor state."""
 
-    def __init__(self, data: torch.Tensor, batch_size: int, *, drop_last: bool = True) -> None:
+    def __init__(
+        self,
+        data: torch.Tensor,
+        batch_size: int,
+        *,
+        drop_last: bool = True,
+        cp_batch_sharder: ContextParallelBatchSharder | None = None,
+    ) -> None:
         if data.size(0) <= 0:
             raise ValueError("data must have a non-empty leading batch dimension")
         if batch_size < 1:
@@ -29,8 +37,9 @@ class SimpleTensorDataLoader:
         self.cursor = 0
         self.epoch = 0
         self.consumed_tokens = 0
+        self._cp_batch_sharder = cp_batch_sharder
 
-    def next_batch(self) -> torch.Tensor:
+    def next_batch(self, cp_rank: int | None = None) -> torch.Tensor | dict[str, torch.Tensor]:
         if self.cursor + self.batch_size > self.data.size(0):
             self.epoch += 1
             self.cursor = 0
@@ -42,7 +51,11 @@ class SimpleTensorDataLoader:
         batch = self.data[self.cursor : end].contiguous()
         self.cursor = end
         self.consumed_tokens += batch.numel()
-        return batch
+        if cp_rank is None:
+            return batch
+        if self._cp_batch_sharder is None:
+            raise RuntimeError("CP-local next_batch(cp_rank) requires constructor cp_batch_sharder")
+        return self._cp_batch_sharder.shard((batch,), rank=cp_rank)
 
     def state_dict(self) -> SimpleDataLoaderState:
         return SimpleDataLoaderState(

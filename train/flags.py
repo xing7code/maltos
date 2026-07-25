@@ -6,10 +6,11 @@ from typing import Any
 import yaml
 
 from parallel.context_interfaces import ContextParallelAttentionCoreType
+from parallel.context_token_planner import ContextTokenPlannerType
 from utils.attention_backend import ATTENTION_BACKEND_CHOICES, AttentionBackend
 
 TRAIN_CLI_RUNTIME_SPEC_FORMAT = "train_cli_args"
-TRAIN_CLI_RUNTIME_SPEC_VERSION = 1
+TRAIN_CLI_RUNTIME_SPEC_VERSION = 2
 
 _RUNTIME_SPEC_MODEL_FIELDS = (
     "model",
@@ -38,6 +39,8 @@ _RUNTIME_SPEC_RUNTIME_FIELDS = (
     "ep_size",
     "pp_microbatches",
     "cp_attn_core",
+    "batch_data_cp_aware",
+    "cp_token_planner",
     "zero_stage",
     "ddp_mode",
     "precision",
@@ -105,6 +108,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="all_gather_kv",
         choices=tuple(core.value for core in ContextParallelAttentionCoreType),
+    )
+    parser.add_argument("--batch-data-cp-aware", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--cp-token-planner",
+        type=str,
+        default=None,
+        choices=tuple(planner.value for planner in ContextTokenPlannerType),
     )
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
@@ -280,6 +290,8 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("parallel", "pp_microbatches"): "pp_microbatches",
         ("parallel", "cp_size"): "cp_size",
         ("parallel", "cp_attn_core"): "cp_attn_core",
+        ("parallel", "batch_data_cp_aware"): "batch_data_cp_aware",
+        ("parallel", "cp_token_planner"): "cp_token_planner",
         ("parallel", "tp_size"): "tp_size",
         ("parallel", "ep_size"): "ep_size",
         ("parallel", "use_sp"): "use_sp",

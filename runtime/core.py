@@ -74,6 +74,11 @@ class RuntimeCore:
         )
         self._group_manager = ProcessGroupManager.from_plan(self.plan, self.mesh)
         self.plugins = self._resolve_plugin_order(self.plugins)
+        if self.plan.batch_data_cp_aware:
+            if self.mesh.cp <= 1:
+                raise ValueError("batch_data_cp_aware=True requires mesh.cp > 1")
+            if not any(plugin.id == PluginId.CP for plugin in self.plugins):
+                raise ValueError("batch_data_cp_aware=True requires ContextParallelPlugin")
         self._optimizer_owner = self._resolve_optimizer_owner()
         self._step_runner_owner = self._resolve_step_runner_owner()
         self._model_state_owner = self._resolve_model_state_owner()

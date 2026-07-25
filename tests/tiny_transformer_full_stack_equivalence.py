@@ -60,6 +60,7 @@ from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
+from parallel.context_token_planner import ContextTokenPlannerType
 
 
 _TINY_MODEL_KWARGS = dict(
@@ -100,6 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pp-schedule", choices=("afab", "1f1b"), default="afab")
     parser.add_argument("--zero-stage", type=int, choices=(0, 1, 2, 3), default=3)
     parser.add_argument("--cp-attn-core", choices=("all_gather_kv", "ring"), default="all_gather_kv")
+    parser.add_argument("--cp-token-planner", choices=tuple(item.value for item in ContextTokenPlannerType))
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29569)
     parser.add_argument("--backend", type=str, default="gloo")
@@ -203,6 +205,7 @@ def _make_baseline_core(reference_model: nn.Module, args: argparse.Namespace, de
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=1),
         plan=ParallelPlan(
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
+            cp_token_planner=ContextTokenPlannerType(args.cp_token_planner) if args.cp_token_planner else None,
         ),
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
@@ -234,6 +237,7 @@ def _make_runtime_core(reference_model: nn.Module, args: argparse.Namespace, dev
         plan=ParallelPlan(
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
+            cp_token_planner=ContextTokenPlannerType(args.cp_token_planner) if args.cp_token_planner else None,
         ),
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),

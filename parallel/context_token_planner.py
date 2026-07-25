@@ -2,40 +2,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Protocol, Sequence
 
 import torch
-
-
-class ContextTokenPlannerPhase(str, Enum):
-    """Runtime boundary at which a CP token plan is applied."""
-
-    PRE_STEP_RUNNER = "pre_step_runner"
-    PRE_FORWARD = "pre_forward"
 
 
 class ContextTokenPlannerType(str, Enum):
     FIXED_CONTIGUOUS = "fixed_contiguous"
     FIXED_ZIGZAG = "fixed_zigzag"
 
-
-@dataclass(frozen=True)
-class ContextTokenPlannerConfig:
-    """Placement lifetime policy shared by CP token planners.
-
-    ``restore_phase`` is deliberately a string instead of a runtime enum: the
-    parallel package must not depend on the runtime package.  It will be used
-    by dynamic planners that need canonical output ordering.
-    """
-
-    planner_type: ContextTokenPlannerType = ContextTokenPlannerType.FIXED_CONTIGUOUS
-    plan_phase: ContextTokenPlannerPhase = ContextTokenPlannerPhase.PRE_STEP_RUNNER
-    restore_phase: str | None = None
+    @property
+    def planner_class(self) -> type["ContextTokenPlanner"]:
+        if self is ContextTokenPlannerType.FIXED_CONTIGUOUS:
+            return FixedContiguousTokenPlanner
+        if self is ContextTokenPlannerType.FIXED_ZIGZAG:
+            return FixedZigzagTokenPlanner
+        raise ValueError(f"unsupported context token planner type={self!r}")
 
 
 @dataclass(frozen=True)
 class ContextTokenPlan:
-    """Ownership of canonical sequence positions for one CP group.
+    """Ownership of canonical positions for a rectangular CP batch.
 
     Current fixed CP layouts use a one-dimensional owner vector.  Future
     packed-data planners may return per-token ownership from the batch, but
@@ -44,7 +31,6 @@ class ContextTokenPlan:
     """
 
     owner_ranks: torch.Tensor
-    restore_indices: torch.Tensor | None = None
 
     def local_positions(self, rank: int) -> torch.Tensor:
         if self.owner_ranks.dim() != 1:
@@ -56,20 +42,30 @@ class ContextTokenPlan:
 
 
 class ContextTokenPlanner(Protocol):
-    config: ContextTokenPlannerConfig
+    planner_type: ContextTokenPlannerType
 
-    def plan(self, *, seq_len: int, world_size: int, device: torch.device | None = None) -> ContextTokenPlan: ...
+    def plan(
+        self,
+        *,
+        sequence_lengths: Sequence[int],
+        world_size: int,
+        device: torch.device | None = None,
+    ) -> ContextTokenPlan: ...
 
-    def restore(self, outputs: Any, plan: ContextTokenPlan) -> Any: ...
 
-
-@dataclass(frozen=True)
 class FixedContiguousTokenPlanner:
     """The original equal-size contiguous CP assignment."""
 
-    config: ContextTokenPlannerConfig = ContextTokenPlannerConfig()
+    planner_type = ContextTokenPlannerType.FIXED_CONTIGUOUS
 
-    def plan(self, *, seq_len: int, world_size: int, device: torch.device | None = None) -> ContextTokenPlan:
+    def plan(
+        self,
+        *,
+        sequence_lengths: Sequence[int],
+        world_size: int,
+        device: torch.device | None = None,
+    ) -> ContextTokenPlan:
+        seq_len = _require_rectangular_sequence_lengths(sequence_lengths)
         if seq_len % world_size != 0:
             raise ValueError(
                 "ContextParallelPlugin fixed contiguous layout requires sequence length divisible by cp world size, "
@@ -78,19 +74,20 @@ class FixedContiguousTokenPlanner:
         positions = torch.arange(seq_len, dtype=torch.long, device=device)
         return ContextTokenPlan(owner_ranks=positions // (seq_len // world_size))
 
-    def restore(self, outputs: Any, plan: ContextTokenPlan) -> Any:
-        return outputs
 
-
-@dataclass(frozen=True)
 class FixedZigzagTokenPlanner:
     """The original equal-size zigzag assignment used by Ring CP."""
 
-    config: ContextTokenPlannerConfig = ContextTokenPlannerConfig(
-        planner_type=ContextTokenPlannerType.FIXED_ZIGZAG,
-    )
+    planner_type = ContextTokenPlannerType.FIXED_ZIGZAG
 
-    def plan(self, *, seq_len: int, world_size: int, device: torch.device | None = None) -> ContextTokenPlan:
+    def plan(
+        self,
+        *,
+        sequence_lengths: Sequence[int],
+        world_size: int,
+        device: torch.device | None = None,
+    ) -> ContextTokenPlan:
+        seq_len = _require_rectangular_sequence_lengths(sequence_lengths)
         if seq_len % (2 * world_size) != 0:
             raise ValueError(
                 "CP ring zigzag requires sequence length divisible by 2 * cp world size, "
@@ -105,14 +102,28 @@ class FixedZigzagTokenPlanner:
             owners[back_start : back_start + half_len] = rank
         return ContextTokenPlan(owner_ranks=owners)
 
-    def restore(self, outputs: Any, plan: ContextTokenPlan) -> Any:
-        return outputs
+
+def build_context_token_planner(planner_type: ContextTokenPlannerType) -> ContextTokenPlanner:
+    """Build the implementation selected by a planner type."""
+    return planner_type.planner_class()
 
 
-def build_context_token_planner(config: ContextTokenPlannerConfig) -> ContextTokenPlanner:
-    """Build a placement policy independently of the CP attention core."""
-    if config.planner_type == ContextTokenPlannerType.FIXED_CONTIGUOUS:
-        return FixedContiguousTokenPlanner(config=config)
-    if config.planner_type == ContextTokenPlannerType.FIXED_ZIGZAG:
-        return FixedZigzagTokenPlanner(config=config)
-    raise ValueError(f"unsupported context token planner type={config.planner_type!r}")
+def _require_rectangular_sequence_lengths(sequence_lengths: Sequence[int]) -> int:
+    """Bridge the legacy rectangular `[batch, seq, ...]` batch contract.
+
+    Fixed layouts own one position vector and apply it identically to every
+    batch row.  They therefore intentionally reject variable lengths; dynamic
+    planners such as ByteScale/FCP consume the same list-shaped input but will
+    return a per-document layout in the next interface phase.
+    """
+    if not sequence_lengths:
+        raise ValueError("Context token planning requires at least one sequence length")
+    lengths = tuple(int(length) for length in sequence_lengths)
+    if any(length < 1 for length in lengths):
+        raise ValueError(f"Context token lengths must be >= 1, got {lengths}")
+    if len(set(lengths)) != 1:
+        raise ValueError(
+            "fixed CP token planners require a rectangular batch with equal sequence lengths, "
+            f"got {lengths}"
+        )
+    return lengths[0]

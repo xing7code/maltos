@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from parallel.context_batch import ContextParallelBatchSharder
 from utils.constants import INPUT_IDS_KEY, LABELS_KEY, POSITION_IDS_KEY, SEQUENCE_IDS_KEY, SFT_BATCH_KEYS
 
 
@@ -172,6 +173,7 @@ class SFTDataLoader:
         dp_world_size: int = 1,
         seed: int = 1234,
         start_state: SFTDataState | None = None,
+        cp_batch_sharder: ContextParallelBatchSharder | None = None,
     ) -> None:
         if micro_batch_size < 1:
             raise ValueError(f"micro_batch_size must be >= 1, got {micro_batch_size}")
@@ -187,10 +189,11 @@ class SFTDataLoader:
         self.shard_idx, self.row_offset = self.dataset.advance(0, 0, dp_rank)
         self.consumed_sequences = 0
         self.consumed_tokens = 0
+        self._cp_batch_sharder = cp_batch_sharder
         if start_state is not None:
             self.load_state_dict(asdict(start_state))
 
-    def next_batch(self) -> dict[str, torch.Tensor]:
+    def next_batch(self, cp_rank: int | None = None) -> dict[str, torch.Tensor]:
         rows: dict[str, list[np.ndarray]] = {key: [] for key in SFT_BATCH_KEYS}
         for _ in range(self.micro_batch_size):
             sample, self.shard_idx, self.row_offset = self.dataset.read_rows(
@@ -212,7 +215,11 @@ class SFTDataLoader:
         }
         self.consumed_sequences += self.micro_batch_size
         self.consumed_tokens += self.micro_batch_size * self.dataset.seq_len
-        return batch
+        if cp_rank is None:
+            return batch
+        if self._cp_batch_sharder is None:
+            raise RuntimeError("CP-local next_batch(cp_rank) requires constructor cp_batch_sharder")
+        return self._cp_batch_sharder.shard(batch, rank=cp_rank)
 
     def state_dict(self) -> SFTDataState:
         return SFTDataState(

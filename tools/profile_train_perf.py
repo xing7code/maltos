@@ -59,8 +59,10 @@ if str(REPO_ROOT) in sys.path:
 sys.path.insert(0, str(REPO_ROOT))
 
 from runtime.core import RuntimeCore
-from runtime.mesh import MeshConfig
+from runtime.mesh import MeshAxis, MeshConfig
 from data import PrefetchDataLoader
+from parallel.context_batch import ContextParallelBatchSharder
+from parallel.context_token_planner import build_context_token_planner
 from train import cli as train_cli
 from train.flags import build_arg_parser, build_runtime_spec, parse_args_from, parse_runtime_spec_args
 from utils.constants import (
@@ -548,8 +550,9 @@ class SyntheticBatchStream:
     seed: int
     runtime_device: torch.device
     _index: int = 0
+    cp_batch_sharder: Any = None
 
-    def next_batch(self) -> dict[str, torch.Tensor]:
+    def next_batch(self, cp_rank: int | None = None) -> dict[str, torch.Tensor]:
         batch_device = self.runtime_device if self.config.delivery == "cuda" else torch.device("cpu")
         batch = make_synthetic_batch(
             batch_size=self.batch_size,
@@ -560,13 +563,23 @@ class SyntheticBatchStream:
             device=batch_device,
         )
         self._index += 1
+        if cp_rank is not None:
+            if self.cp_batch_sharder is None:
+                raise RuntimeError("CP-local synthetic batches require constructor cp_batch_sharder")
+            return self.cp_batch_sharder.shard(batch, rank=cp_rank)
         return batch
 
 
 def _run_global_step(core: RuntimeCore, batches: Any) -> torch.Tensor:
     last_loss: torch.Tensor | None = None
     for micro_step in range(core.grad_accum_steps):
-        loss, should_step = core.run_step(batches.next_batch())
+        cp_rank = None
+        if core.plan.batch_data_cp_aware:
+            cp_group = core.get_group(MeshAxis.CP)
+            assert cp_group is not None
+            cp_rank = dist.get_rank(cp_group)
+        batch = batches.next_batch(cp_rank)
+        loss, should_step = core.run_step(batch)
         if micro_step + 1 == core.grad_accum_steps and not should_step:
             raise RuntimeError("runtime did not request an optimizer step at the accumulation boundary")
         if micro_step + 1 != core.grad_accum_steps and should_step:
@@ -643,7 +656,11 @@ def _run(train_args: argparse.Namespace, tool_args: argparse.Namespace, case: Ca
         if data_source == "recipe":
             if not train_args.data:
                 raise ValueError("--data-source recipe requires recipe --data (or pass it after --)")
-            data_paths, batches, data_format = train_cli._build_dataloader(train_args, dp_rank=dp_rank)
+            data_paths, batches, data_format = train_cli._build_dataloader(
+                train_args,
+                dp_rank=dp_rank,
+                cp_token_planner=core.plan.cp_token_planner,
+            )
             if train_args.data_prefetch_batches:
                 batches = PrefetchDataLoader(batches)
             if rank == 0:
@@ -652,6 +669,14 @@ def _run(train_args: argparse.Namespace, tool_args: argparse.Namespace, case: Ca
                     flush=True,
                 )
         else:
+            cp_batch_sharder = None
+            if train_args.batch_data_cp_aware:
+                if core.plan.cp_token_planner is None:
+                    raise ValueError("--batch-data-cp-aware requires --cp-token-planner")
+                cp_batch_sharder = ContextParallelBatchSharder(
+                    planner=build_context_token_planner(core.plan.cp_token_planner),
+                    world_size=train_args.cp_size,
+                )
             batches = SyntheticBatchStream(
                 batch_size=train_args.micro_batch_size,
                 seq_len=train_args.seq_len,
@@ -661,6 +686,7 @@ def _run(train_args: argparse.Namespace, tool_args: argparse.Namespace, case: Ca
                 # TP/PP/CP ranks for the same DP replica receive the same batch.
                 seed=tool_args.seed + dp_rank,
                 runtime_device=device,
+                cp_batch_sharder=cp_batch_sharder,
             )
         for step in range(1, warmup + 1):
             loss = _run_global_step(core, batches)

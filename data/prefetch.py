@@ -16,14 +16,14 @@ class PrefetchDataLoader:
         self._future: Future[Any] | None = None
         self._state_before_prefetch: dict[str, Any] | None = None
 
-    def next_batch(self) -> Any:
+    def next_batch(self, cp_rank: int | None = None) -> Any:
         if self._future is None:
-            batch = self.loader.next_batch()
+            batch = self.loader.next_batch(cp_rank)
         else:
             batch = self._future.result()
             self._future = None
             self._state_before_prefetch = None
-        self._start_prefetch()
+        self._start_prefetch(cp_rank)
         return _pin_memory(batch)
 
     def state_dict(self):
@@ -42,9 +42,9 @@ class PrefetchDataLoader:
         self._cancel_prefetch()
         self._executor.shutdown(wait=True, cancel_futures=True)
 
-    def _start_prefetch(self) -> None:
+    def _start_prefetch(self, cp_rank: int | None) -> None:
         self._state_before_prefetch = _state_as_dict(self.loader.state_dict())
-        self._future = self._executor.submit(self.loader.next_batch)
+        self._future = self._executor.submit(self.loader.next_batch, cp_rank)
 
     def _cancel_prefetch(self) -> None:
         if self._future is not None:

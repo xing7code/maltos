@@ -32,6 +32,7 @@ from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
+from parallel.context_token_planner import ContextTokenPlannerType
 
 
 _MODEL_KWARGS = dict(
@@ -75,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pp-schedule", choices=("afab", "1f1b"), default="afab")
     parser.add_argument("--zero-stage", type=int, choices=(0, 1, 2, 3), default=3)
     parser.add_argument("--cp-attn-core", choices=("all_gather_kv", "ring"), default="all_gather_kv")
+    parser.add_argument("--cp-token-planner", choices=tuple(item.value for item in ContextTokenPlannerType))
     parser.add_argument("--no-reuse-tp-for-ep", dest="reuse_tp_for_ep", action="store_false")
     parser.add_argument("--no-reuse-cp-for-ep", dest="reuse_cp_for_ep", action="store_false")
     parser.set_defaults(reuse_tp_for_ep=True, reuse_cp_for_ep=True)
@@ -123,6 +125,7 @@ def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Name
         plan=ParallelPlan(
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
+            cp_token_planner=ContextTokenPlannerType(args.cp_token_planner) if args.cp_token_planner else None,
             reuse_tp_for_ep=args.reuse_tp_for_ep,
             reuse_cp_for_ep=args.reuse_cp_for_ep,
         ),
@@ -152,6 +155,7 @@ def _make_runtime_core(reference_model: TinyMoETransformer, args: argparse.Names
         plan=ParallelPlan(
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
+            cp_token_planner=ContextTokenPlannerType(args.cp_token_planner) if args.cp_token_planner else None,
             reuse_tp_for_ep=args.reuse_tp_for_ep,
             reuse_cp_for_ep=args.reuse_cp_for_ep,
         ),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from runtime.core import RuntimeCore
@@ -14,12 +14,8 @@ from parallel.context_interfaces import (
     ContextParallelAttentionCore,
     ContextParallelAttentionCoreType,
 )
-from parallel.context_token_planner import (
-    ContextTokenPlanner,
-    FixedContiguousTokenPlanner,
-    FixedZigzagTokenPlanner,
-    build_context_token_planner,
-)
+from parallel.context_batch import ContextParallelBatchSharder
+from parallel.context_token_planner import ContextTokenPlanner, build_context_token_planner
 from runtime.layers.all_gather_attention import AllGatherKvAttentionCore
 from runtime.layers.ring_attention import RingAttentionCore
 from runtime.mesh import MeshAxis
@@ -27,16 +23,6 @@ from runtime.plugin import ContextParallelizableModule, PluginId, RuntimePlugin
 from runtime.plugins.zero_common import ChainedWork
 from runtime.types import ParamRole, RuntimePhase, SetupPhase
 from utils.attention_backend import AttentionBackend
-from utils.constants import (
-    HIDDEN_STATES_KEY,
-    IGNORE_INDEX,
-    INPUT_IDS_KEY,
-    LABELS_KEY,
-    LOSS_WEIGHT_KEY,
-    POSITION_IDS_KEY,
-    POSITION_OFFSET_KEY,
-    SEQUENCE_IDS_KEY,
-)
 from utils.distributed import all_reduce_tensor
 
 
@@ -77,7 +63,6 @@ class ContextParallelPlugin(RuntimePlugin):
             and PluginId.ZERO2 not in active
             and PluginId.ZERO3 not in active
         )
-        self._token_planner = _resolve_context_token_planner(runtime.plan)
         self._validate_runtime_support()
 
     def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
@@ -95,6 +80,11 @@ class ContextParallelPlugin(RuntimePlugin):
         if not isinstance(model, ContextParallelizableModule):
             return model
         spec = model.context_parallel_spec()
+        assert self.runtime is not None
+        planner_type = self.runtime.plan.cp_token_planner
+        if planner_type is None:
+            raise ValueError("ContextParallelPlugin requires ParallelPlan.cp_token_planner")
+        transformed_any = False
         for path in spec.attention_paths:
             if self.runtime.is_module_path_omitted(path):
                 continue
@@ -104,12 +94,17 @@ class ContextParallelPlugin(RuntimePlugin):
                 raise
             _validate_supported_attention_module(module)
             attention_backend = getattr(module.attn_core, "attention_backend", AttentionBackend.EAGER)
-            module.attn_core = _build_cp_attention_core(
+            core = _build_cp_attention_core(
                 self.cp_group,
                 self.runtime.plan.cp_attn_core,
                 step_context=self.runtime.state.step_context,
                 attention_backend=attention_backend,
             )
+            module.attn_core = core
+            transformed_any = True
+        if not transformed_any:
+            raise ValueError("ContextParallelPlugin found no attention cores to transform")
+        self._token_planner = build_context_token_planner(planner_type)
         return model
 
     def annotate_param_metadata(self) -> None:
@@ -181,12 +176,20 @@ class ContextParallelPlugin(RuntimePlugin):
             return
         if phase == RuntimePhase.PRE_STEP_RUNNER:
             assert self.runtime is not None
-            self.runtime.state.batch = _shard_batch_for_cp(
-                self.runtime.state.batch,
-                rank=self.rank,
-                world_size=self.world_size,
-                planner=self._token_planner,
-            )
+            if self.runtime.plan.batch_data_cp_aware:
+                # The loader used this plugin's exact planner.  Do not slice a
+                # second time; restore the canonical CP token contribution for
+                # logging because the local batch contains only 1 / CP tokens.
+                tokens = self.runtime.state.metadata.get("tokens")
+                if isinstance(tokens, int):
+                    self.runtime.state.metadata["tokens"] = tokens * self.world_size
+            else:
+                if self._token_planner is None:
+                    raise RuntimeError("ContextParallelPlugin has no token planner after setup")
+                self.runtime.state.batch = ContextParallelBatchSharder(
+                    planner=self._token_planner,
+                    world_size=self.world_size,
+                ).shard(self.runtime.state.batch, rank=self.rank)
             return
         if phase == RuntimePhase.POST_BACKWARD:
             self._maybe_launch_grad_sync()
@@ -237,13 +240,15 @@ class ContextParallelPlugin(RuntimePlugin):
         mesh = self.runtime.mesh
         if mesh.cp <= 1:
             raise ValueError("ContextParallelPlugin requires mesh.cp > 1")
+        if self.runtime.plan.cp_token_planner is None:
+            raise ValueError("ContextParallelPlugin requires ParallelPlan.cp_token_planner")
 
 def _build_cp_attention_core(
     group: dist.ProcessGroup,
     attention_core_type: ContextParallelAttentionCoreType,
     step_context: "StepContext | None" = None,
     attention_backend: str = AttentionBackend.EAGER,
-) -> ContextParallelAttentionCore:
+) -> AllGatherKvAttentionCore | RingAttentionCore:
     if attention_core_type == ContextParallelAttentionCoreType.ALL_GATHER_KV:
         return AllGatherKvAttentionCore(group, attention_backend=attention_backend)
     if attention_core_type == ContextParallelAttentionCoreType.RING:
@@ -258,159 +263,3 @@ def _validate_supported_attention_module(module: nn.Module) -> None:
             "ContextParallelPlugin requires attention modules to expose a protocol-compatible "
             f"`attn_core`, got module type={type(module).__name__}"
         )
-
-
-def _shard_batch_for_cp(
-    batch: Any,
-    *,
-    rank: int,
-    world_size: int,
-    attention_core_type: ContextParallelAttentionCoreType | None = None,
-    planner: ContextTokenPlanner | None = None,
-) -> Any:
-    if world_size == 1:
-        return batch
-    seq_len = _infer_seq_len(batch)
-    if planner is None:
-        if attention_core_type is None:
-            raise ValueError("_shard_batch_for_cp requires a planner or attention_core_type")
-        planner = _legacy_context_token_planner(attention_core_type)
-    plan = planner.plan(seq_len=seq_len, world_size=world_size)
-    local_positions = plan.local_positions(rank)
-    if isinstance(batch, dict):
-        sharded = dict(batch)
-        for key in (INPUT_IDS_KEY, LABELS_KEY, HIDDEN_STATES_KEY, POSITION_IDS_KEY, SEQUENCE_IDS_KEY):
-            value = sharded.get(key)
-            sharded[key] = _shard_batch_item(value, local_positions, seq_len)
-        sharded[POSITION_IDS_KEY] = _materialize_position_ids(
-            sharded.get(POSITION_IDS_KEY),
-            positions=local_positions,
-            seq_len=seq_len,
-            reference=_batch_reference_tensor(sharded),
-        )
-        sharded[POSITION_OFFSET_KEY] = int(local_positions[0].item())
-        sharded[LOSS_WEIGHT_KEY] = _loss_weight(batch.get(LABELS_KEY), sharded.get(LABELS_KEY))
-        return sharded
-    if isinstance(batch, tuple):
-        input_ids = _shard_batch_item(batch[0], local_positions, seq_len) if len(batch) > 0 else None
-        labels = _shard_batch_item(batch[1], local_positions, seq_len) if len(batch) > 1 else None
-        return {
-            INPUT_IDS_KEY: input_ids,
-            LABELS_KEY: labels,
-            POSITION_IDS_KEY: _materialize_position_ids(
-                None,
-                positions=local_positions,
-                seq_len=seq_len,
-                reference=input_ids if torch.is_tensor(input_ids) else labels,
-            ),
-            POSITION_OFFSET_KEY: int(local_positions[0].item()),
-            LOSS_WEIGHT_KEY: _loss_weight(batch[1] if len(batch) > 1 else None, labels),
-        }
-    if isinstance(batch, list):
-        input_ids = _shard_batch_item(batch[0], local_positions, seq_len) if len(batch) > 0 else None
-        labels = _shard_batch_item(batch[1], local_positions, seq_len) if len(batch) > 1 else None
-        return {
-            INPUT_IDS_KEY: input_ids,
-            LABELS_KEY: labels,
-            POSITION_IDS_KEY: _materialize_position_ids(
-                None,
-                positions=local_positions,
-                seq_len=seq_len,
-                reference=input_ids if torch.is_tensor(input_ids) else labels,
-            ),
-            POSITION_OFFSET_KEY: int(local_positions[0].item()),
-            LOSS_WEIGHT_KEY: _loss_weight(batch[1] if len(batch) > 1 else None, labels),
-        }
-    raise TypeError(f"ContextParallelPlugin v0 does not support batch type={type(batch).__name__}")
-
-
-def _infer_seq_len(batch: Any) -> int:
-    if isinstance(batch, dict):
-        return _infer_seq_len_from_dict(batch)
-    if isinstance(batch, (tuple, list)):
-        return _infer_seq_len_from_sequence(batch)
-    raise TypeError(f"ContextParallelPlugin v0 does not support batch type={type(batch).__name__}")
-
-
-def _infer_seq_len_from_dict(batch: dict[str, Any]) -> int:
-    for key in (INPUT_IDS_KEY, LABELS_KEY, HIDDEN_STATES_KEY, SEQUENCE_IDS_KEY):
-        value = batch.get(key)
-        if torch.is_tensor(value) and value.dim() >= 2:
-            return int(value.size(1))
-    position_ids = batch.get(POSITION_IDS_KEY)
-    if torch.is_tensor(position_ids):
-        if position_ids.dim() >= 2:
-            return int(position_ids.size(1))
-        if position_ids.dim() == 1:
-            return int(position_ids.size(0))
-    raise TypeError("ContextParallelPlugin could not infer sequence length from dict batch")
-
-
-def _infer_seq_len_from_sequence(batch: tuple[Any, ...] | list[Any]) -> int:
-    for value in batch:
-        if torch.is_tensor(value) and value.dim() >= 2:
-            return int(value.size(1))
-    raise TypeError("ContextParallelPlugin could not infer sequence length from tuple/list batch")
-
-
-def _resolve_context_token_planner(plan: Any) -> ContextTokenPlanner:
-    config = plan.cp_token_planner
-    if config is not None:
-        return build_context_token_planner(config)
-    return _legacy_context_token_planner(plan.cp_attn_core)
-
-
-def _legacy_context_token_planner(
-    attention_core_type: ContextParallelAttentionCoreType,
-) -> ContextTokenPlanner:
-    if attention_core_type == ContextParallelAttentionCoreType.RING:
-        return FixedZigzagTokenPlanner()
-    if attention_core_type == ContextParallelAttentionCoreType.ALL_GATHER_KV:
-        return FixedContiguousTokenPlanner()
-    raise ValueError(f"unsupported CP attention_core={attention_core_type!r}")
-
-
-def _batch_reference_tensor(batch: dict[str, Any]) -> torch.Tensor | None:
-    for key in (INPUT_IDS_KEY, LABELS_KEY, HIDDEN_STATES_KEY, SEQUENCE_IDS_KEY):
-        value = batch.get(key)
-        if torch.is_tensor(value) and value.dim() >= 2:
-            return value
-    return None
-
-
-def _materialize_position_ids(
-    current: Any,
-    *,
-    positions: torch.Tensor,
-    seq_len: int,
-    reference: torch.Tensor | None,
-) -> torch.Tensor:
-    device = reference.device if reference is not None else positions.device
-    if torch.is_tensor(current):
-        sharded = _shard_batch_item(current, positions, seq_len)
-        if torch.is_tensor(sharded):
-            return sharded.to(device=device, dtype=torch.long)
-    if reference is None:
-        return positions.to(dtype=torch.long)
-    batch_size = int(reference.size(0))
-    return positions.unsqueeze(0).expand(batch_size, -1).contiguous().to(device=device, dtype=torch.long)
-
-
-def _shard_batch_item(value: Any, positions: torch.Tensor, seq_len: int) -> Any:
-    if torch.is_tensor(value):
-        index = positions.to(device=value.device)
-        if value.dim() >= 2 and value.size(1) == seq_len:
-            return value.index_select(1, index).contiguous()
-        if value.dim() == 1 and value.size(0) == seq_len:
-            return value.index_select(0, index).contiguous()
-    return value
-
-
-def _loss_weight(global_labels: Any, local_labels: Any) -> float | None:
-    if not torch.is_tensor(global_labels) or not torch.is_tensor(local_labels):
-        return None
-    global_count = int((global_labels != IGNORE_INDEX).sum().item())
-    local_count = int((local_labels != IGNORE_INDEX).sum().item())
-    if global_count == 0:
-        return None
-    return local_count / global_count

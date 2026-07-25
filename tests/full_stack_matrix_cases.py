@@ -173,6 +173,10 @@ def _case(
 ) -> MatrixCase:
     args = dict(_BASE_ARGS[module_key])
     args.update(overrides)
+    if int(args["cp_size"]) > 1 and "cp_token_planner" not in overrides:
+        args["cp_token_planner"] = (
+            "fixed_zigzag" if args["cp_attn_core"] == "ring" else "fixed_contiguous"
+        )
     return MatrixCase(name=name, module_key=module_key, args=args, needs_checkpoint_dir=needs_checkpoint_dir)
 
 

@@ -12,6 +12,7 @@ from runtime.layers.flash_utils import flash_attn_dense_block_fallback_reason
 from runtime.layers.functional import flash_ring_attention, ring_shift
 from runtime.layers.ring_layout import has_zigzag_ring_layout
 from utils.attention_backend import AttentionBackend, validate_attention_backend
+from utils.profiling import profiled
 
 if TYPE_CHECKING:
     from runtime.types import StepContext
@@ -84,6 +85,7 @@ class RingAttentionCore(nn.Module):
                 mb_idx=mb_idx,
             )
         if self.attention_backend == AttentionBackend.FLASH_ATTN:
+            assert flash_ring_reason is not None
             if not type(self)._warned_flash_attn_fallback_global:
                 logging.warning(
                     "RingAttentionCore flash_attn backend falling back to eager ring attention: %s",
@@ -109,6 +111,7 @@ class RingAttentionCore(nn.Module):
         )
 
 
+@profiled("maltos::cp.ring.single_rank")
 def _single_rank_ring_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -149,6 +152,7 @@ def _single_rank_ring_attention(
     return (running_acc / running_lse.clamp_min(1e-20).unsqueeze(-1)).to(dtype=v.dtype)
 
 
+@profiled("maltos::cp.ring.eager")
 def _eager_ring_attention(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -5,13 +5,12 @@ from .context_interfaces import (
 from .context_token_planner import (
     ContextTokenPlan,
     ContextTokenPlanner,
-    ContextTokenPlannerConfig,
-    ContextTokenPlannerPhase,
     ContextTokenPlannerType,
     FixedContiguousTokenPlanner,
     FixedZigzagTokenPlanner,
     build_context_token_planner,
 )
+from .context_batch import ContextParallelBatchSharder
 from .expert_interfaces import ExpertParallelMoEModule
 from .plan import ParallelPlan, PipelineScheduleConfig, PipelineScheduleType
 from .protocols import (
@@ -36,10 +35,9 @@ __all__ = [
     "ContextParallelSpec",
     "ContextParallelAttentionCore",
     "ContextParallelAttentionCoreType",
+    "ContextParallelBatchSharder",
     "ContextTokenPlan",
     "ContextTokenPlanner",
-    "ContextTokenPlannerConfig",
-    "ContextTokenPlannerPhase",
     "ContextTokenPlannerType",
     "ExpertParallelMoEModule",
     "ExpertParallelSpec",

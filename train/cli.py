@@ -37,6 +37,8 @@ from models import (
 from models.llama import LlamaRMSNorm
 from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
+from parallel.context_batch import ContextParallelBatchSharder
+from parallel.context_token_planner import ContextTokenPlannerType, build_context_token_planner
 from parallel.context_interfaces import ContextParallelAttentionCoreType
 from parallel.plan import PipelineScheduleConfig
 from runtime import MeshConfig, RuntimeCore
@@ -125,11 +127,21 @@ def main() -> None:
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
-    dp_rank = rank // (args.pp_size * args.cp_size * args.tp_size)
-    data_paths, loader, data_format = _build_dataloader(args, dp_rank=dp_rank)
+    dp_rank, _, _, _ = MeshConfig(
+        dp=args.dp_size,
+        pp=args.pp_size,
+        cp=args.cp_size,
+        tp=args.tp_size,
+        ep=args.ep_size,
+    ).rank_coordinates(rank)
     model = _build_model(args)
     initial_trainable_params = _count_trainable_params(model)
     runtime = _build_runtime(args, model, device)
+    data_paths, loader, data_format = _build_dataloader(
+        args,
+        dp_rank=dp_rank,
+        cp_token_planner=runtime.plan.cp_token_planner,
+    )
     logger, checkpoint_uploader = (None, None) if args.dry_run else _build_logging(args, rank)
     trainer = Trainer(
         runtime=runtime,
@@ -329,6 +341,8 @@ def _build_runtime(
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=args.ep_size),
         plan=ParallelPlan(
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
+            batch_data_cp_aware=args.batch_data_cp_aware,
+            cp_token_planner=ContextTokenPlannerType(args.cp_token_planner) if args.cp_token_planner is not None else None,
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
         ),
         device=device,
@@ -724,7 +738,22 @@ def _expand_data_paths(items: list[str]) -> list[Path]:
     return paths
 
 
-def _build_dataloader(args: argparse.Namespace, *, dp_rank: int):
+def _build_dataloader(
+    args: argparse.Namespace,
+    *,
+    dp_rank: int,
+    cp_token_planner: ContextTokenPlannerType | None = None,
+):
+    cp_batch_sharder = None
+    if args.batch_data_cp_aware:
+        if args.cp_size <= 1:
+            raise ValueError("--batch-data-cp-aware requires --cp-size > 1")
+        if cp_token_planner is None:
+            raise ValueError("--batch-data-cp-aware requires --cp-token-planner")
+        cp_batch_sharder = ContextParallelBatchSharder(
+            planner=build_context_token_planner(cp_token_planner),
+            world_size=args.cp_size,
+        )
     data_format = _infer_data_format(args.data, explicit=args.data_format)
     if data_format == "pretrain":
         data_paths = _expand_data_paths(args.data)
@@ -735,6 +764,7 @@ def _build_dataloader(args: argparse.Namespace, *, dp_rank: int):
             dp_rank=dp_rank,
             dp_world_size=args.dp_size,
             seed=args.seed,
+            cp_batch_sharder=cp_batch_sharder,
         )
         return data_paths, loader, data_format
 
@@ -750,6 +780,7 @@ def _build_dataloader(args: argparse.Namespace, *, dp_rank: int):
         dp_rank=dp_rank,
         dp_world_size=args.dp_size,
         seed=args.seed,
+        cp_batch_sharder=cp_batch_sharder,
     )
     return list(dataset.shard_paths), loader, data_format
 

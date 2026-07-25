@@ -41,6 +41,7 @@ from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
+from parallel.context_token_planner import ContextTokenPlannerType
 from state import load_sharded_checkpoint, save_sharded_checkpoint
 
 
@@ -74,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pp-schedule", choices=("afab", "1f1b"), default="afab")
     parser.add_argument("--grad-accum-steps", type=int, choices=(1, 2), default=1)
     parser.add_argument("--cp-attn-core", choices=("all_gather_kv", "ring"), default="all_gather_kv")
+    parser.add_argument("--cp-token-planner", choices=tuple(item.value for item in ContextTokenPlannerType))
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29630)
     parser.add_argument("--backend", type=str, default="gloo")
@@ -171,6 +173,7 @@ def _build_runtime(
         plan=ParallelPlan(
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
+            cp_token_planner=ContextTokenPlannerType(args.cp_token_planner) if args.cp_token_planner else None,
         ),
         model=model,
         grad_accum_steps=args.grad_accum_steps,
