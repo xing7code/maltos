@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 import json
+import socket
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -22,14 +24,27 @@ from runtime.layers.cp_functional import dynamic_flash_ring_attention
 from runtime.layers.flash_utils import flash_attn_block_fallback_reason
 
 
-_PORT = 29684
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return int(listener.getsockname()[1])
 
 
-def _worker(rank: int) -> None:
+def _worker(rank: int, port: int) -> None:
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{_PORT}", rank=rank, world_size=3)
+    device = torch.device("cuda", rank)
+    print(f"rank {rank}: initializing NCCL profiler test", flush=True)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=3,
+        timeout=timedelta(seconds=60),
+        device_id=device,
+    )
     try:
-        device = torch.device("cuda", rank)
+        print(f"rank {rank}: NCCL ready", flush=True)
         q = torch.randn(1, 4, 256, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
         k = torch.randn(1, 2, 256, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
         v = torch.randn(1, 2, 256, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -106,7 +121,9 @@ def main() -> None:
     if reason is not None:
         print(f"SKIP: {reason}")
         return
-    mp.spawn(_worker, nprocs=3, join=True)
+    port = _find_free_port()
+    print(f"HDP overlap profiler rendezvous port: {port}", flush=True)
+    mp.spawn(_worker, args=(port,), nprocs=3, join=True)
 
 
 if __name__ == "__main__":
