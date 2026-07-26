@@ -6,6 +6,8 @@ rank-local schedule.
 """
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -37,6 +39,12 @@ class ByteScaleHdpPlugin(RuntimePlugin):
         self.config = config
         self._attention_cores: list[HdpBalancedAttentionCore] = []
         self._metrics: dict[str, float | int] = {}
+        self._dummy_wave_count = 0
+        self._real_wave_count = 0
+        self._dummy_wave_seconds = 0.0
+        self._real_wave_seconds = 0.0
+        self._dummy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._real_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 
     @property
     def hdp_group(self) -> dist.ProcessGroup:
@@ -90,6 +98,8 @@ class ByteScaleHdpPlugin(RuntimePlugin):
     def on_step_phase(self, phase: RuntimePhase) -> None:
         assert self.runtime is not None
         if phase is RuntimePhase.PRE_STEP_RUNNER:
+            if self.runtime.state.step_context.accum_start:
+                self._reset_wave_overhead()
             schedules = tuple(_schedule_from_batch(wave) for wave in _waves_from_batch(self.runtime.state.batch))
             for schedule in schedules:
                 if schedule.partition_tokens != self.config.partition_tokens:
@@ -105,16 +115,65 @@ class ByteScaleHdpPlugin(RuntimePlugin):
                 core.set_active_schedule(schedule)
 
     def collect_metrics(self) -> dict[str, float | int]:
-        metrics = self._metrics
+        self._drain_ready_event_timings()
+        metrics = dict(self._metrics)
+        metrics.update(
+            {
+                "dummy_wave_count": self._dummy_wave_count,
+                "real_wave_count": self._real_wave_count,
+                "dummy_wave_sec": self._dummy_wave_seconds,
+                "real_wave_sec": self._real_wave_seconds,
+                "dummy_wave_sec_sum": self._dummy_wave_seconds,
+                "real_wave_sec_sum": self._real_wave_seconds,
+            }
+        )
         self._metrics = {}
         return metrics
 
     def build_step_runner(self):
-        return _HdpWaveStepRunner()
+        return _HdpWaveStepRunner(self)
+
+    def _reset_wave_overhead(self) -> None:
+        self._dummy_wave_count = self._real_wave_count = 0
+        self._dummy_wave_seconds = self._real_wave_seconds = 0.0
+        self._dummy_events.clear()
+        self._real_events.clear()
+
+    def record_wave_overhead(
+        self,
+        *,
+        is_dummy: bool,
+        host_seconds: float,
+        cuda_events: tuple[torch.cuda.Event, torch.cuda.Event] | None,
+    ) -> None:
+        if is_dummy:
+            self._dummy_wave_count += 1
+            self._dummy_wave_seconds += host_seconds
+            if cuda_events is not None:
+                self._dummy_events.append(cuda_events)
+        else:
+            self._real_wave_count += 1
+            self._real_wave_seconds += host_seconds
+            if cuda_events is not None:
+                self._real_events.append(cuda_events)
+
+    def _drain_ready_event_timings(self) -> None:
+        """Resolve CUDA events only at the normal optimizer-step metric boundary."""
+        for events, attribute in (
+            (self._dummy_events, "_dummy_wave_seconds"),
+            (self._real_events, "_real_wave_seconds"),
+        ):
+            for start, end in events:
+                end.synchronize()
+                setattr(self, attribute, getattr(self, attribute) + start.elapsed_time(end) / 1e3)
+            events.clear()
 
 
 class _HdpWaveStepRunner:
     """Run every global HDP wave so ZeRO/DDP module-hook order stays aligned."""
+
+    def __init__(self, plugin: ByteScaleHdpPlugin) -> None:
+        self.plugin = plugin
 
     def run(self, runtime, batch) -> torch.Tensor:
         losses: list[torch.Tensor] = []
@@ -125,11 +184,28 @@ class _HdpWaveStepRunner:
                 wave_count=len(waves),
             )
             runtime.state.batch = wave
+            layout = _schedule_from_batch(wave)
+            is_dummy = not layout.documents
+            start_host = time.perf_counter()
+            start_event = end_event = None
+            if torch.cuda.is_available():
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
             DefaultStepRunner.run_forward(runtime, wave)
             if not torch.is_tensor(runtime.state.loss):
                 raise TypeError("ByteScale HDP requires each wave to produce a Tensor loss")
             losses.append(runtime.state.loss.detach())
             DefaultStepRunner.run_backward(runtime)
+            if start_event is not None and end_event is not None:
+                end_event.record()
+                cuda_events = (start_event, end_event)
+                host_seconds = 0.0
+            else:
+                cuda_events = None
+                host_seconds = time.perf_counter() - start_host
+            self.plugin.record_wave_overhead(
+                is_dummy=is_dummy, host_seconds=host_seconds, cuda_events=cuda_events)
         total_loss = torch.stack(losses).sum()
         runtime.state.loss = total_loss
         runtime.state.metadata["raw_loss_for_metrics"] = total_loss
@@ -154,7 +230,7 @@ def _waves_from_batch(batch) -> tuple[dict, ...]:
     return waves
 
 
-def _layout_metrics(layout: ByteScaleHdpLocalLayout) -> dict[str, int]:
+def _layout_metrics(layout: ByteScaleHdpLocalLayout) -> dict[str, float | int]:
     return {
         "global_documents": layout.global_document_count,
         "local_documents": len(layout.documents),
@@ -168,7 +244,7 @@ def _layout_metrics(layout: ByteScaleHdpLocalLayout) -> dict[str, int]:
     }
 
 
-def _wave_metrics(layouts: tuple[ByteScaleHdpLocalLayout, ...]) -> dict[str, int]:
+def _wave_metrics(layouts: tuple[ByteScaleHdpLocalLayout, ...]) -> dict[str, float | int]:
     metrics = _layout_metrics(layouts[0])
     metrics["local_documents"] = sum(len(layout.documents) for layout in layouts)
     metrics["local_valid_tokens"] = sum(layout.valid_tokens for layout in layouts)

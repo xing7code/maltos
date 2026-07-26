@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -17,7 +18,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from data import PackedSFTDataset, PretrainingDataLoader, SFTDataLoader, TokenShardDataset
 from data.bytescale_hdp import ByteScaleHdpDataLoader
-from parallel.hdp_helper import ByteScaleHdpBalancedConfig
+from parallel.hdp_helper import ByteScaleHdpBalancedConfig, ByteScaleHdpCostModel
 from models import (
     ActivationCheckpointConfig,
     LlamaConfig,
@@ -118,6 +119,9 @@ def main() -> None:
             raise ValueError("--hdp-partition-tokens must be positive")
         if args.hdp_partition_tokens % 2:
             raise ValueError("--hdp-partition-tokens must be even for symmetric zigzag partitions")
+        ByteScaleHdpBalancedConfig(args.hdp_partition_tokens).validate_tp_sp_partition(
+            tp_size=args.tp_size, use_sp=args.use_sp
+        )
     if args.ep_size > 1 and args.dp_size % args.ep_size != 0:
         raise ValueError("--ep-size must divide --dp-size")
     if args.ep_size > 1 and args.model != "tiny_moe":
@@ -282,6 +286,20 @@ def _build_model(args: argparse.Namespace) -> torch.nn.Module:
     )
 
 
+def _build_hdp_config(args: argparse.Namespace) -> ByteScaleHdpBalancedConfig:
+    if args.hdp_partition_tokens is None:
+        raise ValueError("--hdp-partition-tokens is required for HDP")
+    return ByteScaleHdpBalancedConfig(
+        partition_tokens=args.hdp_partition_tokens,
+        balance_delta=args.hdp_balance_delta,
+        cost_model=ByteScaleHdpCostModel(
+            alpha=args.hdp_cost_alpha,
+            beta=args.hdp_cost_beta,
+            gamma=args.hdp_cost_gamma,
+        ),
+    )
+
+
 def _build_runtime(
     args,
     model: torch.nn.Module,
@@ -304,7 +322,7 @@ def _build_runtime(
     if args.hdp_balanced:
         plugins.append(
             ByteScaleHdpPlugin(
-                config=ByteScaleHdpBalancedConfig(args.hdp_partition_tokens)
+                config=_build_hdp_config(args)
             )
         )
     elif args.cp_size > 1:
@@ -478,6 +496,12 @@ def _parse_tags(tags: str | list[str] | None) -> list[str] | None:
     return parsed or None
 
 
+def _global_batch_tokens(args: argparse.Namespace) -> int:
+    """HDP micro_batch_size already names the global logical batch."""
+    dp_replicas = 1 if args.hdp_balanced else args.dp_size
+    return args.micro_batch_size * args.seq_len * dp_replicas * args.grad_accum_steps
+
+
 def _print_run_summary(
     *,
     args: argparse.Namespace,
@@ -492,7 +516,7 @@ def _print_run_summary(
     if rank != 0:
         return
     local_trainable_params = _count_trainable_params(runtime.model)
-    global_batch_tokens = args.micro_batch_size * args.seq_len * args.dp_size * args.grad_accum_steps
+    global_batch_tokens = _global_batch_tokens(args)
     total_train_tokens = global_batch_tokens * args.max_steps
     plugin_names = [plugin.name for plugin in runtime.plugins]
     flops_per_token = runtime.state.static_metrics.get("perf/flops_per_token")
@@ -598,7 +622,7 @@ def _build_run_manifest(
     world_size: int,
 ) -> dict[str, Any]:
     local_trainable_params = _count_trainable_params(runtime.model)
-    global_batch_tokens = args.micro_batch_size * args.seq_len * args.dp_size * args.grad_accum_steps
+    global_batch_tokens = _global_batch_tokens(args)
     total_train_tokens = global_batch_tokens * args.max_steps
     optimizer, scheduler = runtime.get_optimizer_and_scheduler()
     return {
@@ -801,7 +825,7 @@ def _build_dataloader(
                 loader,
                 hdp_rank=hdp_rank,
                 hdp_world_size=args.dp_size,
-                config=ByteScaleHdpBalancedConfig(args.hdp_partition_tokens),
+                config=_build_hdp_config(args),
             )
         return data_paths, loader, data_format
 
@@ -824,7 +848,7 @@ def _build_dataloader(
             loader,
             hdp_rank=hdp_rank,
             hdp_world_size=args.dp_size,
-            config=ByteScaleHdpBalancedConfig(args.hdp_partition_tokens),
+            config=_build_hdp_config(args),
         )
     return list(dataset.shard_paths), loader, data_format
 

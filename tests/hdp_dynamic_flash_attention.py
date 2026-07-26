@@ -13,15 +13,72 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import runtime.layers.cp_functional as cp_functional
+import runtime.layers.hdp_attention as hdp_attention
+from data.bytescale_hdp import schedule_document_waves
 from runtime.layers.flash_utils import flash_attn_block_fallback_reason
 from runtime.layers.hdp_attention import HdpBalancedAttentionCore, _expand_kv_for_query_heads, _single_document_attention
 from runtime.layers.cp_functional import dynamic_flash_ring_attention
 from runtime.layers.attn_masking_utils import build_example_causal_mask
+from parallel.hdp_helper import ByteScaleHdpBalancedConfig, DocumentIndices
 from utils.attention_backend import eager_causal_attention
 
 
 _PORT = 29683
 _ATOL = 3e-2
+
+
+def _check_local_documents_are_fused(rank: int) -> None:
+    """Two D=1 documents must become one Flash varlen invocation, not two."""
+    if rank != 0:
+        return
+    layout = schedule_document_waves(
+        (DocumentIndices(0, (0, 1)), DocumentIndices(0, (0, 1, 2, 3))),
+        rank=0,
+        world_size=1,
+        config=ByteScaleHdpBalancedConfig(partition_tokens=8),
+        global_valid_targets=6,
+    )[0]
+    device = torch.device("cuda", rank)
+    q = torch.randn(1, 4, 8, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 2, 8, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 2, 8, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
+    position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], device=device)
+    sequence_ids = torch.tensor([[1, 1, 1, 1, 0, 0, -1, -1]], device=device)
+    core = HdpBalancedAttentionCore(dist.group.WORLD, attention_backend="flash_attn")
+    core.set_active_schedule(layout)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    eager_core = HdpBalancedAttentionCore(dist.group.WORLD, attention_backend="eager")
+    eager_core.set_active_schedule(layout)
+    eager_out = eager_core(
+        q_ref, k_ref, v_ref,
+        position_offset=0, position_ids=position_ids, sequence_ids=sequence_ids,
+    )
+    eager_out.float().sum().backward()
+    original = hdp_attention.flash_attn_varlen_segments
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    hdp_attention.flash_attn_varlen_segments = counted
+    try:
+        flash_out = core(
+            q, k, v,
+            position_offset=0, position_ids=position_ids, sequence_ids=sequence_ids,
+        )
+        flash_out.float().sum().backward()
+    finally:
+        hdp_attention.flash_attn_varlen_segments = original
+    assert calls == 1
+    assert ("flash_local_segments", str(device)) in layout.attention_metadata_cache
+    torch.testing.assert_close(flash_out, eager_out, atol=_ATOL, rtol=_ATOL)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=_ATOL, rtol=_ATOL)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=_ATOL, rtol=_ATOL)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=_ATOL, rtol=_ATOL)
 
 
 def _check_document(rank: int, participants: tuple[int, ...], *, packed: bool) -> None:
@@ -111,6 +168,8 @@ def _worker(rank: int) -> None:
         dist.barrier()
         # A second document with another subset verifies independent document rings.
         _check_document(rank, (1, 2), packed=False)
+        dist.barrier()
+        _check_local_documents_are_fused(rank)
         dist.barrier()
         if rank == 0:
             print("PASS: HDP Flash Ring single/2/3-rank, noncontiguous, packed, GQA, dummy coverage")

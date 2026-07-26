@@ -5,12 +5,14 @@ from types import SimpleNamespace
 import torch
 
 from data.bytescale_hdp import (
+    _select_best_fit_document,
     build_bytescale_local_batch,
     build_bytescale_local_batches,
     schedule_document_waves,
 )
-from parallel.hdp_helper import ByteScaleHdpBalancedConfig, DocumentIndices
+from parallel.hdp_helper import ByteScaleHdpBalancedConfig, ByteScaleHdpCostModel, DocumentIndices
 from runtime.mesh import MeshAxis
+from runtime.layers.hdp_attention import _local_flash_segments
 from runtime.plugin import PluginId
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.hdp import ByteScaleHdpPlugin, _layout_metrics
@@ -54,6 +56,17 @@ def test_hdp_balanced_partition_tokens_must_be_even_for_zigzag() -> None:
         raise AssertionError("HDP zigzag must reject an odd partition length")
 
 
+def test_hdp_sp_requires_partition_divisible_by_tp_degree() -> None:
+    config = ByteScaleHdpBalancedConfig(partition_tokens=10)
+    try:
+        config.validate_tp_sp_partition(tp_size=3, use_sp=True)
+    except ValueError as exc:
+        assert "divisible" in str(exc)
+    else:
+        raise AssertionError("HDP+SP must reject a non-divisible partition")
+    config.validate_tp_sp_partition(tp_size=2, use_sp=True)
+
+
 def test_hdp_rejects_sequences_beyond_cp_only_capacity() -> None:
     try:
         ByteScaleHdpBalancedConfig(partition_tokens=4).participant_count(
@@ -64,6 +77,30 @@ def test_hdp_rejects_sequences_beyond_cp_only_capacity() -> None:
         assert "activation offload" in str(exc)
     else:
         raise AssertionError("CP-only HDP must reject a sequence beyond capacity")
+
+
+def test_profiled_cost_model_charges_linear_and_fixed_work_per_participant() -> None:
+    model = ByteScaleHdpCostModel(alpha=0.0, beta=1.5, gamma=2.0)
+    assert model.sequence_cost(4) == 8
+    assert model.participant_cost(4, 2) == 5
+
+
+def test_algorithm_1_best_fit_scans_past_an_unplaceable_document() -> None:
+    config = ByteScaleHdpBalancedConfig(partition_tokens=8)
+    # The 10-token document needs two 6-token slots and cannot use rank 0's
+    # remaining two tokens.  The later 4-token document fits rank 1 and must
+    # still be selected for this wave.
+    candidate = _select_best_fit_document(
+        ((0, DocumentIndices(0, tuple(range(10)))), (1, DocumentIndices(0, tuple(range(4))))),
+        remaining_capacity=(2, 8),
+        predicted_times=(0, 0),
+        world_size=2,
+        config=config,
+    )
+    assert candidate is not None
+    index, placement = candidate
+    assert index == 1
+    assert placement.document_id == 1
 
 
 def test_scheduler_expresses_multiple_ordered_waves() -> None:
@@ -153,6 +190,24 @@ def test_algorithm_2_can_leave_idle_ranks_with_an_empty_local_layout() -> None:
     )
     assert layouts[0][0].document_ids == (0,)
     assert all(rank_layouts[0].document_ids == () for rank_layouts in layouts[1:])
+
+
+def test_local_flash_segments_fuse_documents_and_cache_wave_metadata() -> None:
+    indices = tuple(DocumentIndices(0, tuple(range(length))) for length in (2, 4))
+    layout = schedule_document_waves(
+        indices,
+        rank=0,
+        world_size=1,
+        config=ByteScaleHdpBalancedConfig(partition_tokens=8),
+        global_valid_targets=6,
+    )[0]
+    local_only = tuple(document for document in layout.documents if len(document.participant_ranks) == 1)
+    indices_a, cu_a, max_a = _local_flash_segments(layout, local_only, device=torch.device("cpu"))
+    indices_b, cu_b, max_b = _local_flash_segments(layout, local_only, device=torch.device("cpu"))
+    assert indices_a.tolist() == [0, 1, 2, 3, 4, 5]
+    assert cu_a.tolist() == [0, 4, 6]
+    assert max_a == 4
+    assert indices_a is indices_b and cu_a is cu_b and max_a == max_b
 
 
 def test_plugin_rejects_fixed_cp() -> None:
@@ -285,11 +340,15 @@ def test_repeated_source_sequence_ids_get_unique_document_identity() -> None:
 def main() -> None:
     test_hdp_balanced_participant_count_is_proportional_to_length()
     test_hdp_balanced_partition_tokens_must_be_even_for_zigzag()
+    test_hdp_sp_requires_partition_divisible_by_tp_degree()
     test_hdp_rejects_sequences_beyond_cp_only_capacity()
+    test_profiled_cost_model_charges_linear_and_fixed_work_per_participant()
+    test_algorithm_1_best_fit_scans_past_an_unplaceable_document()
     test_scheduler_expresses_multiple_ordered_waves()
     test_algorithm_2_dp_balance_uses_hand_computed_buckets_and_costs()
     test_algorithm_2_ties_break_by_rank_then_document_order()
     test_algorithm_2_can_leave_idle_ranks_with_an_empty_local_layout()
+    test_local_flash_segments_fuse_documents_and_cache_wave_metadata()
     test_plugin_rejects_fixed_cp()
     test_plugin_rejects_pipeline_parallelism()
     test_plugin_id_is_hdp()

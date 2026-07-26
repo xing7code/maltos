@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
-import math
 from typing import Any, Sequence
 
 import torch
@@ -65,43 +64,29 @@ def schedule_document_waves(
         enumerate(indices),
         key=lambda item: (-len(item[1].source_indices), item[0]),
     )
-    for bucket in _bucket_by_attention_flops(ordered_documents, world_size):
+    for bucket in _bucket_by_profiled_cost(ordered_documents, world_size, config=config):
         remaining = list(bucket)
         while remaining:
             remaining_capacity = [config.partition_tokens] * world_size
             wave: list[_Placement] = []
             while remaining:
-                document_id, source = remaining[0]
-                sequence_length = len(source.source_indices)
-                degree = config.participant_count(sequence_length, world_size=world_size)
-                padded_length = _round_up(sequence_length, 2 * degree)
-                local_length = padded_length // degree
-                participants = _select_algorithm_2_workers(
-                    predicted_times,
-                    worker_count=degree,
-                    balance_delta=config.balance_delta,
-                    eligible_ranks=tuple(
-                        candidate
-                        for candidate, capacity in enumerate(remaining_capacity)
-                        if capacity >= local_length
-                    ),
+                candidate = _select_best_fit_document(
+                    remaining,
+                    remaining_capacity=remaining_capacity,
+                    predicted_times=predicted_times,
+                    world_size=world_size,
+                    config=config,
                 )
-                if participants is None:
+                if candidate is None:
                     break
-                placement = _Placement(
-                    document_id,
-                    source,
-                    sequence_length,
-                    padded_length,
-                    participants,
-                )
+                remaining_index, placement = candidate
                 wave.append(placement)
-                remaining.pop(0)
-                for participant in participants:
-                    remaining_capacity[participant] -= local_length
-                    predicted_times[participant] += Fraction(
-                        sequence_length * sequence_length,
-                        degree,
+                remaining.pop(remaining_index)
+                for participant in placement.participant_ranks:
+                    remaining_capacity[participant] -= placement.padded_length // len(placement.participant_ranks)
+                    predicted_times[participant] += config.cost_model.participant_cost(
+                        placement.sequence_length,
+                        len(placement.participant_ranks),
                     )
             if not wave:
                 raise AssertionError("validated document could not fit an empty HDP wave")
@@ -239,30 +224,77 @@ def _local_layout_for_wave(
     )
 
 
-def _bucket_by_attention_flops(
+def _select_best_fit_document(
+    remaining: Sequence[tuple[int, DocumentIndices]],
+    *,
+    remaining_capacity: Sequence[int],
+    predicted_times: Sequence[Fraction],
+    world_size: int,
+    config: ByteScaleHdpBalancedConfig,
+) -> tuple[int, _Placement] | None:
+    """Algorithm 1 best-fit scan over every unplaced document in this bucket.
+
+    The old implementation stopped at the first document that did not fit.
+    Here every remaining candidate is tested; the placement leaving the least
+    capacity on its selected participants wins, with original bucket order as
+    deterministic tie-breaker.
+    """
+    best: tuple[tuple[int, int], int, _Placement] | None = None
+    for remaining_index, (document_id, source) in enumerate(remaining):
+        sequence_length = len(source.source_indices)
+        degree = config.participant_count(sequence_length, world_size=world_size)
+        padded_length = _round_up(sequence_length, 2 * degree)
+        local_length = padded_length // degree
+        participants = _select_algorithm_2_workers(
+            predicted_times,
+            worker_count=degree,
+            balance_delta=config.balance_delta,
+            eligible_ranks=tuple(
+                rank for rank, capacity in enumerate(remaining_capacity)
+                if capacity >= local_length
+            ),
+        )
+        if participants is None:
+            continue
+        placement = _Placement(document_id, source, sequence_length, padded_length, participants)
+        # Best fit minimizes space left on the participants; prefer a larger
+        # local chunk before falling back to stable bucket order.
+        score = (sum(remaining_capacity[rank] - local_length for rank in participants), -local_length)
+        candidate = (score, remaining_index, placement)
+        if best is None or candidate[:2] < best[:2]:
+            best = candidate
+    return None if best is None else (best[1], best[2])
+
+
+def _bucket_by_profiled_cost(
     ordered_documents: Sequence[tuple[int, DocumentIndices]],
     world_size: int,
+    *,
+    config: ByteScaleHdpBalancedConfig,
 ) -> tuple[tuple[tuple[int, DocumentIndices], ...], ...]:
-    """Construct Algorithm 2's ordered approximately-equal-FLOPs buckets.
+    """Construct Algorithm 2's ordered approximately-equal-cost buckets.
 
     The paper does not define bucket count or a boundary policy.  We use one
-    rank-share of total ``length ** 2`` proxy FLOPs as the deterministic target
+    rank-share of the profiling cost ``αL² + βL + γ`` as the deterministic target
     and never split a document: append while it fits, otherwise start the next
     bucket.  An oversized document is therefore its own bucket.
     """
-    total_flops = sum(len(source.source_indices) ** 2 for _, source in ordered_documents)
-    target_flops = max(1, math.ceil(total_flops / world_size))
+    total_cost = sum(
+        (config.cost_model.sequence_cost(len(source.source_indices)) for _, source in ordered_documents),
+        start=Fraction(0),
+    )
+    target_cost = max(Fraction(1), total_cost / world_size)
     buckets: list[tuple[tuple[int, DocumentIndices], ...]] = []
     current: list[tuple[int, DocumentIndices]] = []
-    current_flops = 0
+    current_cost = Fraction(0)
     for item in ordered_documents:
-        flops = len(item[1].source_indices) ** 2
-        if current and current_flops + flops > target_flops:
+        cost = config.cost_model.sequence_cost(len(item[1].source_indices))
+        if current and current_cost + cost > target_cost:
             buckets.append(tuple(current))
             current = []
-            current_flops = 0
+            current_cost = Fraction(0)
         current.append(item)
-        current_flops += flops
+        current_cost += cost
     if current:
         buckets.append(tuple(current))
     return tuple(buckets)
@@ -272,7 +304,7 @@ def _select_algorithm_2_workers(
     predicted_times: Sequence[Fraction],
     *,
     worker_count: int,
-    balance_delta: int,
+    balance_delta: float,
     eligible_ranks: Sequence[int],
 ) -> tuple[int, ...] | None:
     """Choose one CP worker group from Algorithm 2's target ranks.
@@ -288,7 +320,7 @@ def _select_algorithm_2_workers(
     target_ranks = [
         rank
         for rank, predicted_time in enumerate(predicted_times)
-        if rank in eligible and max_time - predicted_time > balance_delta
+        if rank in eligible and max_time - predicted_time > Fraction(str(balance_delta))
     ]
     ordered_targets = sorted(target_ranks, key=lambda rank: (predicted_times[rank], rank))
     if not ordered_targets:

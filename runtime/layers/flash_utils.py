@@ -50,6 +50,24 @@ class PackedPrefixQkv:
 
 
 @dataclass(frozen=True)
+class VarlenPrefixMetadata:
+    """Layout-only part of a Flash varlen-prefix invocation.
+
+    The indices and cu-seqlens depend only on the HDP wave's position and
+    sequence-id layout, never on a transformer layer's Q/K/V values.  Keeping
+    them separate lets the HDP core reuse them across layers without retaining
+    activations from the first layer.
+    """
+
+    q_indices: torch.Tensor
+    k_indices: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+
+
+@dataclass(frozen=True)
 class FlashAttnBlockOutput:
     out: torch.Tensor
     lse: torch.Tensor
@@ -447,6 +465,49 @@ def flash_attn_varlen(
     )
 
 
+def flash_attn_varlen_segments(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    token_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """One varlen Flash kernel for independent contiguous local documents.
+
+    ``token_indices`` indexes the flattened ``[batch, tokens]`` layout and
+    ``cu_seqlens`` describes document boundaries.  It is deliberately a
+    layout-only API so HDP can cache both tensors per wave and reuse them in
+    every transformer layer.
+    """
+    if _flash_attn_varlen_func is None:
+        raise RuntimeError("flash-attn is not available")
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4 or k.shape != v.shape:
+        raise ValueError("flash_attn_varlen_segments expects [batch, heads, tokens, dim] Q and native matching K/V")
+    if q.size(0) != k.size(0) or q.size(2) != k.size(2) or q.size(3) != k.size(3) or q.size(1) % k.size(1):
+        raise ValueError("Flash varlen segments requires matching batch/token/head_dim and divisible Q/KV heads")
+    if token_indices.dtype != torch.long or token_indices.device != q.device:
+        raise ValueError("Flash varlen segment indices must be CUDA/CPU long indices on q.device")
+    if cu_seqlens.dtype != torch.int32 or cu_seqlens.device != q.device:
+        raise ValueError("Flash varlen cu_seqlens must be int32 on q.device")
+    if max_seqlen < 1 or token_indices.numel() == 0:
+        return q.new_zeros(q.shape)
+    q_flat = q.transpose(1, 2).contiguous().reshape(-1, q.size(1), q.size(-1)).index_select(0, token_indices)
+    k_flat = k.transpose(1, 2).contiguous().reshape(-1, k.size(1), k.size(-1)).index_select(0, token_indices)
+    v_flat = v.transpose(1, 2).contiguous().reshape(-1, v.size(1), v.size(-1)).index_select(0, token_indices)
+    packed_out = _flash_attn_varlen_func(
+        q_flat, k_flat, v_flat,
+        cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+        dropout_p=0.0, causal=True,
+    )
+    return unpack_varlen_output_by_indices(
+        packed_out, token_indices,
+        batch_size=q.size(0), seq_len=q.size(2),
+        num_heads=q.size(1), head_dim=q.size(-1),
+    )
+
+
 def pack_varlen_prefix_qkv(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -457,6 +518,7 @@ def pack_varlen_prefix_qkv(
     q_sequence_ids: torch.Tensor | None = None,
     k_sequence_ids: torch.Tensor | None = None,
     allow_empty_kv: bool = False,
+    metadata: VarlenPrefixMetadata | None = None,
 ) -> PackedPrefixQkv:
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError("pack_varlen_prefix_qkv expects q, k, v to have shape [batch, heads, seq, dim]")
@@ -505,6 +567,22 @@ def pack_varlen_prefix_qkv(
     q_flat = q.transpose(1, 2).contiguous().reshape(batch_size * q_seq_len, q_num_heads, head_dim)
     k_flat = k.transpose(1, 2).contiguous().reshape(batch_size * k_seq_len, k_num_heads, head_dim)
     v_flat = v.transpose(1, 2).contiguous().reshape(batch_size * k_seq_len, k_num_heads, head_dim)
+
+    if metadata is not None:
+        # Metadata is owned by an immutable HDP wave layout.  It is only valid
+        # for that layout/device; callers keep the cache key structural.
+        return PackedPrefixQkv(
+            q=q_flat.index_select(0, metadata.q_indices),
+            k=k_flat.index_select(0, metadata.k_indices),
+            v=v_flat.index_select(0, metadata.k_indices),
+            q_indices=metadata.q_indices,
+            k_indices=metadata.k_indices,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            max_seqlen_q=metadata.max_seqlen_q,
+            max_seqlen_k=metadata.max_seqlen_k,
+            token_mask=q_valid,
+        )
 
     q_segments: list[torch.Tensor] = []
     k_segments: list[torch.Tensor] = []
@@ -645,9 +723,14 @@ def flash_attn_varlen_prefix_with_lse(
     q_sequence_ids: torch.Tensor | None = None,
     k_sequence_ids: torch.Tensor | None = None,
     allow_empty_kv: bool = False,
+    metadata: VarlenPrefixMetadata | None = None,
+    metadata_cache: dict[object, VarlenPrefixMetadata] | None = None,
+    metadata_cache_key: object | None = None,
 ) -> FlashAttnBlockOutput:
     if _flash_attn_varlen_forward_with_lse is None:
         raise RuntimeError("flash-attn internal varlen forward with softmax_lse is unavailable")
+    if metadata is None and metadata_cache is not None and metadata_cache_key is not None:
+        metadata = metadata_cache.get(metadata_cache_key)
     packed = pack_varlen_prefix_qkv(
         q,
         k,
@@ -657,7 +740,17 @@ def flash_attn_varlen_prefix_with_lse(
         q_sequence_ids=q_sequence_ids,
         k_sequence_ids=k_sequence_ids,
         allow_empty_kv=allow_empty_kv,
+        metadata=metadata,
     )
+    if metadata is None and metadata_cache is not None and metadata_cache_key is not None:
+        metadata_cache[metadata_cache_key] = VarlenPrefixMetadata(
+            q_indices=packed.q_indices,
+            k_indices=packed.k_indices,
+            cu_seqlens_q=packed.cu_seqlens_q,
+            cu_seqlens_k=packed.cu_seqlens_k,
+            max_seqlen_q=packed.max_seqlen_q,
+            max_seqlen_k=packed.max_seqlen_k,
+        )
     batch_size, num_heads, seq_len, head_dim = q.shape
     if packed.max_seqlen_q == 0 or packed.max_seqlen_k == 0 or packed.q.numel() == 0:
         return FlashAttnBlockOutput(
@@ -719,9 +812,14 @@ def flash_attn_varlen_prefix_backward(
     q_sequence_ids: torch.Tensor | None = None,
     k_sequence_ids: torch.Tensor | None = None,
     allow_empty_kv: bool = False,
+    metadata: VarlenPrefixMetadata | None = None,
+    metadata_cache: dict[object, VarlenPrefixMetadata] | None = None,
+    metadata_cache_key: object | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if _flash_attn_varlen_backward_with_lse is None:
         raise RuntimeError("flash-attn internal varlen backward helper is unavailable")
+    if metadata is None and metadata_cache is not None and metadata_cache_key is not None:
+        metadata = metadata_cache.get(metadata_cache_key)
     packed = pack_varlen_prefix_qkv(
         q,
         k,
@@ -731,7 +829,17 @@ def flash_attn_varlen_prefix_backward(
         q_sequence_ids=q_sequence_ids,
         k_sequence_ids=k_sequence_ids,
         allow_empty_kv=allow_empty_kv,
+        metadata=metadata,
     )
+    if metadata is None and metadata_cache is not None and metadata_cache_key is not None:
+        metadata_cache[metadata_cache_key] = VarlenPrefixMetadata(
+            q_indices=packed.q_indices,
+            k_indices=packed.k_indices,
+            cu_seqlens_q=packed.cu_seqlens_q,
+            cu_seqlens_k=packed.cu_seqlens_k,
+            max_seqlen_q=packed.max_seqlen_q,
+            max_seqlen_k=packed.max_seqlen_k,
+        )
     batch_size, num_heads, q_seq_len, head_dim = q.shape
     kv_num_heads = k.size(1)
     k_seq_len = k.size(2)

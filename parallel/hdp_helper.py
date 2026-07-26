@@ -1,8 +1,10 @@
 """ByteScale HDP schedule data types shared by data and runtime code."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from fractions import Fraction
 import math
+from typing import Any
 
 import torch
 
@@ -14,16 +16,52 @@ BYTESCALE_HDP_WAVES_KEY = "bytescale_hdp_waves"
 
 
 @dataclass(frozen=True)
+class ByteScaleHdpCostModel:
+    """Per-sequence execution-time fit obtained from an HDP profiling run.
+
+    ``alpha`` accounts for attention's quadratic work, ``beta`` for token-linear
+    work (MLP, projections, norms), and ``gamma`` for each participant's fixed
+    scheduling/communication overhead.  Values are deliberately unitless: a
+    calibration tool supplies coefficients in a common time unit.
+    """
+
+    alpha: float = 1.0
+    beta: float = 0.0
+    gamma: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.alpha < 0 or self.beta < 0 or self.gamma < 0:
+            raise ValueError("ByteScale profiling coefficients must be non-negative")
+
+    def sequence_cost(self, sequence_length: int) -> Fraction:
+        if sequence_length < 1:
+            raise ValueError("sequence_length must be positive")
+        return (
+            Fraction(str(self.alpha)) * sequence_length * sequence_length
+            + Fraction(str(self.beta)) * sequence_length
+            + Fraction(str(self.gamma))
+        )
+
+    def participant_cost(self, sequence_length: int, participant_count: int) -> Fraction:
+        if participant_count < 1:
+            raise ValueError("participant_count must be positive")
+        # The fitted fixed component is paid on every selected HDP rank.
+        total_without_fixed = (
+            Fraction(str(self.alpha)) * sequence_length * sequence_length
+            + Fraction(str(self.beta)) * sequence_length
+        )
+        return total_without_fixed / participant_count + Fraction(str(self.gamma))
+
+
+@dataclass(frozen=True)
 class ByteScaleHdpBalancedConfig:
     """CP-only ByteScale Algorithm 2 DP-balance reproduction configuration.
 
     ``partition_tokens`` is the resident-token capacity of one HDP rank.  The
-    paper leaves the cost model and several scheduling tie-breaks unspecified.
-    This reproduction uses the attention-FLOP proxy ``length ** 2`` and charges
-    each selected worker ``length ** 2 / worker_count``.  It makes buckets by
-    greedily filling the descending-length sequence order up to total proxy
-    FLOPs divided by the HDP degree.  ``balance_delta`` is expressed in that
-    same proxy unit and defaults to zero.
+    ``cost_model`` is an explicit profiling fit ``αL² + βL + γ``.  It makes
+    buckets from that predicted sequence cost and charges each selected worker
+    its sharded quadratic/linear contribution plus its fixed overhead.
+    ``balance_delta`` is expressed in the same profiling time unit.
 
     When Algorithm 2's strict target predicate produces no rank, all ranks are
     equally eligible.  When it produces fewer ranks than a sequence needs, the
@@ -34,7 +72,8 @@ class ByteScaleHdpBalancedConfig:
     """
 
     partition_tokens: int
-    balance_delta: int = 0
+    balance_delta: float = 0.0
+    cost_model: ByteScaleHdpCostModel = field(default_factory=ByteScaleHdpCostModel)
 
     def __post_init__(self) -> None:
         if self.partition_tokens < 1:
@@ -57,6 +96,10 @@ class ByteScaleHdpBalancedConfig:
                 "or a larger HDP degree"
             )
         return min(world_size, math.ceil(sequence_length / self.partition_tokens))
+
+    def validate_tp_sp_partition(self, *, tp_size: int, use_sp: bool) -> None:
+        if use_sp and self.partition_tokens % tp_size:
+            raise ValueError("HDP partition_tokens must be divisible by TP size when SP is enabled")
 
 
 @dataclass(frozen=True)
@@ -129,6 +172,12 @@ class ByteScaleHdpLocalLayout:
     global_document_count: int
     wave_index: int = 0
     wave_count: int = 1
+    # Runtime-only tensors derived from immutable document placement.  The
+    # dictionary is intentionally shared by all attention layers that consume
+    # this wave; it is not part of schedule equality or serialization.
+    attention_metadata_cache: dict[object, Any] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     @property
     def document_ids(self) -> tuple[int, ...]:

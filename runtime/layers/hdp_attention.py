@@ -17,7 +17,7 @@ import torch.nn as nn
 
 from runtime.layers.attn_masking_utils import canonical_position_ids, canonical_sequence_ids
 from runtime.layers.cp_functional import dynamic_flash_ring_attention, subset_ring_exchange_metadata, subset_ring_shift
-from runtime.layers.flash_utils import flash_attn_block_fallback_reason
+from runtime.layers.flash_utils import flash_attn_block_fallback_reason, flash_attn_varlen_segments
 from runtime.layers.ring_attention import _update_online_attention_state
 from utils.attention_backend import AttentionBackend, validate_attention_backend
 from utils.profiling import profiled
@@ -90,8 +90,32 @@ class HdpBalancedAttentionCore(nn.Module):
             device=q.device,
         )
         output = torch.zeros_like(q)
+        fused_documents: set[int] = set()
+        if self.attention_backend == AttentionBackend.FLASH_ATTN:
+            reason = flash_attn_block_fallback_reason(q)
+            if reason is not None:
+                raise RuntimeError(
+                    "HDP flash_attn backend is unavailable for dynamic-subset Flash Ring: " + reason
+                )
+            # Algorithm 1's best-fit packing must also reach attention: all
+            # local-only documents share one varlen Flash launch rather than
+            # paying one Python dispatch/kernel launch per short sequence.
+            local_only = tuple(doc for doc in layout.documents if len(doc.participant_ranks) == 1)
+            if local_only:
+                token_indices, cu_seqlens, max_seqlen = _local_flash_segments(
+                    layout, local_only, device=q.device
+                )
+                output = output + flash_attn_varlen_segments(
+                    q, k, v,
+                    token_indices=token_indices,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+                fused_documents = {document.document_id for document in local_only}
         # Every participant independently gets this same planner ordering.
         for document in layout.documents:
+            if document.document_id in fused_documents:
+                continue
             row_slice = slice(document.local_row, document.local_row + 1)
             token_slice = slice(document.local_start, document.local_end)
             row_q = q[row_slice, :, token_slice, :]
@@ -100,11 +124,6 @@ class HdpBalancedAttentionCore(nn.Module):
             row_positions = q_positions[row_slice, token_slice]
             row_sequence_ids = None if q_sequence_ids is None else q_sequence_ids[row_slice, token_slice]
             if self.attention_backend == AttentionBackend.FLASH_ATTN:
-                reason = flash_attn_block_fallback_reason(row_q)
-                if reason is not None:
-                    raise RuntimeError(
-                        "HDP flash_attn backend is unavailable for dynamic-subset Flash Ring: " + reason
-                    )
                 row_out = dynamic_flash_ring_attention(
                     row_q, row_k, row_v,
                     positions=row_positions,
@@ -112,6 +131,8 @@ class HdpBalancedAttentionCore(nn.Module):
                     group=self.group,
                     participant_ranks=document.participant_ranks,
                     module_id=id(self),
+                    metadata_cache=layout.attention_metadata_cache,
+                    metadata_cache_key=("flash_ring", str(q.device), document.document_id),
                 )
             elif len(document.participant_ranks) == 1:
                 row_out = _single_document_attention(
@@ -133,6 +154,42 @@ class HdpBalancedAttentionCore(nn.Module):
                 )
             output[row_slice, :, token_slice, :] = row_out
         return output
+
+
+def _local_flash_segments(
+    layout: "ByteScaleHdpLocalLayout",
+    documents: tuple[object, ...],
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Get cached flattened indices/cu-seqlens for local HDP documents."""
+    cache_key = ("flash_local_segments", str(device))
+    cached = layout.attention_metadata_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    indices: list[int] = []
+    lengths: list[int] = []
+    for document in documents:
+        # D=1 zigzag is a contiguous document.  Padding is always at its end,
+        # so this segment is equivalent to the current position/sequence mask.
+        length = sum(index is not None for index in document.source_indices)
+        if length:
+            base = document.local_row * layout.packed_width + document.local_start
+            indices.extend(range(base, base + length))
+            lengths.append(length)
+    if not lengths:
+        token_indices = torch.empty(0, dtype=torch.long, device=device)
+        cu_seqlens = torch.zeros(1, dtype=torch.int32, device=device)
+        result = (token_indices, cu_seqlens, 0)
+    else:
+        token_indices = torch.tensor(indices, dtype=torch.long, device=device)
+        lengths_tensor = torch.tensor(lengths, dtype=torch.int32, device=device)
+        cu_seqlens = torch.empty(len(lengths) + 1, dtype=torch.int32, device=device)
+        cu_seqlens[0] = 0
+        cu_seqlens[1:] = lengths_tensor.cumsum(dim=0)
+        result = (token_indices, cu_seqlens, max(lengths))
+    layout.attention_metadata_cache[cache_key] = result
+    return result
 
 
 def _single_document_attention(

@@ -69,6 +69,108 @@ cases:
     warmup: 5
     steps: 10
 
+  olmo2_13b_hdp_flash_gqa_packed_8xa100_preflight:
+    description: >-
+      OLMo2-like 13B GQA HDP Flash-Ring preflight for 8xA100-80G: 8 dynamic HDP participants,
+      ZeRO-1, activation checkpointing, native 40Q/8KV GQA, packed short and
+      long documents, and multiple ordered waves. This is a systems smoke
+      workload; replace the uncalibrated cost coefficients before reporting a
+      paper-faithful scheduler comparison.
+    recipe: configs/olmo2_13b_sft.yaml
+    recipe_overrides:
+      # HDP replaces fixed CP and schedules across all eight DP ranks.
+      - --dp-size
+      - "8"
+      - --tp-size
+      - "1"
+      - --cp-size
+      - "1"
+      - --no-use-sp
+      - --zero-stage
+      - "1"
+      - --hdp-balanced
+      - --hdp-partition-tokens
+      # 4K packed rows with global logical micro_batch_size=2 exceed one
+      # 8x512-token HDP wave, ensuring ordered multi-wave execution.
+      - "512"
+      - --micro-batch-size
+      - "2"
+      - --grad-accum-steps
+      - "1"
+      - --data-prefetch-batches
+      - "1"
+      - --attention-backend
+      - flash_attn
+      # Exercise native-GQA transport: K/V stay at 8 heads while Q has 40.
+      - --n-kv-heads
+      - "8"
+      # Explicitly record the current L^2-only pre-calibration policy. Pass
+      # calibrated alpha/beta/gamma after the profiling fit is available.
+      - --hdp-cost-alpha
+      - "1.0"
+      - --hdp-cost-beta
+      - "0.0"
+      - --hdp-cost-gamma
+      - "0.0"
+      - --hdp-balance-delta
+      - "0.0"
+    synthetic:
+      packed: true
+      # Several uneven documents make both D=1 fused local Flash documents
+      # and multi-rank Flash Ring documents likely in every logical batch.
+      segment_count_min: 5
+      segment_count_max: 9
+      supervised_fraction_min: 0.55
+      supervised_fraction_max: 0.70
+      max_padding_fraction: 0.02
+      delivery: host
+      data_source: synthetic
+    warmup: 5
+    steps: 10
+
+  olmo2_13b_hdp_flash_gqa_packed_8xa100_paper:
+    description: >-
+      OLMo2-like 13B GQA 8xA100-80G paper measurement: fixed packed document
+      trace covers HDP D1/D2/D4/D8, host-side synthetic generation and HDP
+      scheduling/materialization prefetch, Flash Ring, ZeRO-1, and activation
+      checkpointing. This case refuses the uncalibrated 1/0/0 cost proxy;
+      pass calibrated alpha/beta/gamma after --.
+    recipe: configs/olmo2_13b_sft.yaml
+    require_calibrated_hdp_cost: true
+    recipe_overrides:
+      - --dp-size
+      - "8"
+      - --tp-size
+      - "1"
+      - --cp-size
+      - "1"
+      - --no-use-sp
+      - --zero-stage
+      - "1"
+      - --hdp-balanced
+      - --hdp-partition-tokens
+      - "512"
+      - --micro-batch-size
+      - "2"
+      - --grad-accum-steps
+      - "1"
+      - --data-prefetch-batches
+      - "1"
+      - --attention-backend
+      - flash_attn
+      - --n-kv-heads
+      - "8"
+    synthetic:
+      packed: true
+      # Row 0: D8. Row 1: D4 + D2 + D1. Active=7,680 <= nominal=8,192.
+      document_length_trace:
+        - [4096]
+        - [2048, 1024, 512]
+      delivery: host
+      data_source: synthetic
+    warmup: 20
+    steps: 200
+
   llama50m_cp_ring_dense_smoke:
     description: "Dense Flash-Ring correctness/performance smoke: 8 CP ranks, 1K local tokens/rank."
     recipe: configs/llama_50m.yaml

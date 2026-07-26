@@ -7,7 +7,11 @@ import torch
 import torch.distributed as dist
 
 from runtime.buffer_allocator import BufferPolicy, acquire_buffer
-from runtime.layers.flash_utils import flash_attn_varlen_prefix_backward, flash_attn_varlen_prefix_with_lse
+from runtime.layers.flash_utils import (
+    VarlenPrefixMetadata,
+    flash_attn_varlen_prefix_backward,
+    flash_attn_varlen_prefix_with_lse,
+)
 from utils.distributed import pairwise_send_recv_async
 
 
@@ -109,8 +113,9 @@ class _AsyncSubsetExchange:
     works: list[object]
 
     def wait(self) -> torch.Tensor:
-        for work in self.works:
-            work.wait()
+        with torch.profiler.record_function("maltos::hdp.flash.p2p.wait"):
+            for work in self.works:
+                work.wait()
         return self.recv_tensor
 
 
@@ -149,12 +154,13 @@ def _async_subset_ring_exchange(
         shape=tuple(x.shape), dtype=x.dtype, device=x.device,
         policy=BufferPolicy.PINNED, key=alloc_key,
     ).tensor
-    works = pairwise_send_recv_async(
-        send_tensor, recv_tensor,
-        send_rank=dist.get_global_rank(group, send_to),
-        recv_rank=dist.get_global_rank(group, recv_from),
-        group=group,
-    )
+    with torch.profiler.record_function("maltos::hdp.flash.p2p.launch"):
+        works = pairwise_send_recv_async(
+            send_tensor, recv_tensor,
+            send_rank=dist.get_global_rank(group, send_to),
+            recv_rank=dist.get_global_rank(group, recv_from),
+            group=group,
+        )
     return _AsyncSubsetExchange(send_tensor, recv_tensor, works)
 
 
@@ -184,7 +190,7 @@ class _DynamicFlashRingAttention(torch.autograd.Function):
     """Double-buffered async FlashAttention ring on an arbitrary parent-group subset."""
 
     @staticmethod
-    def forward(ctx, q, k, v, positions, sequence_ids, group, participant_ranks, module_id):
+    def forward(ctx, q, k, v, positions, sequence_ids, group, participant_ranks, module_id, prefix_metadata, metadata_cache, metadata_cache_key):
         has_sequence_ids = sequence_ids.numel() != 0
         current_k, current_v = k, v
         current_positions = positions
@@ -200,12 +206,16 @@ class _DynamicFlashRingAttention(torch.autograd.Function):
                     group=group, participant_ranks=participant_ranks,
                     alloc_key=f"hdp.flash_ring.{module_id}.fwd.slot_{step % 2}",
                 )
-            block = flash_attn_varlen_prefix_with_lse(
-                q, current_k, current_v,
-                q_positions=positions, k_positions=current_positions,
-                q_sequence_ids=sequence_ids if has_sequence_ids else None,
-                k_sequence_ids=current_sequence_ids, allow_empty_kv=True,
-            )
+            with torch.profiler.record_function("maltos::hdp.flash.forward.block"):
+                block = flash_attn_varlen_prefix_with_lse(
+                    q, current_k, current_v,
+                    q_positions=positions, k_positions=current_positions,
+                    q_sequence_ids=sequence_ids if has_sequence_ids else None,
+                    k_sequence_ids=current_sequence_ids, allow_empty_kv=True,
+                    metadata=None if prefix_metadata is None else prefix_metadata[step],
+                    metadata_cache=metadata_cache,
+                    metadata_cache_key=None if metadata_cache_key is None else (*metadata_cache_key, step),
+                )
             running_out, running_lse = _merge_flash_attention_blocks(
                 running_out, running_lse, block.out, block.lse)
             if step + 1 != len(participant_ranks):
@@ -214,6 +224,8 @@ class _DynamicFlashRingAttention(torch.autograd.Function):
         out = running_out.to(dtype=q.dtype)
         ctx.save_for_backward(q, k, v, out, running_lse, positions, sequence_ids)
         ctx.group, ctx.participant_ranks, ctx.module_id = group, participant_ranks, module_id
+        ctx.prefix_metadata = prefix_metadata
+        ctx.metadata_cache, ctx.metadata_cache_key = metadata_cache, metadata_cache_key
         return out
 
     @staticmethod
@@ -236,12 +248,18 @@ class _DynamicFlashRingAttention(torch.autograd.Function):
                     group=ctx.group, participant_ranks=ctx.participant_ranks,
                     alloc_key=f"hdp.flash_ring.{ctx.module_id}.bwd.kv.slot_{step % 2}",
                 )
-            block_dq, block_dk, block_dv = flash_attn_varlen_prefix_backward(
-                dout.contiguous(), q, current_k, current_v, out, lse,
-                q_positions=positions, k_positions=current_positions,
-                q_sequence_ids=sequence_ids if has_sequence_ids else None,
-                k_sequence_ids=current_sequence_ids, allow_empty_kv=True,
-            )
+            with torch.profiler.record_function("maltos::hdp.flash.backward.block"):
+                block_dq, block_dk, block_dv = flash_attn_varlen_prefix_backward(
+                    dout.contiguous(), q, current_k, current_v, out, lse,
+                    q_positions=positions, k_positions=current_positions,
+                    q_sequence_ids=sequence_ids if has_sequence_ids else None,
+                    k_sequence_ids=current_sequence_ids, allow_empty_kv=True,
+                    metadata=None if ctx.prefix_metadata is None else ctx.prefix_metadata[step],
+                    metadata_cache=ctx.metadata_cache,
+                    metadata_cache_key=(
+                        None if ctx.metadata_cache_key is None else (*ctx.metadata_cache_key, step)
+                    ),
+                )
             # The prior owner's gradient exchange progressed while this Flash block ran.
             if pending_dk_exchange is not None:
                 current_dk = pending_dk_exchange.wait()
@@ -260,7 +278,7 @@ class _DynamicFlashRingAttention(torch.autograd.Function):
                 current_k, current_v, current_positions, current_sequence_ids = next_block_exchange.wait()
         local_dk = _subset_ring_exchange(current_dk, group=ctx.group, participant_ranks=ctx.participant_ranks)
         local_dv = _subset_ring_exchange(current_dv, group=ctx.group, participant_ranks=ctx.participant_ranks)
-        return dq.to(q.dtype), local_dk.to(k.dtype), local_dv.to(v.dtype), None, None, None, None, None
+        return dq.to(q.dtype), local_dk.to(k.dtype), local_dv.to(v.dtype), None, None, None, None, None, None, None, None
 
 
 def _merge_flash_attention_blocks(running_out, running_lse, block_out, block_lse):
@@ -282,6 +300,9 @@ def dynamic_flash_ring_attention(
     group: dist.ProcessGroup,
     participant_ranks: tuple[int, ...],
     module_id: int = 0,
+    prefix_metadata: tuple[VarlenPrefixMetadata | None, ...] | None = None,
+    metadata_cache: dict[object, VarlenPrefixMetadata] | None = None,
+    metadata_cache_key: tuple[object, ...] | None = None,
 ) -> torch.Tensor:
     """Run custom-autograd Flash Ring without creating a per-document group."""
     if not participant_ranks or len(set(participant_ranks)) != len(participant_ranks):
@@ -291,4 +312,8 @@ def dynamic_flash_ring_attention(
     if q.size(0) != k.size(0) or q.size(2) != k.size(2) or q.size(3) != k.size(3) or q.size(1) % k.size(1):
         raise ValueError("Flash Ring Q heads must be divisible by native KV heads with matching batch/token/head_dim")
     sequence_arg = sequence_ids if sequence_ids is not None else positions.new_empty((0,), dtype=torch.long)
-    return _DynamicFlashRingAttention.apply(q, k, v, positions, sequence_arg, group, participant_ranks, module_id)
+    if prefix_metadata is not None and len(prefix_metadata) != len(participant_ranks):
+        raise ValueError("Flash Ring prefix metadata must contain one layout for every ring step")
+    return _DynamicFlashRingAttention.apply(
+        q, k, v, positions, sequence_arg, group, participant_ranks, module_id,
+        prefix_metadata, metadata_cache, metadata_cache_key)

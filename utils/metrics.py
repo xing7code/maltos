@@ -343,6 +343,8 @@ def _rule_for_key(key: str, rules: dict[str, MetricRule]) -> MetricRule:
         return MetricRule(MetricReduction.LAST, MetricReduction.RANK0)
     if key.endswith("_sec"):
         return MetricRule(MetricReduction.SUM, MetricReduction.MAX, MetricStepReduction.PER_STEP)
+    if key.endswith("_sec_sum") or key.endswith("_wave_count"):
+        return MetricRule(MetricReduction.SUM, MetricReduction.SUM, MetricStepReduction.PER_STEP)
     if key.endswith("/overflow"):
         return MetricRule(MetricReduction.ANY, MetricReduction.ANY)
     if key.endswith("/grad_norm") or "memory" in key:

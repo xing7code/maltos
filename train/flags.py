@@ -39,6 +39,10 @@ _RUNTIME_SPEC_RUNTIME_FIELDS = (
     "ep_size",
     "hdp_balanced",
     "hdp_partition_tokens",
+    "hdp_cost_alpha",
+    "hdp_cost_beta",
+    "hdp_cost_gamma",
+    "hdp_balance_delta",
     "pp_microbatches",
     "cp_attn_core",
     "batch_data_cp_aware",
@@ -141,6 +145,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "sequence k*L gets k worker partitions"
         ),
     )
+    parser.add_argument("--hdp-cost-alpha", type=float, default=1.0, help="profiled HDP attention cost coefficient")
+    parser.add_argument("--hdp-cost-beta", type=float, default=0.0, help="profiled HDP token-linear cost coefficient")
+    parser.add_argument("--hdp-cost-gamma", type=float, default=0.0, help="profiled HDP fixed per-participant cost")
+    parser.add_argument("--hdp-balance-delta", type=float, default=0.0, help="HDP Algorithm-2 target-rank balance tolerance")
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--zero-stage", type=int, default=0, choices=(0, 1, 2, 3))
@@ -319,6 +327,10 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("parallel", "cp_token_planner"): "cp_token_planner",
         ("parallel", "hdp_balanced"): "hdp_balanced",
         ("parallel", "hdp_partition_tokens"): "hdp_partition_tokens",
+        ("parallel", "hdp_cost_alpha"): "hdp_cost_alpha",
+        ("parallel", "hdp_cost_beta"): "hdp_cost_beta",
+        ("parallel", "hdp_cost_gamma"): "hdp_cost_gamma",
+        ("parallel", "hdp_balance_delta"): "hdp_balance_delta",
         ("parallel", "tp_size"): "tp_size",
         ("parallel", "ep_size"): "ep_size",
         ("parallel", "use_sp"): "use_sp",
