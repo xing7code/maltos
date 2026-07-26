@@ -185,13 +185,18 @@ def _fixed_capacity_receive_view(
             "HDP dynamic Flash Ring local tensor exceeds its explicit partition capacity: "
             f"tokens={actual_tokens} partition_tokens={partition_tokens}"
         )
-    capacity_shape = list(x.shape)
-    capacity_shape[token_dim] = partition_tokens
+    # Do not narrow a logical [B, H, capacity, D] allocation on its token
+    # dimension.  That produces a strided (non-contiguous) [B, H, T, D] view
+    # when T < capacity, which is not a valid NCCL P2P receive destination.
+    # Keep the fixed capacity in flat physical storage instead, then expose the
+    # actual prefix as a contiguous tensor with x's logical shape.
+    token_width = x.numel() // actual_tokens
+    capacity_numel = token_width * partition_tokens
     capacity = acquire_buffer(
-        shape=tuple(capacity_shape), dtype=x.dtype, device=x.device,
+        shape=(capacity_numel,), dtype=x.dtype, device=x.device,
         policy=BufferPolicy.PINNED, key=alloc_key,
     ).tensor
-    return capacity.narrow(token_dim, 0, actual_tokens)
+    return capacity.narrow(0, 0, x.numel()).view_as(x)
 
 
 def _async_subset_block_exchange(

@@ -388,6 +388,13 @@ def test_dynamic_flash_ring_pinned_buffers_use_partition_capacity_across_lengths
                     assert dv_view.shape == (1, 2, length, 16)
                     assert positions_view.shape == (1, length)
                     assert sequence_ids_view.shape == (1, length)
+                    # NCCL P2P must receive into contiguous storage.  The
+                    # fixed allocation itself is flat; each dynamic-length
+                    # logical tensor is a contiguous prefix of that storage.
+                    assert all(view.is_contiguous() for view in (
+                        k_view, v_view, dk_view, dv_view,
+                        positions_view, sequence_ids_view,
+                    ))
                     handle_count = len(global_buffer_pool()._pinned_handles)
                     if length_index == 0:
                         expected_handle_count = handle_count
@@ -398,8 +405,10 @@ def test_dynamic_flash_ring_pinned_buffers_use_partition_capacity_across_lengths
         # Two D3 double-buffer slots × {K/V, FP32 dK/dV, positions, sequence IDs}.
         assert len(pool._pinned_handles) == 12
         for (_, _, shape, _), handle in pool._pinned_handles.items():
-            token_dim = -1 if len(shape) == 2 else -2
-            assert shape[token_dim] == capacity
+            # Capacity is deliberately flat so that any actual-length prefix
+            # remains a valid contiguous P2P receive tensor.
+            assert len(shape) == 1
+            assert shape[0] in {capacity, 1 * 2 * capacity * 16}
             assert handle.tensor.shape == shape
     finally:
         clear_buffer_pool()
