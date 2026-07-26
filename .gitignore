@@ -26,6 +26,7 @@ __pycache__/
 nccl_logs/
 
 # raw profiler artifacts
+profiles/
 profiles/**/trace_case_*/
 profiles/**/profile_case_*/
 profiles/**/*.pt.trace.json
