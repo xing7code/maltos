@@ -74,7 +74,7 @@ class Zero3Plugin(ZeroPluginBase):
             name="zero3",
             owns_optimizer=True,
             owns_model_state=True,
-            runs_after={PluginId.PP, PluginId.CP, PluginId.TP, PluginId.SP},
+            runs_after={PluginId.PP, PluginId.CP, PluginId.HDP, PluginId.TP, PluginId.SP},
         )
         self.wrap_cls = set(wrap_cls or {nn.Linear})
         self.buckets: list[_Bucket] = []
@@ -142,7 +142,7 @@ class Zero3Plugin(ZeroPluginBase):
             context = self.runtime.state.step_context
             self._reset_buckets(
                 grad_accum_start=context.accum_start,
-                backward_start=context.backward_start,
+                backward_start=context.is_step_boundary,
             )
             if (
                 self.bucket_order_checked

@@ -74,6 +74,8 @@ class StepContext:
     grad_accum_steps: int = 1
     pp_cur_microbatch_idx: int = 0
     pp_status: PpStatus = PpStatus.IDLE
+    hdp_wave_idx: int = 0
+    hdp_wave_count: int = 1
 
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
@@ -81,10 +83,18 @@ class StepContext:
 
     @property
     def accum_start(self) -> bool:
+        return self.outer_accum_start and self.hdp_wave_idx == 0
+
+    @property
+    def outer_accum_start(self) -> bool:
         return self.microbatch_idx == 0 and self.pp_status in {PpStatus.IDLE, PpStatus.BACKWARD_START}
 
     @property
     def is_step_boundary(self) -> bool:
+        return self.outer_step_boundary and self.hdp_wave_idx + 1 == self.hdp_wave_count
+
+    @property
+    def outer_step_boundary(self) -> bool:
         return (
             ((self.microbatch_idx + 1) % self.grad_accum_steps) == 0
             and self.pp_status in {PpStatus.IDLE, PpStatus.BACKWARD_END}
@@ -102,7 +112,13 @@ class StepContext:
         the async grad-reduce worker reads a stale zero, firing before backward
         has produced its handles.
         """
-        return self.pp_status in {PpStatus.IDLE, PpStatus.BACKWARD_START}
+        return self.pp_status in {PpStatus.IDLE, PpStatus.BACKWARD_START} and self.hdp_wave_idx == 0
+
+    def set_hdp_wave(self, *, wave_idx: int, wave_count: int) -> None:
+        if not 0 <= wave_idx < wave_count:
+            raise ValueError("invalid HDP wave position")
+        self.hdp_wave_idx = wave_idx
+        self.hdp_wave_count = wave_count
 
     @property
     def loss_divisor(self) -> float:
@@ -119,6 +135,8 @@ class StepContext:
         self.microbatch_idx = (self.microbatch_idx + 1) % self.grad_accum_steps
         self.pp_cur_microbatch_idx = 0
         self.pp_status = PpStatus.IDLE
+        self.hdp_wave_idx = 0
+        self.hdp_wave_count = 1
         return should_step
 
     def advance_step(self) -> None:

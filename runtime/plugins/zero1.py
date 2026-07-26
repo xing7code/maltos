@@ -47,7 +47,7 @@ class Zero1Plugin(ZeroPluginBase):
             id=PluginId.ZERO1,
             name="zero1",
             owns_optimizer=True,
-            runs_after={PluginId.PP, PluginId.CP, PluginId.TP, PluginId.SP},
+            runs_after={PluginId.PP, PluginId.CP, PluginId.HDP, PluginId.TP, PluginId.SP},
             bucket_mb_size=bucket_mb_size,
         )
         self.data_buffer: torch.Tensor | None = None

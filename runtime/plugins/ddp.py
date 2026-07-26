@@ -158,10 +158,12 @@ class BucketDataParallelPlugin(RuntimePlugin):
         if phase == RuntimePhase.PRE_BACKWARD:
             assert self.runtime is not None
             context = self.runtime.state.step_context
-            should_sync = context.is_step_boundary
-            accum_start = context.accum_start
-            for bucket in self.buckets:
-                bucket.reset(grad_accum_start=accum_start, grad_accum_end=should_sync)
+            if context.accum_start or context.is_step_boundary:
+                for bucket in self.buckets:
+                    bucket.reset(
+                        grad_accum_start=context.accum_start,
+                        grad_accum_end=context.is_step_boundary,
+                    )
         elif phase == RuntimePhase.POST_BACKWARD:
             assert self.runtime is not None
             if not self.runtime.state.step_context.is_step_boundary:

@@ -55,7 +55,7 @@ class Zero2Plugin(ZeroPluginBase):
             id=PluginId.ZERO2,
             name="zero2",
             owns_optimizer=True,
-            runs_after={PluginId.PP, PluginId.CP, PluginId.TP, PluginId.SP},
+            runs_after={PluginId.PP, PluginId.CP, PluginId.HDP, PluginId.TP, PluginId.SP},
             bucket_mb_size=bucket_mb_size,
         )
         self.data_buffer: torch.Tensor | None = None
@@ -84,7 +84,7 @@ class Zero2Plugin(ZeroPluginBase):
             context = self.runtime.state.step_context
             self._reset_buckets(
                 grad_accum_start=context.accum_start,
-                backward_start=context.backward_start,
+                backward_start=context.is_step_boundary,
             )
         elif phase == RuntimePhase.POST_BACKWARD:
             # See Zero1Plugin.on_phase: run_step() callers may read .grad once it

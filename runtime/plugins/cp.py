@@ -55,6 +55,8 @@ class ContextParallelPlugin(RuntimePlugin):
 
     def bind(self, runtime: "RuntimeCore") -> None:
         super().bind(runtime)
+        if any(plugin.id == PluginId.HDP for plugin in runtime.plugins if plugin is not self):
+            raise ValueError("ContextParallelPlugin and HdpPlugin are mutually exclusive")
         self._active_plugin_ids = {plugin.id for plugin in runtime.plugins if plugin is not self}
         active = self._active_plugin_ids
         self._use_param_hook_sync = (

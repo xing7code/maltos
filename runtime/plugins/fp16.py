@@ -18,6 +18,7 @@ class Fp16Plugin(RuntimePlugin):
                 PluginId.DP,
                 PluginId.PP,
                 PluginId.CP,
+                PluginId.HDP,
                 PluginId.EP,
             },
         )

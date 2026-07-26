@@ -16,6 +16,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from data import PackedSFTDataset, PretrainingDataLoader, SFTDataLoader, TokenShardDataset
+from data.bytescale_hdp import ByteScaleHdpDataLoader
+from parallel.hdp_helper import ByteScaleHdpBalancedConfig
 from models import (
     ActivationCheckpointConfig,
     LlamaConfig,
@@ -48,6 +50,7 @@ from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.compile import CompilePlugin
 from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
+from runtime.plugins.hdp import ByteScaleHdpPlugin
 from runtime.plugins.metrics import MetricPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.fp16 import Fp16Plugin
@@ -102,6 +105,19 @@ def main() -> None:
         raise ValueError("--use-sp requires --tp-size > 1")
     if args.cp_size > 1 and args.seq_len % args.cp_size != 0:
         raise ValueError("--cp-size requires --seq-len divisible by cp_size for CP v0")
+    if args.hdp_balanced:
+        if args.cp_size != 1:
+            raise ValueError("--hdp-balanced requires --cp-size 1; HDP replaces fixed CP")
+        if args.pp_size != 1:
+            raise ValueError("--hdp-balanced currently implements FCP's CP-only baseline and requires --pp-size 1")
+        if args.batch_data_cp_aware:
+            raise ValueError("--hdp-balanced is incompatible with --batch-data-cp-aware")
+        if args.hdp_partition_tokens is None:
+            raise ValueError("--hdp-balanced requires --hdp-partition-tokens")
+        if args.hdp_partition_tokens < 1:
+            raise ValueError("--hdp-partition-tokens must be positive")
+        if args.hdp_partition_tokens % 2:
+            raise ValueError("--hdp-partition-tokens must be even for symmetric zigzag partitions")
     if args.ep_size > 1 and args.dp_size % args.ep_size != 0:
         raise ValueError("--ep-size must divide --dp-size")
     if args.ep_size > 1 and args.model != "tiny_moe":
@@ -285,7 +301,13 @@ def _build_runtime(
         plugins.append(TensorParallelPlugin())
     if args.use_sp:
         plugins.append(SequenceParallelPlugin())
-    if args.cp_size > 1:
+    if args.hdp_balanced:
+        plugins.append(
+            ByteScaleHdpPlugin(
+                config=ByteScaleHdpBalancedConfig(args.hdp_partition_tokens)
+            )
+        )
+    elif args.cp_size > 1:
         plugins.append(ContextParallelPlugin())
     if args.ep_size > 1:
         plugins.append(ExpertParallelPlugin())
@@ -744,6 +766,14 @@ def _build_dataloader(
     dp_rank: int,
     cp_token_planner: ContextTokenPlannerType | None = None,
 ):
+    hdp_rank = dp_rank
+    if args.hdp_balanced:
+        # Every HDP rank consumes the identical canonical global batch; the
+        # data wrapper materializes its own variable-length local batch.
+        dp_rank = 0
+        dp_world_size = 1
+    else:
+        dp_world_size = args.dp_size
     cp_batch_sharder = None
     if args.batch_data_cp_aware:
         if args.cp_size <= 1:
@@ -762,10 +792,17 @@ def _build_dataloader(
             seq_len=args.seq_len,
             micro_batch_size=args.micro_batch_size,
             dp_rank=dp_rank,
-            dp_world_size=args.dp_size,
+            dp_world_size=dp_world_size,
             seed=args.seed,
             cp_batch_sharder=cp_batch_sharder,
         )
+        if args.hdp_balanced:
+            loader = ByteScaleHdpDataLoader(
+                loader,
+                hdp_rank=hdp_rank,
+                hdp_world_size=args.dp_size,
+                config=ByteScaleHdpBalancedConfig(args.hdp_partition_tokens),
+            )
         return data_paths, loader, data_format
 
     data_source = _resolve_sft_data_source(args.data)
@@ -778,10 +815,17 @@ def _build_dataloader(
         dataset,
         micro_batch_size=args.micro_batch_size,
         dp_rank=dp_rank,
-        dp_world_size=args.dp_size,
+        dp_world_size=dp_world_size,
         seed=args.seed,
         cp_batch_sharder=cp_batch_sharder,
     )
+    if args.hdp_balanced:
+        loader = ByteScaleHdpDataLoader(
+            loader,
+            hdp_rank=hdp_rank,
+            hdp_world_size=args.dp_size,
+            config=ByteScaleHdpBalancedConfig(args.hdp_partition_tokens),
+        )
     return list(dataset.shard_paths), loader, data_format
 
 

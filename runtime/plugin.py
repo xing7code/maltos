@@ -32,6 +32,7 @@ class PluginId(str, Enum):
     DP = "dp"
     PP = "pp"
     CP = "cp"
+    HDP = "hdp"
     EP = "ep"
     ZERO1 = "zero1"
     ZERO2 = "zero2"

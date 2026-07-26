@@ -10,7 +10,7 @@ from parallel.context_token_planner import ContextTokenPlannerType
 from utils.attention_backend import ATTENTION_BACKEND_CHOICES, AttentionBackend
 
 TRAIN_CLI_RUNTIME_SPEC_FORMAT = "train_cli_args"
-TRAIN_CLI_RUNTIME_SPEC_VERSION = 2
+TRAIN_CLI_RUNTIME_SPEC_VERSION = 3
 
 _RUNTIME_SPEC_MODEL_FIELDS = (
     "model",
@@ -37,6 +37,8 @@ _RUNTIME_SPEC_RUNTIME_FIELDS = (
     "pp_size",
     "cp_size",
     "ep_size",
+    "hdp_balanced",
+    "hdp_partition_tokens",
     "pp_microbatches",
     "cp_attn_core",
     "batch_data_cp_aware",
@@ -64,7 +66,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-format", type=str, default="auto", choices=("auto", "pretrain", "sft"))
     parser.add_argument("--token-dtype", type=str, default="uint32", choices=("uint16", "uint32", "int64"))
     parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--micro-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "per-DP-rank batch size "
+            "(or global logical packed batch size with --hdp-balanced)"
+        ),
+    )
     parser.add_argument("--data-prefetch-batches", type=int, default=0, choices=(0, 1))
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
@@ -115,6 +125,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=tuple(planner.value for planner in ContextTokenPlannerType),
+    )
+    parser.add_argument(
+        "--hdp-balanced",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable FCP's CP-only HDP-balanced ByteScale baseline",
+    )
+    parser.add_argument(
+        "--hdp-partition-tokens",
+        type=int,
+        default=None,
+        help=(
+            "HDP-balanced baseline partition length L; "
+            "sequence k*L gets k worker partitions"
+        ),
     )
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
@@ -292,6 +317,8 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("parallel", "cp_attn_core"): "cp_attn_core",
         ("parallel", "batch_data_cp_aware"): "batch_data_cp_aware",
         ("parallel", "cp_token_planner"): "cp_token_planner",
+        ("parallel", "hdp_balanced"): "hdp_balanced",
+        ("parallel", "hdp_partition_tokens"): "hdp_partition_tokens",
         ("parallel", "tp_size"): "tp_size",
         ("parallel", "ep_size"): "ep_size",
         ("parallel", "use_sp"): "use_sp",

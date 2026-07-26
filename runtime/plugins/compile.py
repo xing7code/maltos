@@ -34,6 +34,7 @@ class CompilePlugin(RuntimePlugin):
                 PluginId.TP,
                 PluginId.SP,
                 PluginId.CP,
+                PluginId.HDP,
                 PluginId.EP,
                 PluginId.PP,
                 PluginId.ZERO1,
