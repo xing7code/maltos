@@ -130,6 +130,12 @@ def _call_flash_attn_interface(func, **kwargs):
     except (TypeError, ValueError):
         return func(**kwargs)
     supported_kwargs = {name: value for name, value in kwargs.items() if name in signature.parameters}
+    # Recent flash-attn releases expose the CUDA custom op through a generic
+    # ``(*args, **kwargs)`` Python signature.  Filtering against that wrapper
+    # would drop every real argument (including q/k/v), even though the op
+    # itself accepts their canonical keyword names.
+    if kwargs and not supported_kwargs:
+        return func(**kwargs)
     return func(**supported_kwargs)
 
 
@@ -180,6 +186,7 @@ def flash_attn_dense_with_lse(
         return_softmax=False,
         window_size_left=-1,
         window_size_right=-1,
+        softcap=0.0,
         alibi_slopes=None,
     )
     if len(outputs) == 8:

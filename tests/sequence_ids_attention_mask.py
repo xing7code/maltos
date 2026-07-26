@@ -5,7 +5,7 @@ import torch
 from models.llama import _LlamaAttentionCore
 from models.tiny_transformer import _LocalCausalAttentionCore
 from runtime.layers import functional as layer_functional
-from runtime.layers.flash_utils import pack_dense_varlen_qkv, pack_varlen_prefix_qkv, pack_varlen_qkv
+from runtime.layers.flash_utils import _call_flash_attn_interface, pack_dense_varlen_qkv, pack_varlen_prefix_qkv, pack_varlen_qkv
 from runtime.layers.flash_utils import FlashAttnBlockOutput
 from runtime.layers.functional import _AsyncRingExchange, _flash_packed_ring_forward, _flash_ring_backward, _flash_ring_forward
 from runtime.layers.ring_layout import expected_zigzag_ring_positions
@@ -40,6 +40,14 @@ def test_llama_attention_core_masks_cross_example_tokens() -> None:
 
     expected = torch.tensor([10.0, 15.0, 20.0, 100.0, 150.0, 200.0], dtype=torch.float32).view(1, 1, 6, 1)
     assert torch.allclose(out, expected, atol=1e-5)
+
+
+def test_flash_interface_preserves_kwargs_for_generic_wrapper() -> None:
+    def generic_wrapper(**kwargs):
+        return kwargs
+
+    q = torch.ones(1)
+    assert _call_flash_attn_interface(generic_wrapper, q=q, causal=True) == {"q": q, "causal": True}
 
 
 def test_cp_attention_masks_cross_example_tokens() -> None:
@@ -513,6 +521,7 @@ def test_flash_ring_backward_uses_dense_zigzag_half_schedule() -> None:
 def main() -> None:
     test_local_attention_masks_cross_example_tokens()
     test_llama_attention_core_masks_cross_example_tokens()
+    test_flash_interface_preserves_kwargs_for_generic_wrapper()
     test_cp_attention_masks_cross_example_tokens()
     test_pack_varlen_qkv_builds_expected_cu_seqlens()
     test_pack_varlen_prefix_qkv_builds_expected_qk_segments()
