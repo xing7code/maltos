@@ -123,7 +123,7 @@ def test_trainer_profiler_annotations() -> None:
         trainer.setup()
         trainer.fit()
 
-        trace_files = list((Path(tmp) / "rank_00000").glob("*.pt.trace.json"))
+        trace_files = list((Path(tmp) / "rank_00000").glob("trace.json"))
         assert trace_files
         trace = json.loads(trace_files[0].read_text())
         names = {event.get("name") for event in trace["traceEvents"]}

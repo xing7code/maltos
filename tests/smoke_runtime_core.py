@@ -701,7 +701,7 @@ def test_torch_profiler_plugin_writes_trace() -> None:
         assert metrics["torch_profiler/trace_dir"].endswith("rank_00000")
         trace_dir = Path(tmp) / "rank_00000"
         assert trace_dir.is_dir()
-        trace_files = list(trace_dir.glob("*.pt.trace.json"))
+        trace_files = list(trace_dir.glob("trace.json"))
         assert trace_files
         trace = json.loads(trace_files[0].read_text())
         names = {event.get("name") for event in trace["traceEvents"]}

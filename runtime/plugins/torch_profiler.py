@@ -52,6 +52,7 @@ class TorchProfilerPlugin(RuntimePlugin):
         self._profiler: torch.profiler.profile | None = None
         self._enabled = False
         self._trace_path: Path | None = None
+        self._trace_file: Path | None = None
 
     def bind(self, runtime: "RuntimeCore") -> None:
         super().bind(runtime)
@@ -75,8 +76,11 @@ class TorchProfilerPlugin(RuntimePlugin):
     def close(self) -> None:
         if self._profiler is None:
             return
-        self._profiler.__exit__(None, None, None)
+        profiler = self._profiler
+        profiler.__exit__(None, None, None)
         self._profiler = None
+        if self._trace_file is not None:
+            profiler.export_chrome_trace(str(self._trace_file))
 
     def _start(self) -> None:
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -87,6 +91,7 @@ class TorchProfilerPlugin(RuntimePlugin):
         trace_path = self.trace_dir / f"rank_{rank:05d}"
         trace_path.mkdir(parents=True, exist_ok=True)
         self._trace_path = trace_path
+        self._trace_file = trace_path / "trace.json"
         activities = [torch.profiler.ProfilerActivity.CPU]
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
@@ -97,10 +102,6 @@ class TorchProfilerPlugin(RuntimePlugin):
                 warmup=self.warmup,
                 active=self.active,
                 repeat=self.repeat,
-            ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                str(trace_path),
-                worker_name=f"rank_{rank:05d}",
             ),
             record_shapes=self.record_shapes,
             profile_memory=self.profile_memory,
