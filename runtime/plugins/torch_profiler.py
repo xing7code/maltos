@@ -53,14 +53,37 @@ class TorchProfilerPlugin(RuntimePlugin):
         self._enabled = False
         self._trace_path: Path | None = None
         self._trace_file: Path | None = None
+        self._post_step_count = 0
 
     def bind(self, runtime: "RuntimeCore") -> None:
         super().bind(runtime)
         self._start()
 
     def on_step_phase(self, phase: RuntimePhase) -> None:
-        if phase == RuntimePhase.POST_STEP and self._profiler is not None:
+        if phase != RuntimePhase.POST_STEP:
+            return
+        self._post_step_count += 1
+        trace_boundary = self._is_rank0_trace_boundary()
+        if trace_boundary:
+            # Profiler stop synchronizes rank 0's CUDA work.  Keep every peer
+            # at the same optimizer-step boundary until that synchronization
+            # completes; otherwise they can launch the next collective while
+            # rank 0 is still stopping the trace.
+            dist.barrier()
+        if self._profiler is not None:
             self._profiler.step()
+        if trace_boundary:
+            dist.barrier()
+
+    def _is_rank0_trace_boundary(self) -> bool:
+        if not self.rank0_only or not dist.is_initialized():
+            return False
+        cycle_steps = self.wait + self.warmup + self.active
+        return (
+            cycle_steps > 0
+            and self._post_step_count <= self.repeat * cycle_steps
+            and self._post_step_count % cycle_steps == 0
+        )
 
     def collect_metrics(self) -> dict[str, MetricValue]:
         return {
