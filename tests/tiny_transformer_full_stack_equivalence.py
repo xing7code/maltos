@@ -205,7 +205,11 @@ def _make_baseline_core(reference_model: nn.Module, args: argparse.Namespace, de
         mesh=MeshConfig(dp=args.dp_size, tp=args.tp_size, pp=args.pp_size, cp=args.cp_size, ep=1),
         plan=ParallelPlan(
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
-            cp_token_planner=ContextTokenPlannerType(args.cp_token_planner) if args.cp_token_planner else None,
+            cp_token_planner=(
+                ContextTokenPlannerType(cp_token_planner)
+                if (cp_token_planner := getattr(args, "cp_token_planner", None))
+                else None
+            ),
         ),
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
@@ -237,7 +241,11 @@ def _make_runtime_core(reference_model: nn.Module, args: argparse.Namespace, dev
         plan=ParallelPlan(
             pp_schedule=PipelineScheduleConfig(microbatches=args.pp_microbatches),
             cp_attn_core=ContextParallelAttentionCoreType(args.cp_attn_core),
-            cp_token_planner=ContextTokenPlannerType(args.cp_token_planner) if args.cp_token_planner else None,
+            cp_token_planner=(
+                ContextTokenPlannerType(cp_token_planner)
+                if (cp_token_planner := getattr(args, "cp_token_planner", None))
+                else None
+            ),
         ),
         model=model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
