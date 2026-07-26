@@ -51,7 +51,11 @@ class CausalSelfAttention(nn.Module):
         q = self.q_proj(x).view(b, s, -1, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(b, s, -1, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(b, s, -1, self.head_dim).transpose(1, 2)
-        if self.n_heads != self.n_kv_heads:
+        if self.n_heads != self.n_kv_heads and not getattr(
+            self.attn_core,
+            "preserves_native_gqa",
+            False,
+        ):
             k = k.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1)
             v = v.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1)
         vo = self.attn_core(q, k, v, position_offset, position_ids, sequence_ids)

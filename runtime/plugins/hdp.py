@@ -78,12 +78,8 @@ class ByteScaleHdpPlugin(RuntimePlugin):
             module = model.get_submodule(path)
             if not hasattr(module, "attn_core"):
                 raise TypeError(f"attention module path={path} has no attn_core")
-            if getattr(module.attn_core, "attention_backend", None) != AttentionBackend.EAGER:
-                raise ValueError(
-                    "ByteScale HDP currently supports eager dynamic RingAttention only"
-                )
-
-            core = HdpBalancedAttentionCore(self.hdp_group)
+            backend = getattr(module.attn_core, "attention_backend", AttentionBackend.EAGER)
+            core = HdpBalancedAttentionCore(self.hdp_group, attention_backend=backend)
             module.attn_core = core
             self._attention_cores.append(core)
 

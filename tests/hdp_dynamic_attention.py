@@ -30,10 +30,10 @@ def _run_worker(rank: int) -> None:
     )
     try:
         torch.manual_seed(7)
-        full_q = torch.randn(1, 2, 8, 4, requires_grad=True)
+        full_q = torch.randn(1, 4, 8, 4, requires_grad=True)
         full_k = torch.randn(1, 2, 8, 4, requires_grad=True)
         full_v = torch.randn(1, 2, 8, 4, requires_grad=True)
-        short_q = torch.randn(1, 2, 2, 4, requires_grad=True)
+        short_q = torch.randn(1, 4, 2, 4, requires_grad=True)
         short_k = torch.randn(1, 2, 2, 4, requires_grad=True)
         short_v = torch.randn(1, 2, 2, 4, requires_grad=True)
         positions = torch.arange(8, dtype=torch.long).unsqueeze(0)
@@ -66,7 +66,7 @@ def _run_worker(rank: int) -> None:
             [index for index in document.source_indices if index is not None],
             dtype=torch.long,
         )
-        q = torch.zeros(1, 2, 6, 4)
+        q = torch.zeros(1, 4, 6, 4)
         k = torch.zeros(1, 2, 6, 4)
         v = torch.zeros(1, 2, 6, 4)
         q[:, :, :4, :] = full_q.detach().index_select(2, local_positions)

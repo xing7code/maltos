@@ -462,12 +462,17 @@ def pack_varlen_prefix_qkv(
         raise ValueError("pack_varlen_prefix_qkv expects q, k, v to have shape [batch, heads, seq, dim]")
     if q_positions.dim() != 2 or k_positions.dim() != 2:
         raise ValueError("q_positions and k_positions must have shape [batch, seq]")
-    batch_size, num_heads, q_seq_len, head_dim = q.shape
+    batch_size, q_num_heads, q_seq_len, head_dim = q.shape
     k_batch_size, k_num_heads, k_seq_len, k_head_dim = k.shape
-    if (k_batch_size, k_num_heads, k_head_dim) != (batch_size, num_heads, head_dim):
+    if k_batch_size != batch_size or k_head_dim != head_dim or k.shape != v.shape:
         raise ValueError(
-            "q and k/v must agree on batch/head/head_dim, "
+            "q and k/v must agree on batch/head_dim and K/V shape, "
             f"got q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        )
+    if q_num_heads % k_num_heads:
+        raise ValueError(
+            "FlashAttention GQA requires query heads divisible by native KV heads, "
+            f"got {q_num_heads} and {k_num_heads}"
         )
     if q_positions.shape != (batch_size, q_seq_len):
         raise ValueError(
@@ -497,9 +502,9 @@ def pack_varlen_prefix_qkv(
 
     q_valid = q_sequence_ids != PAD_SEQUENCE_ID
     k_valid = k_sequence_ids != PAD_SEQUENCE_ID
-    q_flat = q.transpose(1, 2).contiguous().reshape(batch_size * q_seq_len, num_heads, head_dim)
-    k_flat = k.transpose(1, 2).contiguous().reshape(batch_size * k_seq_len, num_heads, head_dim)
-    v_flat = v.transpose(1, 2).contiguous().reshape(batch_size * k_seq_len, num_heads, head_dim)
+    q_flat = q.transpose(1, 2).contiguous().reshape(batch_size * q_seq_len, q_num_heads, head_dim)
+    k_flat = k.transpose(1, 2).contiguous().reshape(batch_size * k_seq_len, k_num_heads, head_dim)
+    v_flat = v.transpose(1, 2).contiguous().reshape(batch_size * k_seq_len, k_num_heads, head_dim)
 
     q_segments: list[torch.Tensor] = []
     k_segments: list[torch.Tensor] = []
@@ -549,11 +554,12 @@ def pack_varlen_prefix_qkv(
             run_start = run_end
 
     if not q_segments:
-        empty = q.new_empty((0, num_heads, head_dim))
+        empty_q = q.new_empty((0, q_num_heads, head_dim))
+        empty_kv = k.new_empty((0, k_num_heads, head_dim))
         return PackedPrefixQkv(
-            q=empty,
-            k=empty,
-            v=empty,
+            q=empty_q,
+            k=empty_kv,
+            v=empty_kv,
             q_indices=torch.zeros(0, dtype=torch.long, device=q.device),
             k_indices=torch.zeros(0, dtype=torch.long, device=q.device),
             cu_seqlens_q=torch.zeros(1, dtype=torch.int32, device=q.device),
@@ -727,6 +733,7 @@ def flash_attn_varlen_prefix_backward(
         allow_empty_kv=allow_empty_kv,
     )
     batch_size, num_heads, q_seq_len, head_dim = q.shape
+    kv_num_heads = k.size(1)
     k_seq_len = k.size(2)
     if packed.max_seqlen_q == 0 or packed.max_seqlen_k == 0 or packed.q.numel() == 0:
         return (
@@ -778,7 +785,7 @@ def flash_attn_varlen_prefix_backward(
             packed.k_indices,
             batch_size=batch_size,
             seq_len=k_seq_len,
-            num_heads=num_heads,
+            num_heads=kv_num_heads,
             head_dim=head_dim,
         ),
         scatter_varlen_output_by_indices(
@@ -786,7 +793,7 @@ def flash_attn_varlen_prefix_backward(
             packed.k_indices,
             batch_size=batch_size,
             seq_len=k_seq_len,
-            num_heads=num_heads,
+            num_heads=kv_num_heads,
             head_dim=head_dim,
         ),
     )

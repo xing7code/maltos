@@ -162,8 +162,9 @@ class OlmoAttention(nn.Module):
         q = _apply_olmo_rotary(q, cos, sin)
         k = _apply_olmo_rotary(k, cos, sin)
         repeats = q.size(1) // k.size(1)
-        k = _repeat_kv(k, repeats)
-        v = _repeat_kv(v, repeats)
+        if not getattr(self.attn_core, "preserves_native_gqa", False):
+            k = _repeat_kv(k, repeats)
+            v = _repeat_kv(v, repeats)
         vo = self.attn_core(q, k, v, position_offset, position_ids, sequence_ids)
         out = vo.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(out)
