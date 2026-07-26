@@ -12,7 +12,9 @@ from data.bytescale_hdp import (
 )
 from parallel.hdp_helper import ByteScaleHdpBalancedConfig, ByteScaleHdpCostModel, DocumentIndices
 from runtime.mesh import MeshAxis
+from runtime.buffer_allocator import clear_buffer_pool, global_buffer_pool
 from runtime.layers.hdp_attention import _local_flash_segments
+from runtime.layers.cp_functional import _fixed_capacity_receive_view
 from runtime.plugin import PluginId
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.hdp import ByteScaleHdpPlugin, _layout_metrics
@@ -337,6 +339,72 @@ def test_repeated_source_sequence_ids_get_unique_document_identity() -> None:
     assert local[POSITION_IDS_KEY].tolist() == [[0, 1, 0, 1]]
 
 
+def test_dynamic_flash_ring_pinned_buffers_use_partition_capacity_across_lengths() -> None:
+    clear_buffer_pool()
+    capacity = 512
+    lengths = (258, 344, 418, 506)
+    try:
+        for degree in (2, 3):
+            # A D2 ring uses slot 0; D3 reaches both alternating slots.  The
+            # production key is independent of dynamic degree, so both must
+            # reuse the same per-layer/phase capacity handles.
+            for slot in range(degree - 1):
+                prefix = f"test.hdp.layer.fwd.slot{slot}"
+                expected_handle_count: int | None = None
+                for length_index, length in enumerate(lengths):
+                    k_view = _fixed_capacity_receive_view(
+                        torch.empty((1, 2, length, 16), dtype=torch.bfloat16),
+                        partition_tokens=capacity,
+                        alloc_key=f"{prefix}.k",
+                    )
+                    v_view = _fixed_capacity_receive_view(
+                        torch.empty((1, 2, length, 16), dtype=torch.bfloat16),
+                        partition_tokens=capacity,
+                        alloc_key=f"{prefix}.v",
+                    )
+                    dk_view = _fixed_capacity_receive_view(
+                        torch.empty((1, 2, length, 16), dtype=torch.float32),
+                        partition_tokens=capacity,
+                        alloc_key=f"{prefix}.dk",
+                    )
+                    dv_view = _fixed_capacity_receive_view(
+                        torch.empty((1, 2, length, 16), dtype=torch.float32),
+                        partition_tokens=capacity,
+                        alloc_key=f"{prefix}.dv",
+                    )
+                    positions_view = _fixed_capacity_receive_view(
+                        torch.empty((1, length), dtype=torch.long),
+                        partition_tokens=capacity,
+                        alloc_key=f"{prefix}.positions",
+                    )
+                    sequence_ids_view = _fixed_capacity_receive_view(
+                        torch.empty((1, length), dtype=torch.long),
+                        partition_tokens=capacity,
+                        alloc_key=f"{prefix}.sequence_ids",
+                    )
+                    assert k_view.shape == (1, 2, length, 16)
+                    assert v_view.shape == (1, 2, length, 16)
+                    assert dk_view.shape == (1, 2, length, 16)
+                    assert dv_view.shape == (1, 2, length, 16)
+                    assert positions_view.shape == (1, length)
+                    assert sequence_ids_view.shape == (1, length)
+                    handle_count = len(global_buffer_pool()._pinned_handles)
+                    if length_index == 0:
+                        expected_handle_count = handle_count
+                    else:
+                        assert handle_count == expected_handle_count
+
+        pool = global_buffer_pool()
+        # Two D3 double-buffer slots × {K/V, FP32 dK/dV, positions, sequence IDs}.
+        assert len(pool._pinned_handles) == 12
+        for (_, _, shape, _), handle in pool._pinned_handles.items():
+            token_dim = -1 if len(shape) == 2 else -2
+            assert shape[token_dim] == capacity
+            assert handle.tensor.shape == shape
+    finally:
+        clear_buffer_pool()
+
+
 def main() -> None:
     test_hdp_balanced_participant_count_is_proportional_to_length()
     test_hdp_balanced_partition_tokens_must_be_even_for_zigzag()
@@ -357,6 +425,7 @@ def main() -> None:
     test_packed_position_fallback_is_document_relative()
     test_best_fit_packing_tracks_valid_and_padded_slots()
     test_repeated_source_sequence_ids_get_unique_document_identity()
+    test_dynamic_flash_ring_pinned_buffers_use_partition_capacity_across_lengths()
     print("ByteScale HDP placement PASS")
 
 

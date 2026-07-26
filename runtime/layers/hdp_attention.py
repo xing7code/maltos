@@ -131,6 +131,7 @@ class HdpBalancedAttentionCore(nn.Module):
                     group=self.group,
                     participant_ranks=document.participant_ranks,
                     module_id=id(self),
+                    partition_tokens=layout.partition_tokens,
                     metadata_cache=layout.attention_metadata_cache,
                     metadata_cache_key=("flash_ring", str(q.device), document.document_id),
                 )

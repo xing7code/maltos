@@ -53,7 +53,7 @@ def _worker(rank: int, port: int) -> None:
         # Warmup initializes FlashAttention and pinned double buffers outside the trace.
         out = dynamic_flash_ring_attention(
             q, k, v, positions=positions, sequence_ids=None,
-            group=dist.group.WORLD, participant_ranks=participants, module_id=917,
+            group=dist.group.WORLD, participant_ranks=participants, module_id=917, partition_tokens=256,
         )
         out.float().sum().backward()
         q.grad = k.grad = v.grad = None
@@ -61,7 +61,7 @@ def _worker(rank: int, port: int) -> None:
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
             out = dynamic_flash_ring_attention(
                 q, k, v, positions=positions, sequence_ids=None,
-                group=dist.group.WORLD, participant_ranks=participants, module_id=917,
+                group=dist.group.WORLD, participant_ranks=participants, module_id=917, partition_tokens=256,
             )
             out.float().sum().backward()
             torch.cuda.synchronize(device)

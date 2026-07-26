@@ -113,6 +113,7 @@ def _check_document(rank: int, participants: tuple[int, ...], *, packed: bool) -
             out = dynamic_flash_ring_attention(
                 q, k, v, positions=local_positions, sequence_ids=sequence_ids,
                 group=dist.group.WORLD, participant_ranks=participants,
+                partition_tokens=8,
             )
             out.float().sum().backward()
         finally:

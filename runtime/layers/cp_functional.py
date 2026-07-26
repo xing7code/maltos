@@ -143,6 +143,7 @@ def _async_subset_ring_exchange(
     group: dist.ProcessGroup,
     participant_ranks: tuple[int, ...],
     alloc_key: str,
+    partition_tokens: int,
 ) -> _AsyncSubsetExchange:
     if len(participant_ranks) == 1:
         return _AsyncSubsetExchange(x, x, [])
@@ -150,10 +151,9 @@ def _async_subset_ring_exchange(
     send_to = participant_ranks[(local_index + 1) % len(participant_ranks)]
     recv_from = participant_ranks[(local_index - 1) % len(participant_ranks)]
     send_tensor = x.contiguous()
-    recv_tensor = acquire_buffer(
-        shape=tuple(x.shape), dtype=x.dtype, device=x.device,
-        policy=BufferPolicy.PINNED, key=alloc_key,
-    ).tensor
+    recv_tensor = _fixed_capacity_receive_view(
+        x, partition_tokens=partition_tokens, alloc_key=alloc_key
+    )
     with torch.profiler.record_function("maltos::hdp.flash.p2p.launch"):
         works = pairwise_send_recv_async(
             send_tensor, recv_tensor,
@@ -162,6 +162,36 @@ def _async_subset_ring_exchange(
             group=group,
         )
     return _AsyncSubsetExchange(send_tensor, recv_tensor, works)
+
+
+def _fixed_capacity_receive_view(
+    x: torch.Tensor,
+    *,
+    partition_tokens: int,
+    alloc_key: str,
+) -> torch.Tensor:
+    """Return an actual-length view into one HDP rank's fixed receive capacity."""
+    if partition_tokens < 1:
+        raise ValueError("HDP partition_tokens must be positive")
+    if x.dim() not in (2, 4):
+        raise ValueError(
+            "HDP dynamic Flash Ring receive tensors must be [B, T] metadata "
+            "or [B, H, T, D] K/V tensors"
+        )
+    token_dim = -1 if x.dim() == 2 else -2
+    actual_tokens = x.size(token_dim)
+    if actual_tokens > partition_tokens:
+        raise ValueError(
+            "HDP dynamic Flash Ring local tensor exceeds its explicit partition capacity: "
+            f"tokens={actual_tokens} partition_tokens={partition_tokens}"
+        )
+    capacity_shape = list(x.shape)
+    capacity_shape[token_dim] = partition_tokens
+    capacity = acquire_buffer(
+        shape=tuple(capacity_shape), dtype=x.dtype, device=x.device,
+        policy=BufferPolicy.PINNED, key=alloc_key,
+    ).tensor
+    return capacity.narrow(token_dim, 0, actual_tokens)
 
 
 def _async_subset_block_exchange(
@@ -173,15 +203,16 @@ def _async_subset_block_exchange(
     group: dist.ProcessGroup,
     participant_ranks: tuple[int, ...],
     alloc_key: str,
+    partition_tokens: int,
 ) -> _AsyncSubsetBlockExchange:
     return _AsyncSubsetBlockExchange(
-        k=_async_subset_ring_exchange(k, group=group, participant_ranks=participant_ranks, alloc_key=f"{alloc_key}.k"),
-        v=_async_subset_ring_exchange(v, group=group, participant_ranks=participant_ranks, alloc_key=f"{alloc_key}.v"),
-        positions=_async_subset_ring_exchange(positions, group=group, participant_ranks=participant_ranks, alloc_key=f"{alloc_key}.positions"),
+        k=_async_subset_ring_exchange(k, group=group, participant_ranks=participant_ranks, alloc_key=f"{alloc_key}.k", partition_tokens=partition_tokens),
+        v=_async_subset_ring_exchange(v, group=group, participant_ranks=participant_ranks, alloc_key=f"{alloc_key}.v", partition_tokens=partition_tokens),
+        positions=_async_subset_ring_exchange(positions, group=group, participant_ranks=participant_ranks, alloc_key=f"{alloc_key}.positions", partition_tokens=partition_tokens),
         sequence_ids=(
             None if sequence_ids is None else _async_subset_ring_exchange(
                 sequence_ids, group=group, participant_ranks=participant_ranks,
-                alloc_key=f"{alloc_key}.sequence_ids")
+                alloc_key=f"{alloc_key}.sequence_ids", partition_tokens=partition_tokens)
         ),
     )
 
@@ -190,7 +221,7 @@ class _DynamicFlashRingAttention(torch.autograd.Function):
     """Double-buffered async FlashAttention ring on an arbitrary parent-group subset."""
 
     @staticmethod
-    def forward(ctx, q, k, v, positions, sequence_ids, group, participant_ranks, module_id, prefix_metadata, metadata_cache, metadata_cache_key):
+    def forward(ctx, q, k, v, positions, sequence_ids, group, participant_ranks, module_id, partition_tokens, prefix_metadata, metadata_cache, metadata_cache_key):
         has_sequence_ids = sequence_ids.numel() != 0
         current_k, current_v = k, v
         current_positions = positions
@@ -204,7 +235,7 @@ class _DynamicFlashRingAttention(torch.autograd.Function):
                 next_exchange = _async_subset_block_exchange(
                     current_k, current_v, current_positions, current_sequence_ids,
                     group=group, participant_ranks=participant_ranks,
-                    alloc_key=f"hdp.flash_ring.{module_id}.fwd.slot_{step % 2}",
+                    alloc_key=f"hdp.flash_ring.{module_id}.fwd.slot_{step % 2}", partition_tokens=partition_tokens,
                 )
             with torch.profiler.record_function("maltos::hdp.flash.forward.block"):
                 block = flash_attn_varlen_prefix_with_lse(
@@ -224,6 +255,7 @@ class _DynamicFlashRingAttention(torch.autograd.Function):
         out = running_out.to(dtype=q.dtype)
         ctx.save_for_backward(q, k, v, out, running_lse, positions, sequence_ids)
         ctx.group, ctx.participant_ranks, ctx.module_id = group, participant_ranks, module_id
+        ctx.partition_tokens = partition_tokens
         ctx.prefix_metadata = prefix_metadata
         ctx.metadata_cache, ctx.metadata_cache_key = metadata_cache, metadata_cache_key
         return out
@@ -246,7 +278,7 @@ class _DynamicFlashRingAttention(torch.autograd.Function):
                 next_block_exchange = _async_subset_block_exchange(
                     current_k, current_v, current_positions, current_sequence_ids,
                     group=ctx.group, participant_ranks=ctx.participant_ranks,
-                    alloc_key=f"hdp.flash_ring.{ctx.module_id}.bwd.kv.slot_{step % 2}",
+                    alloc_key=f"hdp.flash_ring.{ctx.module_id}.bwd.kv.slot_{step % 2}", partition_tokens=ctx.partition_tokens,
                 )
             with torch.profiler.record_function("maltos::hdp.flash.backward.block"):
                 block_dq, block_dk, block_dv = flash_attn_varlen_prefix_backward(
@@ -270,15 +302,15 @@ class _DynamicFlashRingAttention(torch.autograd.Function):
             if step + 1 != len(ctx.participant_ranks):
                 pending_dk_exchange = _async_subset_ring_exchange(
                     current_dk, group=ctx.group, participant_ranks=ctx.participant_ranks,
-                    alloc_key=f"hdp.flash_ring.{ctx.module_id}.bwd.dk.slot_{step % 2}")
+                    alloc_key=f"hdp.flash_ring.{ctx.module_id}.bwd.dk.slot_{step % 2}", partition_tokens=ctx.partition_tokens)
                 pending_dv_exchange = _async_subset_ring_exchange(
                     current_dv, group=ctx.group, participant_ranks=ctx.participant_ranks,
-                    alloc_key=f"hdp.flash_ring.{ctx.module_id}.bwd.dv.slot_{step % 2}")
+                    alloc_key=f"hdp.flash_ring.{ctx.module_id}.bwd.dv.slot_{step % 2}", partition_tokens=ctx.partition_tokens)
                 assert next_block_exchange is not None
                 current_k, current_v, current_positions, current_sequence_ids = next_block_exchange.wait()
         local_dk = _subset_ring_exchange(current_dk, group=ctx.group, participant_ranks=ctx.participant_ranks)
         local_dv = _subset_ring_exchange(current_dv, group=ctx.group, participant_ranks=ctx.participant_ranks)
-        return dq.to(q.dtype), local_dk.to(k.dtype), local_dv.to(v.dtype), None, None, None, None, None, None, None, None
+        return dq.to(q.dtype), local_dk.to(k.dtype), local_dv.to(v.dtype), None, None, None, None, None, None, None, None, None
 
 
 def _merge_flash_attention_blocks(running_out, running_lse, block_out, block_lse):
@@ -300,6 +332,7 @@ def dynamic_flash_ring_attention(
     group: dist.ProcessGroup,
     participant_ranks: tuple[int, ...],
     module_id: int = 0,
+    partition_tokens: int,
     prefix_metadata: tuple[VarlenPrefixMetadata | None, ...] | None = None,
     metadata_cache: dict[object, VarlenPrefixMetadata] | None = None,
     metadata_cache_key: tuple[object, ...] | None = None,
@@ -307,13 +340,20 @@ def dynamic_flash_ring_attention(
     """Run custom-autograd Flash Ring without creating a per-document group."""
     if not participant_ranks or len(set(participant_ranks)) != len(participant_ranks):
         raise ValueError("Flash Ring participant_ranks must be a non-empty ordered set")
+    if partition_tokens < 1:
+        raise ValueError("HDP partition_tokens must be positive")
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4 or k.shape != v.shape:
         raise ValueError("Flash Ring expects Q and native K/V tensors shaped [batch, heads, tokens, head_dim]")
     if q.size(0) != k.size(0) or q.size(2) != k.size(2) or q.size(3) != k.size(3) or q.size(1) % k.size(1):
         raise ValueError("Flash Ring Q heads must be divisible by native KV heads with matching batch/token/head_dim")
+    if q.size(2) > partition_tokens:
+        raise ValueError(
+            "Flash Ring local sequence length exceeds explicit HDP partition_tokens: "
+            f"tokens={q.size(2)} partition_tokens={partition_tokens}"
+        )
     sequence_arg = sequence_ids if sequence_ids is not None else positions.new_empty((0,), dtype=torch.long)
     if prefix_metadata is not None and len(prefix_metadata) != len(participant_ranks):
         raise ValueError("Flash Ring prefix metadata must contain one layout for every ring step")
     return _DynamicFlashRingAttention.apply(
-        q, k, v, positions, sequence_arg, group, participant_ranks, module_id,
+        q, k, v, positions, sequence_arg, group, participant_ranks, module_id, partition_tokens,
         prefix_metadata, metadata_cache, metadata_cache_key)
