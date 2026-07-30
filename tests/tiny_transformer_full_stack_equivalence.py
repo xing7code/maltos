@@ -55,8 +55,7 @@ from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.types import RuntimePhase
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
-from runtime.plugins.sp import SequenceParallelPlugin
-from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.tp_sp import TpSpPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
@@ -195,7 +194,7 @@ def _make_baseline_core(reference_model: nn.Module, args: argparse.Namespace, de
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
-        plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
+        plugins.append(TpSpPlugin())
     if args.cp_size > 1:
         plugins.append(ContextParallelPlugin())
     zero_plugin = _make_zero_plugin(args)
@@ -228,7 +227,7 @@ def _make_runtime_core(reference_model: nn.Module, args: argparse.Namespace, dev
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
-        plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
+        plugins.append(TpSpPlugin())
     if args.cp_size > 1:
         plugins.append(ContextParallelPlugin())
     if args.pp_size > 1:

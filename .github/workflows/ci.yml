@@ -117,4 +117,20 @@ jobs:
           python tests/tiny_transformer_tp_checkpoint_manifest.py \
             --master-port 29618
 
+          python tests/tiny_transformer_tp_grad_clip_equivalence.py \
+            --world-size 2 \
+            --master-port 29619
+
+          python tests/tiny_transformer_full_stack_equivalence.py \
+            --world-size 4 \
+            --dp-size 2 \
+            --pp-size 1 \
+            --tp-size 2 \
+            --pp-microbatches 1 \
+            --zero-stage 3 \
+            --backend gloo \
+            --master-port 29620 \
+            --model olmo2 \
+            --activation-checkpointing
+
           python tests/tiny_moe_aux_loss.py

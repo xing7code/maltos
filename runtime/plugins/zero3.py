@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from runtime.buffer_allocator import BufferHandle, BufferPolicy, acquire_buffer, release_buffer
 from runtime.mesh import MeshAxis
-from runtime.plugin import PluginId
+from runtime.plugin import ParamMaterializationGroupProvider, PluginId
 from runtime.plugins.zero_common import (
     ChainedWork,
     CompletedWork,
@@ -74,7 +74,13 @@ class Zero3Plugin(ZeroPluginBase):
             name="zero3",
             owns_optimizer=True,
             owns_model_state=True,
-            runs_after={PluginId.PP, PluginId.CP, PluginId.HDP, PluginId.TP, PluginId.SP},
+            runs_after={
+                PluginId.PP,
+                PluginId.CP,
+                PluginId.HDP,
+                PluginId.TP,
+                PluginId.TP_SP,
+            },
         )
         self.wrap_cls = set(wrap_cls or {nn.Linear})
         self.buckets: list[_Bucket] = []
@@ -177,12 +183,33 @@ class Zero3Plugin(ZeroPluginBase):
         param_to_name = {id(param): name for name, param in model.named_parameters()}
         covered_param_ids: set[int] = set()
         bucket_specs: list[tuple[nn.Module, list[nn.Parameter], list[str]]] = []
+
+        assert self.runtime is not None
+        for plugin in self.runtime.plugins:
+            if not isinstance(plugin, ParamMaterializationGroupProvider):
+                continue
+            for module, grouped_params in plugin.param_materialization_groups():
+                params = [
+                    param
+                    for param in grouped_params
+                    if param.requires_grad and id(param) not in covered_param_ids
+                ]
+                if not params:
+                    continue
+                logical_names = [param_to_name[id(param)] for param in params]
+                bucket_specs.append((module, params, logical_names))
+                covered_param_ids.update(id(param) for param in params)
+
         for module_name, module in model.named_modules():
             if not isinstance(module, tuple(self.wrap_cls)):
                 continue
             if any(module_name.startswith(parent + ".") for parent in visited):
                 continue
-            params = [param for param in module.parameters(recurse=True) if param.requires_grad]
+            params = [
+                param
+                for param in module.parameters(recurse=True)
+                if param.requires_grad and id(param) not in covered_param_ids
+            ]
             if not params:
                 continue
             visited.add(module_name)
@@ -272,7 +299,10 @@ class Zero3Plugin(ZeroPluginBase):
 
     def _add_hooks(self) -> None:
         for bucket in self.buckets:
-            bucket.module.register_forward_pre_hook(self._make_materialize_forward_hook(bucket))
+            bucket.module.register_forward_pre_hook(
+                self._make_materialize_forward_hook(bucket),
+                prepend=True,
+            )
             bucket.module.register_forward_hook(self._make_free_forward_hook(bucket))
             for param in bucket.params:
                 param.register_hook(self._make_attach_grad_hook(bucket))

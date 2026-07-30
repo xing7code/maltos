@@ -27,7 +27,6 @@ class PluginId(str, Enum):
     FP16 = "fp16"
     GRAD_CLIP = "grad_clip"
     TP = "tp"
-    SP = "sp"
     TP_SP = "tp_sp"
     DP = "dp"
     PP = "pp"
@@ -55,6 +54,13 @@ class OptimizerOwner(Protocol):
 @runtime_checkable
 class StepRunnerOwner(Protocol):
     def build_step_runner(self) -> "StepRunner | None": ...
+
+
+@runtime_checkable
+class ParamMaterializationGroupProvider(Protocol):
+    def param_materialization_groups(
+        self,
+    ) -> tuple[tuple[nn.Module, tuple[nn.Parameter, ...]], ...]: ...
 
 
 @runtime_checkable

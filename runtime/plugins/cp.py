@@ -31,7 +31,7 @@ class ContextParallelPlugin(RuntimePlugin):
         super().__init__(
             id=PluginId.CP,
             name="context_parallel",
-            runs_after={PluginId.TP, PluginId.SP, PluginId.DP},
+            runs_after={PluginId.TP, PluginId.TP_SP, PluginId.DP},
         )
         self._grad_sync_handles: list[object] = []
         self._use_param_hook_sync = False

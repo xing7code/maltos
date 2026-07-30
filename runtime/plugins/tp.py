@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from parallel.specs import TpSpShardAxis
+from parallel.specs import TpSpShardAxis, TpSpShardRule
 from runtime.mesh import MeshAxis
 from runtime.layers.distributed_rmsnorm import DistributedRMSNorm
 from runtime.plugin import PluginId, RuntimePlugin, TpSpParallelizableModule
@@ -27,11 +27,11 @@ class _NormInitSpec:
     weight: torch.Tensor
 
 
-class TensorParallelPlugin(RuntimePlugin):
-    """Draft TP plugin that cooperates with RuntimeCore instead of driving execution."""
+class TensorParallelTransformPlugin(RuntimePlugin):
+    """Shared parameter-sharding transform for TP-aware runtime plugins."""
 
-    def __init__(self):
-        super().__init__(id=PluginId.TP, name="tensor_parallel")
+    def __init__(self, *, plugin_id: PluginId, name: str):
+        super().__init__(id=plugin_id, name=name)
         self._param_shard_axis: dict[str, TpSpShardAxis] = {}
         self._logical_shapes: dict[str, tuple[int, ...]] = {}
         self._tp_replicated_params: set[str] = set()
@@ -70,14 +70,7 @@ class TensorParallelPlugin(RuntimePlugin):
                             bias=None if module.bias is None else module.bias.detach(),
                         )
                     )
-                    new_col = ColumnParallelLinear(
-                        module.in_features,
-                        module.out_features,
-                        self.tp_group,
-                        bias=module.bias is not None,
-                        gather_output=(rule.post_comm == "all_gather"),
-                        init=False,
-                    )
+                    new_col = self._make_column_parallel_linear(module, rule)
                     model.set_submodule(rule.module_path, new_col)
                 elif rule.shard_axis == TpSpShardAxis.PARAM_IN:
                     self._record_linear_rule(rule.module_path, module, rule.shard_axis)
@@ -89,15 +82,7 @@ class TensorParallelPlugin(RuntimePlugin):
                             bias=None if module.bias is None else module.bias.detach(),
                         )
                     )
-                    new_row = RowParallelLinear(
-                        module.in_features,
-                        module.out_features,
-                        self.tp_group,
-                        rule.post_comm,
-                        rule.comm_dim,
-                        bias=module.bias is not None,
-                        init=False,
-                    )
+                    new_row = self._make_row_parallel_linear(module, rule)
                     model.set_submodule(rule.module_path, new_row)
                 continue
             if isinstance(module, DistributedRMSNorm):
@@ -125,6 +110,35 @@ class TensorParallelPlugin(RuntimePlugin):
         self.runtime.add_module_replacement(nn.Linear, RowParallelLinear)
         self.runtime.add_module_replacement(DistributedRMSNorm, DistributedRMSNorm)
         return model
+
+    def _make_column_parallel_linear(
+        self,
+        module: nn.Linear,
+        rule: TpSpShardRule,
+    ) -> ColumnParallelLinear:
+        return ColumnParallelLinear(
+            module.in_features,
+            module.out_features,
+            self.tp_group,
+            bias=module.bias is not None,
+            gather_output=(rule.post_comm == "all_gather"),
+            init=False,
+        )
+
+    def _make_row_parallel_linear(
+        self,
+        module: nn.Linear,
+        rule: TpSpShardRule,
+    ) -> RowParallelLinear:
+        return RowParallelLinear(
+            module.in_features,
+            module.out_features,
+            self.tp_group,
+            rule.post_comm,
+            rule.comm_dim,
+            bias=module.bias is not None,
+            init=False,
+        )
 
     def _materialize_shards(self, model: nn.Module) -> None:
         for spec in self._pending_linear_inits:
@@ -220,3 +234,13 @@ class TensorParallelPlugin(RuntimePlugin):
                 fq_name,
                 replicated_axes=attrs.replicated_axes | {MeshAxis.TP},
             )
+
+
+class TensorParallelPlugin(TensorParallelTransformPlugin):
+    """Standalone tensor-parallel transform."""
+
+    def __init__(self):
+        super().__init__(
+            plugin_id=PluginId.TP,
+            name="tensor_parallel",
+        )

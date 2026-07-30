@@ -34,8 +34,7 @@ from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.grad_clip import GradClipPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.fp16 import Fp16Plugin
-from runtime.plugins.sp import SequenceParallelPlugin
-from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.tp_sp import TpSpPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
@@ -126,7 +125,7 @@ def _build_runtime(
         zero_plugin = Zero3Plugin(wrap_cls=_ZERO3_WRAP_CLS)
     plugins = []
     if args.tp_size > 1:
-        plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
+        plugins.append(TpSpPlugin())
     if args.cp_size > 1:
         plugins.append(ContextParallelPlugin())
     if args.pp_size > 1:

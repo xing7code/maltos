@@ -14,7 +14,7 @@ class Fp16Plugin(RuntimePlugin):
             name="fp16",
             runs_after={
                 PluginId.TP,
-                PluginId.SP,
+                PluginId.TP_SP,
                 PluginId.DP,
                 PluginId.PP,
                 PluginId.CP,

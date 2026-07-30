@@ -24,8 +24,7 @@ from models.tiny_transformer import RmsNorm
 from parallel import ParallelPlan
 from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.fp16 import Fp16Plugin
-from runtime.plugins.sp import SequenceParallelPlugin
-from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.tp_sp import TpSpPlugin
 from runtime.plugins.zero3 import Zero3Plugin
 from state import load_sharded_checkpoint, save_sharded_checkpoint
 from utils.constants import INPUT_IDS_KEY, LABELS_KEY
@@ -103,8 +102,7 @@ def _build_runtime(model: TinyTransformerTpSp, dp_size: int, tp_size: int) -> tu
         grad_clip_max_norm=1.0,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=[
-            TensorParallelPlugin(),
-            SequenceParallelPlugin(),
+            TpSpPlugin(),
             zero3,
         ],
         dtype=torch.bfloat16,

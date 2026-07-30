@@ -32,7 +32,7 @@ class CompilePlugin(RuntimePlugin):
             name="compile",
             runs_after={
                 PluginId.TP,
-                PluginId.SP,
+                PluginId.TP_SP,
                 PluginId.CP,
                 PluginId.HDP,
                 PluginId.EP,

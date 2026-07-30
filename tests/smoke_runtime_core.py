@@ -303,7 +303,7 @@ def test_missing_required_plugin_fails() -> None:
             plan=ParallelPlan(),
             model=LossModel(),
             optimizer_factory=_sgd_factory(),
-            plugins=[RecordingPlugin(PluginId.SP, [], requires={PluginId.TP})],
+            plugins=[RecordingPlugin(PluginId.CP, [], requires={PluginId.TP})],
         )
     except ValueError as exc:
         assert "requires missing plugins=['tp']" in str(exc)

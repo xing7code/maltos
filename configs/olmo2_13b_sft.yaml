@@ -35,6 +35,9 @@ parallel:
   dp_size: 4
   tp_size: 2
   use_sp: true
+  # Launch with CUDA_DEVICE_MAX_CONNECTIONS=1 so NCCL collectives are issued
+  # before the GEMMs intended to overlap them. Set it before torchrun starts.
+  tp_native_comm_overlap: true
   zero_stage: 3
 
 training:

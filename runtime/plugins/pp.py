@@ -27,7 +27,7 @@ class PipelineParallelPlugin(RuntimePlugin):
                 PluginId.ZERO2,
                 PluginId.ZERO3,
                 PluginId.TP,
-                PluginId.SP,
+                PluginId.TP_SP,
                 PluginId.EP,
                 PluginId.FP16,
             },
@@ -46,7 +46,7 @@ class PipelineParallelPlugin(RuntimePlugin):
     def bind(self, runtime: "RuntimeCore") -> None:
         super().bind(runtime)
         active_plugins = {plugin.id for plugin in runtime.plugins if plugin is not self}
-        self.sequence_parallel_enabled = PluginId.SP in active_plugins
+        self.sequence_parallel_enabled = PluginId.TP_SP in active_plugins
         self.sequence_parallel_world_size = runtime.mesh.tp if self.sequence_parallel_enabled else 1
 
     def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:

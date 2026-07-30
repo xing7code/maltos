@@ -55,7 +55,13 @@ class Zero2Plugin(ZeroPluginBase):
             id=PluginId.ZERO2,
             name="zero2",
             owns_optimizer=True,
-            runs_after={PluginId.PP, PluginId.CP, PluginId.HDP, PluginId.TP, PluginId.SP},
+            runs_after={
+                PluginId.PP,
+                PluginId.CP,
+                PluginId.HDP,
+                PluginId.TP,
+                PluginId.TP_SP,
+            },
             bucket_mb_size=bucket_mb_size,
         )
         self.data_buffer: torch.Tensor | None = None

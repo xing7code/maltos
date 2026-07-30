@@ -49,7 +49,7 @@ class ExpertParallelPlugin(RuntimePlugin):
         super().__init__(
             id=PluginId.EP,
             name="expert_parallel",
-            runs_after={PluginId.TP, PluginId.SP},
+            runs_after={PluginId.TP, PluginId.TP_SP},
             runs_before={PluginId.DP, PluginId.ZERO1, PluginId.ZERO2, PluginId.ZERO3},
         )
         self.bucket_byte_size = bucket_mb_size * 1024 * 1024

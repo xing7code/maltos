@@ -118,6 +118,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pp-microbatches", type=int, default=1)
     parser.add_argument("--cp-size", type=int, default=1)
     parser.add_argument(
+        "--tp-native-comm-overlap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "use PyTorch native pipelined GEMM/reduce-scatter on supported "
+            "CUDA/NCCL builds; launch with CUDA_DEVICE_MAX_CONNECTIONS=1 for "
+            "the intended NCCL/GEMM ordering; unsupported backends use the "
+            "portable fallback"
+        ),
+    )
+    parser.add_argument(
         "--cp-attn-core",
         type=str,
         default="all_gather_kv",
@@ -332,6 +343,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("parallel", "hdp_cost_gamma"): "hdp_cost_gamma",
         ("parallel", "hdp_balance_delta"): "hdp_balance_delta",
         ("parallel", "tp_size"): "tp_size",
+        ("parallel", "tp_native_comm_overlap"): "tp_native_comm_overlap",
         ("parallel", "ep_size"): "ep_size",
         ("parallel", "use_sp"): "use_sp",
         ("parallel", "zero_stage"): "zero_stage",

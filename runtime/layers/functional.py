@@ -15,6 +15,73 @@ from utils.distributed import all_gather_single, all_reduce_tensor, pairwise_sen
 from utils.profiling import profiled
 
 
+def _native_fused_matmul_reduce_scatter(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    group: dist.ProcessGroup,
+    *,
+    scatter_dim: int,
+) -> torch.Tensor | None:
+    """Use PyTorch's native micro-pipelined GEMM/RS when it is available.
+
+    The private symmetric-memory API is intentionally capability-gated.  It is
+    currently the only PyTorch-native implementation that pipelines output
+    GEMM tiles with the corresponding reduce-scatter traffic.  Older PyTorch
+    builds and non-NCCL backends keep using the portable collective fallback.
+    """
+
+    if not input.is_cuda or dist.get_backend(group) != "nccl":
+        return None
+    get_group_name = getattr(dist, "_get_process_group_name", None)
+    if get_group_name is None:
+        return None
+    try:
+        from torch.distributed import _symmetric_memory as symm_mem
+    except ImportError:
+        return None
+    fused = getattr(symm_mem, "_fused_matmul_reduce_scatter", None)
+    if fused is None:
+        return None
+    return fused(
+        input,
+        weight.t(),
+        "sum",
+        scatter_dim,
+        get_group_name(group),
+    )
+
+
+def _native_fused_all_gather_matmul(
+    input: torch.Tensor,
+    weights: tuple[torch.Tensor, ...],
+    group: dist.ProcessGroup,
+    *,
+    gather_dim: int,
+) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
+    if not input.is_cuda or dist.get_backend(group) != "nccl":
+        return None
+    get_group_name = getattr(dist, "_get_process_group_name", None)
+    if get_group_name is None:
+        return None
+    try:
+        from torch.distributed import _symmetric_memory as symm_mem
+    except ImportError:
+        return None
+    fused = getattr(symm_mem, "_fused_all_gather_matmul", None)
+    if fused is None:
+        return None
+    gathered, outputs = fused(
+        input,
+        [weight.t() for weight in weights],
+        gather_dim,
+        get_group_name(group),
+        return_A=True,
+    )
+    if gathered is None:
+        raise RuntimeError("PyTorch fused all-gather/matmul did not return the gathered input")
+    return gathered, outputs
+
+
 @dataclass
 class _AsyncRingExchange:
     send_tensor: torch.Tensor
@@ -43,6 +110,7 @@ class AllGather(torch.autograd.Function):
         ctx.rank = dist.get_rank(group)
         ctx.world_size = dist.get_world_size(group)
         ctx.backward_reduce_op = backward_reduce_op
+        ctx.alloc_key = alloc_key
 
         x_t = x.transpose(0, comm_dim).contiguous()
         out_shape = (ctx.world_size * x_t.shape[0], *x_t.shape[1:])
@@ -59,11 +127,28 @@ class AllGather(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         dim = ctx.comm_dim
-        per_rank_dim = grad_output.shape[dim] // ctx.world_size
-        grad = grad_output.narrow(dim, ctx.rank * per_rank_dim, per_rank_dim).contiguous()
-        if ctx.backward_reduce_op is not None:
-            all_reduce_tensor(grad, op=ctx.backward_reduce_op, group=ctx.group)
-        return grad, None, None, None, None
+        if ctx.backward_reduce_op is None:
+            per_rank_dim = grad_output.shape[dim] // ctx.world_size
+            grad = grad_output.narrow(dim, ctx.rank * per_rank_dim, per_rank_dim).contiguous()
+            return grad, None, None, None, None
+
+        grad_output_t = grad_output.transpose(0, dim).contiguous()
+        grad_shape = list(grad_output_t.shape)
+        grad_shape[0] //= ctx.world_size
+        grad_t = acquire_buffer(
+            shape=tuple(grad_shape),
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+            policy=BufferPolicy.PINNED,
+            key=f"{ctx.alloc_key}.backward.reduce_scatter",
+        ).tensor
+        reduce_scatter_single(
+            grad_t,
+            grad_output_t,
+            group=ctx.group,
+            op=ctx.backward_reduce_op,
+        )
+        return grad_t.transpose(0, dim).contiguous(), None, None, None, None
 
 
 class ReduceScatter(torch.autograd.Function):
@@ -121,7 +206,7 @@ class AllReduce(torch.autograd.Function):
 
 class _RowParallelReduceScatterAsync(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, weight, bias, tp_group, alloc_key: str):
+    def forward(ctx, input, weight, bias, tp_group, alloc_key: str, native_comm_overlap: bool):
         ctx.tp_group = tp_group
         ctx.alloc_key = alloc_key
         ctx.use_bias = bias is not None
@@ -130,13 +215,24 @@ class _RowParallelReduceScatterAsync(torch.autograd.Function):
         ctx.world_size = dist.get_world_size(tp_group)
         ctx.save_for_backward(input, weight)
 
-        output = F.linear(input, weight, None)
-        output = reduce_scatter(
-            output,
-            tp_group,
-            1,
-            alloc_key=f"{alloc_key}.forward.reduce_scatter",
+        output = (
+            _native_fused_matmul_reduce_scatter(
+                input,
+                weight,
+                tp_group,
+                scatter_dim=1,
+            )
+            if native_comm_overlap
+            else None
         )
+        if output is None:
+            output = F.linear(input, weight, None)
+            output = reduce_scatter(
+                output,
+                tp_group,
+                1,
+                alloc_key=f"{alloc_key}.forward.reduce_scatter",
+            )
         if bias is not None:
             output = output + bias
         return output
@@ -170,21 +266,158 @@ class _RowParallelReduceScatterAsync(torch.autograd.Function):
         local_end = local_start + local_seq
         grad_input.narrow(1, local_start, local_seq).copy_(grad_output.matmul(grad_output_weight))
 
+        local_input = input.narrow(1, local_start, local_seq)
+        grad_weight = grad_output.reshape(-1, grad_output.shape[-1]).to(grad_weight_dtype).t().matmul(
+            local_input.reshape(-1, local_input.shape[-1]).to(grad_weight_dtype)
+        )
+        grad_bias = grad_output.to(grad_weight_dtype).sum(dim=(0, 1)) if ctx.use_bias else None
+
         handle.wait()
 
         gathered_grad_output = gathered_grad_output_t.transpose(0, 1)
         if local_start > 0:
             left = gathered_grad_output.narrow(1, 0, local_start)
             grad_input.narrow(1, 0, local_start).copy_(left.matmul(grad_output_weight))
+            grad_weight.add_(
+                left.reshape(-1, left.shape[-1]).to(grad_weight_dtype).t().matmul(
+                    input.narrow(1, 0, local_start).reshape(-1, input.shape[-1]).to(grad_weight_dtype)
+                )
+            )
+            if grad_bias is not None:
+                grad_bias.add_(left.to(grad_weight_dtype).sum(dim=(0, 1)))
         if local_end < grad_input.shape[1]:
             right = gathered_grad_output.narrow(1, local_end, grad_input.shape[1] - local_end)
             grad_input.narrow(1, local_end, grad_input.shape[1] - local_end).copy_(right.matmul(grad_output_weight))
+            grad_weight.add_(
+                right.reshape(-1, right.shape[-1]).to(grad_weight_dtype).t().matmul(
+                    input.narrow(1, local_end, input.shape[1] - local_end)
+                    .reshape(-1, input.shape[-1])
+                    .to(grad_weight_dtype)
+                )
+            )
+            if grad_bias is not None:
+                grad_bias.add_(right.to(grad_weight_dtype).sum(dim=(0, 1)))
+        return grad_input, grad_weight, grad_bias, None, None, None
 
-        grad_weight = gathered_grad_output.reshape(-1, gathered_grad_output.shape[-1]).to(grad_weight_dtype).t().matmul(
-            input.reshape(-1, input.shape[-1]).to(grad_weight_dtype)
+
+class _SequenceParallelGroupedLinear(torch.autograd.Function):
+    """One SP all-gather shared by parallel input projections.
+
+    Backward follows Megatron's native bulk schedule: gather the saved local
+    input while computing dgrad, then reduce-scatter dgrad while computing the
+    weight gradients.
+    """
+
+    @staticmethod
+    def forward(ctx, input, tp_group, alloc_key: str, native_comm_overlap: bool, *weights):
+        ctx.tp_group = tp_group
+        ctx.alloc_key = alloc_key
+        ctx.world_size = dist.get_world_size(tp_group)
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(input, *weights)
+
+        fused = (
+            _native_fused_all_gather_matmul(
+                input,
+                weights,
+                tp_group,
+                gather_dim=1,
+            )
+            if native_comm_overlap
+            else None
         )
-        grad_bias = gathered_grad_output.to(grad_weight_dtype).sum(dim=(0, 1)) if ctx.use_bias else None
-        return grad_input, grad_weight, grad_bias, None, None
+        if fused is not None:
+            gathered_input, outputs = fused
+        else:
+            input_t = input.transpose(0, 1).contiguous()
+            gathered_shape = (ctx.world_size * input_t.shape[0], *input_t.shape[1:])
+            gathered_input_t = acquire_buffer(
+                shape=gathered_shape,
+                dtype=input.dtype,
+                device=input.device,
+                policy=BufferPolicy.PINNED,
+                key=f"{alloc_key}.forward.all_gather",
+            ).tensor
+            all_gather_single(gathered_input_t, input_t, group=tp_group)
+            gathered_input = gathered_input_t.transpose(0, 1).contiguous()
+            outputs = [F.linear(gathered_input, weight, None) for weight in weights]
+        return (gathered_input, *outputs)
+
+    @staticmethod
+    def backward(ctx, grad_gathered_input, *grad_outputs):
+        input, *weights = ctx.saved_tensors
+
+        input_t = input.transpose(0, 1).contiguous()
+        gathered_shape = (ctx.world_size * input_t.shape[0], *input_t.shape[1:])
+        gathered_input_t = acquire_buffer(
+            shape=gathered_shape,
+            dtype=input.dtype,
+            device=input.device,
+            policy=BufferPolicy.PINNED,
+            key=f"{ctx.alloc_key}.backward.all_gather",
+        ).tensor
+        input_handle = all_gather_single(
+            gathered_input_t,
+            input_t,
+            group=ctx.tp_group,
+            async_op=True,
+        )
+
+        grad_input_full = None
+        if grad_gathered_input is not None:
+            grad_input_full = grad_gathered_input.contiguous()
+        for grad_output, weight in zip(grad_outputs, weights, strict=True):
+            if grad_output is None:
+                continue
+            contribution = grad_output.matmul(weight.to(dtype=grad_output.dtype))
+            if grad_input_full is None:
+                grad_input_full = contribution
+            else:
+                grad_input_full.add_(contribution)
+        if grad_input_full is None:
+            grad_input_full = input.new_zeros(
+                input.shape[0],
+                input.shape[1] * ctx.world_size,
+                input.shape[2],
+            )
+
+        input_handle.wait()
+        gathered_input = gathered_input_t.transpose(0, 1)
+
+        grad_input_full_t = grad_input_full.transpose(0, 1).contiguous()
+        grad_input_t = acquire_buffer(
+            shape=tuple(input_t.shape),
+            dtype=grad_input_full.dtype,
+            device=grad_input_full.device,
+            policy=BufferPolicy.PINNED,
+            key=f"{ctx.alloc_key}.backward.reduce_scatter",
+        ).tensor
+        grad_input_handle = reduce_scatter_single(
+            grad_input_t,
+            grad_input_full_t,
+            group=ctx.tp_group,
+            op=dist.ReduceOp.SUM,
+            async_op=True,
+        )
+
+        grad_weights = []
+        for grad_output, weight in zip(grad_outputs, weights, strict=True):
+            if grad_output is None:
+                grad_weights.append(None)
+                continue
+            grad_dtype = weight.dtype
+            grad_weights.append(
+                grad_output.reshape(-1, grad_output.shape[-1])
+                .to(grad_dtype)
+                .t()
+                .matmul(
+                    gathered_input.reshape(-1, gathered_input.shape[-1]).to(grad_dtype)
+                )
+            )
+
+        grad_input_handle.wait()
+        grad_input = grad_input_t.transpose(0, 1).contiguous()
+        return grad_input, None, None, None, *grad_weights
 
 
 class _RingShift(torch.autograd.Function):
@@ -275,8 +508,35 @@ def row_parallel_reduce_scatter_async(
     tp_group: dist.ProcessGroup,
     *,
     alloc_key: str,
+    native_comm_overlap: bool = False,
 ) -> torch.Tensor:
-    return _RowParallelReduceScatterAsync.apply(input, weight, bias, tp_group, alloc_key)
+    return _RowParallelReduceScatterAsync.apply(
+        input,
+        weight,
+        bias,
+        tp_group,
+        alloc_key,
+        native_comm_overlap,
+    )
+
+
+def sequence_parallel_grouped_linear(
+    input: torch.Tensor,
+    weights: tuple[torch.Tensor, ...],
+    tp_group: dist.ProcessGroup,
+    *,
+    alloc_key: str,
+    native_comm_overlap: bool = False,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    outputs = _SequenceParallelGroupedLinear.apply(
+        input,
+        tp_group,
+        alloc_key,
+        native_comm_overlap,
+        *weights,
+    )
+    gathered_input, *linear_outputs = outputs
+    return gathered_input, tuple(linear_outputs)
 
 
 def ring_shift(

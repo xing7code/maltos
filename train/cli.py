@@ -55,9 +55,9 @@ from runtime.plugins.hdp import ByteScaleHdpPlugin
 from runtime.plugins.metrics import MetricPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
 from runtime.plugins.fp16 import Fp16Plugin
-from runtime.plugins.sp import SequenceParallelPlugin
 from runtime.plugins.torch_profiler import TorchProfilerPlugin
 from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.tp_sp import TpSpPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
@@ -315,10 +315,14 @@ def _build_runtime(
         else _build_optimizer_factory(args)
     )
     scheduler_factory = None if weights_only else _build_scheduler_factory(args)
-    if args.tp_size > 1:
+    if args.tp_size > 1 and args.use_sp:
+        plugins.append(
+            TpSpPlugin(
+                native_comm_overlap=getattr(args, "tp_native_comm_overlap", False),
+            )
+        )
+    elif args.tp_size > 1:
         plugins.append(TensorParallelPlugin())
-    if args.use_sp:
-        plugins.append(SequenceParallelPlugin())
     if args.hdp_balanced:
         plugins.append(
             ByteScaleHdpPlugin(

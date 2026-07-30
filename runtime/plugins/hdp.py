@@ -33,7 +33,7 @@ class ByteScaleHdpPlugin(RuntimePlugin):
         super().__init__(
             id=PluginId.HDP,
             name="bytescale_hdp",
-            runs_after={PluginId.TP, PluginId.SP, PluginId.DP},
+            runs_after={PluginId.TP, PluginId.TP_SP, PluginId.DP},
             owns_step_runner=True,
         )
         self.config = config

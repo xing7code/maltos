@@ -27,8 +27,7 @@ from runtime.types import RuntimePhase
 from runtime.plugins.cp import ContextParallelPlugin
 from runtime.plugins.ep import ExpertParallelPlugin
 from runtime.plugins.pp import PipelineParallelPlugin
-from runtime.plugins.sp import SequenceParallelPlugin
-from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.tp_sp import TpSpPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
@@ -113,7 +112,7 @@ def _make_baseline_core(reference_model: TinyMoETransformer, args: argparse.Name
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
-        plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
+        plugins.append(TpSpPlugin())
     if args.cp_size > 1:
         plugins.append(ContextParallelPlugin())
     plugins.append(ExpertParallelPlugin())
@@ -141,7 +140,7 @@ def _make_runtime_core(reference_model: TinyMoETransformer, args: argparse.Names
     model.load_state_dict(reference_model.state_dict())
     plugins = []
     if args.tp_size > 1:
-        plugins += [TensorParallelPlugin(), SequenceParallelPlugin()]
+        plugins.append(TpSpPlugin())
     if args.cp_size > 1:
         plugins.append(ContextParallelPlugin())
     if args.pp_size > 1:

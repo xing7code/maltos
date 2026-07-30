@@ -26,14 +26,17 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from distributed_test_utils import rule_by_param_name as _rule_by_param_name
+from distributed_test_utils import (
+    max_diff,
+    named_tensors,
+    rule_by_param_name as _rule_by_param_name,
+)
 from helpers import causal_lm_batch
 from models import TinyTransformer, TinyTransformerTpSp
 from parallel import ParallelPlan
-from runtime import MeshConfig, RuntimeCore
+from runtime import MeshAxis, MeshConfig, RuntimeCore
 from runtime.plugins.grad_clip import GradClipPlugin
-from runtime.plugins.sp import SequenceParallelPlugin
-from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.tp_sp import TpSpPlugin
 
 
 _MODEL_KWARGS = dict(
@@ -49,6 +52,7 @@ _MODEL_KWARGS = dict(
 
 _LR = 1e-2
 _NORM_REL_TOL = 0.05
+_GRAD_ATOL = 1e-5
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,14 +108,34 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         model=sharded_model,
         optimizer_factory=lambda params: torch.optim.SGD(params, lr=_LR),
         plugins=[
-            TensorParallelPlugin(),
-            SequenceParallelPlugin(),
+            TpSpPlugin(native_comm_overlap=True),
             GradClipPlugin(max_norm=1e10),
         ],
     )
     core.setup()
     core.model.train()
     _, _ = core.run_step(causal_lm_batch(tokens))
+    tp_group = core.get_group(MeshAxis.TP)
+    shard_rules = _rule_by_param_name(core.model)
+    sharded_grads = named_tensors(
+        core.model,
+        shard_rules,
+        tp_group,
+        grads=True,
+    )
+    sharded_grads = {
+        name: grad for name, grad in sharded_grads.items() if name in shard_rules
+    }
+    baseline_grads = {
+        name: (
+            torch.zeros_like(param)
+            if param.grad is None
+            else param.grad.detach().clone()
+        )
+        for name, param in baseline_model.named_parameters()
+        if name in shard_rules
+    }
+    grad_name, grad_diff = max_diff(sharded_grads, baseline_grads)
     core.step_optimizer()
 
     reported_norm = core.state.metadata.get("grad_norm")
@@ -123,10 +147,16 @@ def _run_worker(rank: int, args: argparse.Namespace) -> None:
         print(f"Baseline grad norm  : {baseline_norm:.6f}")
         print(f"Reported grad norm  : {reported_norm:.6f}")
         print(f"Relative error      : {rel_err:.4f}  (tol={_NORM_REL_TOL:.2f})")
+        print(f"Max gradient diff   : {grad_diff:.2e}  ({grad_name or 'none'})")
         if rel_err > _NORM_REL_TOL:
             raise AssertionError(
                 f"TP+GradClip norm mismatch: baseline={baseline_norm:.6f}, "
                 f"reported={reported_norm:.6f}, rel_err={rel_err:.4f}"
+            )
+        if grad_diff > _GRAD_ATOL:
+            raise AssertionError(
+                f"TP/SP gradient mismatch: param={grad_name}, "
+                f"diff={grad_diff:.2e}, atol={_GRAD_ATOL:.2e}"
             )
         print("PASS")
 

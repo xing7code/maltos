@@ -18,8 +18,7 @@ from parallel.plan import ParallelPlan
 from runtime.core import RuntimeCore
 from runtime.mesh import MeshConfig
 from runtime.plugins.hdp import ByteScaleHdpPlugin
-from runtime.plugins.sp import SequenceParallelPlugin
-from runtime.plugins.tp import TensorParallelPlugin
+from runtime.plugins.tp_sp import TpSpPlugin
 from runtime.plugins.zero1 import Zero1Plugin
 from utils.constants import INPUT_IDS_KEY, LABELS_KEY, POSITION_IDS_KEY, SEQUENCE_IDS_KEY
 from runtime.layers.flash_utils import flash_attn_block_fallback_reason
@@ -69,7 +68,7 @@ def _run_case(rank: int, tp_sp: bool) -> None:
         config = ByteScaleHdpBalancedConfig(partition_tokens=6 if not tp_sp else 4)
         plugins = [ByteScaleHdpPlugin(config=config), Zero1Plugin()]
         if tp_sp:
-            plugins = [TensorParallelPlugin(), SequenceParallelPlugin(), *plugins]
+            plugins = [TpSpPlugin(), *plugins]
         runtime = RuntimeCore(
             model=model, mesh=MeshConfig(dp=dp, tp=tp, pp=1, cp=1, ep=1), plan=ParallelPlan(),
             optimizer_factory=lambda params: torch.optim.SGD(params, lr=1e-3), plugins=plugins,

@@ -423,7 +423,12 @@ plugins = [TensorParallelPlugin()]
 mesh = MeshConfig(tp=2)
 ```
 
-For SP, add sequence-axis rules and include `SequenceParallelPlugin()` as well.
+For TP+SP, add sequence-axis rules and use the joint plugin:
+
+```python
+plugins = [TpSpPlugin()]
+mesh = MeshConfig(tp=2)
+```
 
 ## 12. Example: Add PP Spec To A Custom Decoder
 
