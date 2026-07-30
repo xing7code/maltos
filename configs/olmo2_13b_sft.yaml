@@ -21,7 +21,7 @@ model:
   num_heads: 40
   num_kv_heads: 40
   rms_norm_eps: 1.0e-6
-  attention_backend: sdpa_auto
+  attention_backend: flash_attn
   activation_checkpointing: true
   activation_checkpoint_every_n_layers: 1
 

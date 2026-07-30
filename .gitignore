@@ -3,6 +3,7 @@ logs/
 checkpoints/
 wandb/
 local_notes/
+research/
 workspace/*
 !workspace/README.md
 !workspace/.gitkeep

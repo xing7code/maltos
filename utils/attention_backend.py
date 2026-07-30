@@ -77,21 +77,6 @@ def causal_attention(
     if q_positions is None or k_positions is None:
         raise ValueError("q_positions and k_positions must both be provided when using example-aware attention")
 
-    mask = build_example_causal_mask(
-        q_positions=q_positions,
-        k_positions=k_positions,
-        q_sequence_ids=q_sequence_ids,
-        k_sequence_ids=k_sequence_ids,
-    ).unsqueeze(1)
-    if attention_backend == AttentionBackend.SDPA_AUTO:
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
-    if attention_backend == AttentionBackend.SDPA_FLASH:
-        _warn_once(
-            f"{warning_prefix}.sdpa_flash_mask_fallback",
-            "%s sdpa_flash received example-aware attention mask; falling back to regular SDPA for correctness",
-            warning_prefix,
-        )
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
     if attention_backend == AttentionBackend.FLASH_ATTN:
         fallback_reason = flash_attn_fallback_reason(q)
         if fallback_reason is None:
@@ -113,6 +98,21 @@ def causal_attention(
             "%s flash_attn backend falling back to regular attention: %s",
             warning_prefix,
             fallback_reason,
+        )
+
+    mask = build_example_causal_mask(
+        q_positions=q_positions,
+        k_positions=k_positions,
+        q_sequence_ids=q_sequence_ids,
+        k_sequence_ids=k_sequence_ids,
+    ).unsqueeze(1)
+    if attention_backend in (AttentionBackend.SDPA_AUTO, AttentionBackend.FLASH_ATTN):
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
+    if attention_backend == AttentionBackend.SDPA_FLASH:
+        _warn_once(
+            f"{warning_prefix}.sdpa_flash_mask_fallback",
+            "%s sdpa_flash received example-aware attention mask; falling back to regular SDPA for correctness",
+            warning_prefix,
         )
         return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
     return eager_causal_attention(q, k, v, mask=mask)
