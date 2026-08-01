@@ -98,6 +98,16 @@ def test_pack_varlen_qkv_builds_expected_cu_seqlens() -> None:
         [True, True, True, True, False, False],
     ]
 
+    # All layers and activation-checkpoint recomputation reuse the layout;
+    # an in-place edit invalidates it through Tensor's mutation version.
+    packed_again = pack_varlen_qkv(q, q, q, sequence_ids)
+    assert packed_again.cu_seqlens is packed.cu_seqlens
+    assert packed_again.token_mask is packed.token_mask
+    sequence_ids[1, 4] = 3
+    packed_after_mutation = pack_varlen_qkv(q, q, q, sequence_ids)
+    assert packed_after_mutation.cu_seqlens is not packed.cu_seqlens
+    assert packed_after_mutation.cu_seqlens.tolist() == [0, 3, 5, 7, 10]
+
 
 def test_pack_varlen_prefix_qkv_builds_expected_qk_segments() -> None:
     q = torch.arange(1 * 2 * 5 * 3, dtype=torch.float32).view(1, 2, 5, 3)

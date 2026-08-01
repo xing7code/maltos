@@ -36,6 +36,17 @@ class PackedQkv:
 
 
 @dataclass(frozen=True)
+class VarlenQkvMetadata:
+    """Sequence layout shared by every attention layer in one microbatch."""
+
+    source_version: int
+    token_mask: torch.Tensor
+    flat_token_mask: torch.Tensor
+    cu_seqlens: torch.Tensor
+    max_seqlen: int
+
+
+@dataclass(frozen=True)
 class PackedPrefixQkv:
     q: torch.Tensor
     k: torch.Tensor
@@ -316,34 +327,19 @@ def pack_varlen_qkv(
             f"got {tuple(sequence_ids.shape)} vs ({batch_size}, {seq_len})"
         )
 
-    valid_tokens = sequence_ids != PAD_SEQUENCE_ID
-    total_valid = int(valid_tokens.sum().item())
-    if total_valid == 0:
+    metadata = _varlen_qkv_metadata(sequence_ids)
+    if metadata.max_seqlen == 0:
         empty = q.new_empty((0, q.size(1), q.size(-1)))
         return PackedQkv(
             q=empty,
             k=empty,
             v=empty,
-            cu_seqlens=torch.zeros(1, dtype=torch.int32, device=q.device),
+            cu_seqlens=metadata.cu_seqlens,
             max_seqlen=0,
-            token_mask=valid_tokens,
+            token_mask=metadata.token_mask,
         )
 
-    prev_valid = torch.zeros_like(valid_tokens)
-    prev_valid[:, 1:] = valid_tokens[:, :-1]
-    prev_sequence_ids = torch.zeros_like(sequence_ids)
-    prev_sequence_ids[:, 1:] = sequence_ids[:, :-1]
-    starts = valid_tokens & (~prev_valid | (sequence_ids != prev_sequence_ids))
-
-    flat_valid = valid_tokens.reshape(-1)
-    flat_starts = starts.reshape(-1)[flat_valid]
-    segment_ids = flat_starts.to(dtype=torch.int32).cumsum(dim=0) - 1
-    num_segments = int(segment_ids[-1].item()) + 1
-    lengths = torch.bincount(segment_ids, minlength=num_segments)
-    cu_seqlens = torch.zeros(num_segments + 1, dtype=torch.int32, device=q.device)
-    cu_seqlens[1:] = lengths.cumsum(dim=0, dtype=torch.int32)
-    max_seqlen = int(lengths.max().item())
-
+    flat_valid = metadata.flat_token_mask
     q_flat = q.transpose(1, 2).contiguous().reshape(batch_size * seq_len, q.size(1), q.size(-1))[flat_valid]
     k_flat = k.transpose(1, 2).contiguous().reshape(batch_size * seq_len, k.size(1), k.size(-1))[flat_valid]
     v_flat = v.transpose(1, 2).contiguous().reshape(batch_size * seq_len, v.size(1), v.size(-1))[flat_valid]
@@ -351,10 +347,62 @@ def pack_varlen_qkv(
         q=q_flat,
         k=k_flat,
         v=v_flat,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        token_mask=valid_tokens,
+        cu_seqlens=metadata.cu_seqlens,
+        max_seqlen=metadata.max_seqlen,
+        token_mask=metadata.token_mask,
     )
+
+
+def _varlen_qkv_metadata(sequence_ids: torch.Tensor) -> VarlenQkvMetadata:
+    """Build once per sequence-id tensor, then reuse across layers/recompute.
+
+    Computing FlashAttention's integer ``max_seqlen`` requires device scalar
+    reads.  A packed microbatch passes the same immutable sequence-id tensor to
+    every transformer layer (and activation-checkpoint recomputation), so
+    repeating those reads only serializes the CPU and GPU.  Tensor's mutation
+    version guards against accidentally reusing metadata after an in-place
+    layout update.
+    """
+
+    cache_name = "_maltos_flash_varlen_qkv_metadata"
+    source_version = sequence_ids._version
+    cached = getattr(sequence_ids, cache_name, None)
+    if isinstance(cached, VarlenQkvMetadata) and cached.source_version == source_version:
+        return cached
+
+    valid_tokens = sequence_ids != PAD_SEQUENCE_ID
+    flat_valid = valid_tokens.reshape(-1)
+    total_valid = int(valid_tokens.sum().item())
+    if total_valid == 0:
+        metadata = VarlenQkvMetadata(
+            source_version=source_version,
+            token_mask=valid_tokens,
+            flat_token_mask=flat_valid,
+            cu_seqlens=torch.zeros(1, dtype=torch.int32, device=sequence_ids.device),
+            max_seqlen=0,
+        )
+    else:
+        prev_valid = torch.zeros_like(valid_tokens)
+        prev_valid[:, 1:] = valid_tokens[:, :-1]
+        prev_sequence_ids = torch.zeros_like(sequence_ids)
+        prev_sequence_ids[:, 1:] = sequence_ids[:, :-1]
+        starts = valid_tokens & (~prev_valid | (sequence_ids != prev_sequence_ids))
+
+        flat_starts = starts.reshape(-1)[flat_valid]
+        segment_ids = flat_starts.to(dtype=torch.int32).cumsum(dim=0) - 1
+        num_segments = int(segment_ids[-1].item()) + 1
+        lengths = torch.bincount(segment_ids, minlength=num_segments)
+        cu_seqlens = torch.zeros(num_segments + 1, dtype=torch.int32, device=sequence_ids.device)
+        cu_seqlens[1:] = lengths.cumsum(dim=0, dtype=torch.int32)
+        metadata = VarlenQkvMetadata(
+            source_version=source_version,
+            token_mask=valid_tokens,
+            flat_token_mask=flat_valid,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=int(lengths.max().item()),
+        )
+    setattr(sequence_ids, cache_name, metadata)
+    return metadata
 
 
 def unpack_varlen_output(
