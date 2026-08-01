@@ -51,12 +51,35 @@ class CompilePlugin(RuntimePlugin):
         self.backend = backend
         self.mode = mode
         self.compiled_module_paths: list[str] = []
+        self._targets: list[tuple[str, nn.Module]] = []
 
     def on_setup_phase(self, phase: SetupPhase, model: nn.Module) -> nn.Module:
+        if phase == SetupPhase.TRANSFORM:
+            # Resolve after parallel transforms but before ZeRO-3 materializes
+            # parameters.  Zero3Plugin discovers this plugin structurally as a
+            # ParamMaterializationGroupProvider during MATERIALIZE.
+            self._targets = self._resolve_targets(model)
+            return model
         if phase != SetupPhase.FINALIZE:
             return model
         if not hasattr(torch, "compile"):
             raise RuntimeError("--compile requires torch.compile, which is unavailable in this PyTorch build")
+        if not self._targets:
+            self._targets = self._resolve_targets(model)
+        for name, module in self._targets:
+            # Keep Module.__call__ eager so parallel-runtime pre/post hooks are
+            # not captured by Dynamo. ZeRO-3 groups the target's descendant
+            # parameters at this outer module boundary via
+            # param_materialization_groups(), so child calls are hook-free.
+            module.forward = torch.compile(
+                module.forward,
+                backend=self.backend,
+                mode=self.mode,
+            )
+            self.compiled_module_paths.append(name)
+        return model
+
+    def _resolve_targets(self, model: nn.Module) -> list[tuple[str, nn.Module]]:
         if not isinstance(model, CompilableModule):
             raise ValueError(
                 f"model type={type(model).__name__} does not declare a compile_spec(); "
@@ -94,19 +117,22 @@ class CompilePlugin(RuntimePlugin):
                 ) from exc
         if not targets:
             raise ValueError(f"compile scope={self.scope!r} has no local modules after parallel transforms")
-        for name, module in targets:
-            # Keep Module.__call__ eager so parallel-runtime pre/post hooks are
-            # not captured by Dynamo. ZeRO-3 hooks rebind parameters between
-            # flat local shards and full-shaped tensors; Module.compile()
-            # specializes those mutations to one shape. Replacing only the
-            # bound forward preserves identity, hooks, and state keys.
-            module.forward = torch.compile(
-                module.forward,
-                backend=self.backend,
-                mode=self.mode,
-            )
-            self.compiled_module_paths.append(name)
-        return model
+        return targets
+
+    def param_materialization_groups(
+        self,
+    ) -> tuple[tuple[nn.Module, tuple[nn.Parameter, ...]], ...]:
+        """Keep ZeRO-3 parameter hooks outside each compiled scope.
+
+        Without this grouping, descendant Linear hooks execute from inside the
+        compiled MLP and Dynamo captures the temporary shard/full parameter
+        shape changes.  Grouping also coalesces those per-projection gathers.
+        """
+
+        return tuple(
+            (module, tuple(module.parameters(recurse=True)))
+            for _, module in self._targets
+        )
 
     def collect_metrics(self) -> dict[str, MetricValue]:
         return {

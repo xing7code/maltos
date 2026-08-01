@@ -95,6 +95,23 @@ def _zero3_worker(rank: int, port: int) -> None:
             ],
         )
         runtime.setup()
+        zero3 = next(plugin for plugin in runtime.plugins if isinstance(plugin, Zero3Plugin))
+        compile_plugin = next(plugin for plugin in runtime.plugins if isinstance(plugin, CompilePlugin))
+        for path in compile_plugin.compiled_module_paths:
+            module = runtime.model.get_submodule(path)
+            target_param_ids = {id(param) for param in module.parameters()}
+            target_buckets = [
+                bucket
+                for bucket in zero3.buckets
+                if target_param_ids.intersection(id(param) for param in bucket.params)
+            ]
+            assert target_buckets
+            assert all(bucket.module is module for bucket in target_buckets)
+            assert {
+                id(param)
+                for bucket in target_buckets
+                for param in bucket.params
+            } == target_param_ids
         loss, should_step = runtime.run_step(
             {
                 "input_ids": torch.randint(0, 64, (2, 8)),
@@ -104,8 +121,7 @@ def _zero3_worker(rank: int, port: int) -> None:
         assert should_step
         assert torch.isfinite(loss)
         runtime.step_optimizer()
-        plugin = next(plugin for plugin in runtime.plugins if isinstance(plugin, CompilePlugin))
-        assert len(plugin.compiled_module_paths) == 2
+        assert len(compile_plugin.compiled_module_paths) == 2
         runtime.close()
     finally:
         dist.destroy_process_group()
