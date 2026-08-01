@@ -14,10 +14,12 @@ class CompilePlugin(RuntimePlugin):
     ZeRO-3 and the parallel plugins attach execution hooks to modules and the
     checkpoint/state layer relies on stable parameter names.  Calling
     ``torch.compile(model)`` would wrap the root module and make those
-    boundaries much harder to reason about.  ``nn.Module.compile`` instead
-    keeps the selected module object and its state dict intact while replacing
-    only its call implementation. The model, rather than this runtime plugin,
-    declares which module paths are safe to compile for every named scope.
+    boundaries much harder to reason about.  Compiling only the selected
+    module's ``forward`` keeps the module object, state dict, and
+    ``nn.Module.__call__`` hook boundary intact.  In particular, ZeRO-3 must
+    materialize and free full parameters outside the compiled graph because
+    those hooks temporarily change parameter shapes.  The model, rather than
+    this runtime plugin, declares which module paths are safe to compile.
     """
 
     def __init__(
@@ -93,9 +95,13 @@ class CompilePlugin(RuntimePlugin):
         if not targets:
             raise ValueError(f"compile scope={self.scope!r} has no local modules after parallel transforms")
         for name, module in targets:
-            # In-place compilation is intentional: preserve module identity,
-            # parameter names, plugin hooks, and checkpoint state keys.
-            module.compile(
+            # Keep Module.__call__ eager so parallel-runtime pre/post hooks are
+            # not captured by Dynamo. ZeRO-3 hooks rebind parameters between
+            # flat local shards and full-shaped tensors; Module.compile()
+            # specializes those mutations to one shape. Replacing only the
+            # bound forward preserves identity, hooks, and state keys.
+            module.forward = torch.compile(
+                module.forward,
                 backend=self.backend,
                 mode=self.mode,
             )

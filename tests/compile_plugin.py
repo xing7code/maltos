@@ -58,6 +58,29 @@ def _single_process_equivalence() -> None:
     compiled.close()
 
 
+def _hooks_stay_outside_compiled_forward() -> None:
+    class HookBoundaryModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2, 2))
+            self.forward_was_compiled = False
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            self.forward_was_compiled = torch._dynamo.is_compiling()
+            return value @ self.weight
+
+    module = HookBoundaryModule()
+    hook_states: list[bool] = []
+    module.register_forward_pre_hook(lambda *_: hook_states.append(torch._dynamo.is_compiling()))
+    module.register_forward_hook(lambda *_: hook_states.append(torch._dynamo.is_compiling()))
+    module.forward = torch.compile(module.forward, backend="eager")
+
+    result = module(torch.ones(1, 2))
+    torch.testing.assert_close(result, torch.full((1, 2), 2.0))
+    assert module.forward_was_compiled
+    assert hook_states == [False, False]
+
+
 def _zero3_worker(rank: int, port: int) -> None:
     dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2)
     try:
@@ -89,6 +112,7 @@ def _zero3_worker(rank: int, port: int) -> None:
 
 
 def main() -> None:
+    _hooks_stay_outside_compiled_forward()
     _single_process_equivalence()
     mp.spawn(_zero3_worker, args=(29663,), nprocs=2, join=True)
     print("compile plugin ok")
