@@ -9,6 +9,7 @@ import torch.nn as nn
 from parallel.specs import TpSpComm, TpSpShardAxis, TpSpShardRule
 from runtime.layers.functional import (
     all_gather,
+    prewarm_native_comm_overlap_workspace,
     row_parallel_reduce_scatter_async,
     sequence_parallel_grouped_linear,
 )
@@ -74,12 +75,19 @@ class _ProjectionGroup:
 class TpSpPlugin(TensorParallelTransformPlugin):
     """Joint tensor/sequence-parallel transform with fused communication plans."""
 
-    def __init__(self, *, native_comm_overlap: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        native_comm_overlap: bool = False,
+        native_comm_overlap_workspace_bytes: int | None = None,
+    ) -> None:
         super().__init__(
             plugin_id=PluginId.TP_SP,
             name="tensor_sequence_parallel",
         )
         self.native_comm_overlap = native_comm_overlap
+        self.native_comm_overlap_workspace_bytes = native_comm_overlap_workspace_bytes
+        self.native_comm_overlap_workspace_prewarmed = False
         self._projection_groups: list[_ProjectionGroup] = []
 
     @property
@@ -102,6 +110,11 @@ class TpSpPlugin(TensorParallelTransformPlugin):
         if phase == SetupPhase.TRANSFORM:
             self._build_projection_groups(model)
         elif phase == SetupPhase.FINALIZE:
+            if self.native_comm_overlap and self.native_comm_overlap_workspace_bytes is not None:
+                self.native_comm_overlap_workspace_prewarmed = prewarm_native_comm_overlap_workspace(
+                    self.sp_group,
+                    min_workspace_bytes=self.native_comm_overlap_workspace_bytes,
+                )
             self._register_sequence_hooks(model)
         return model
 

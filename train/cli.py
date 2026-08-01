@@ -58,6 +58,7 @@ from runtime.plugins.fp16 import Fp16Plugin
 from runtime.plugins.torch_profiler import TorchProfilerPlugin
 from runtime.plugins.tp import TensorParallelPlugin
 from runtime.plugins.tp_sp import TpSpPlugin
+from runtime.layers.functional import native_comm_overlap_workspace_bytes
 from runtime.plugins.zero1 import Zero1Plugin
 from runtime.plugins.zero2 import Zero2Plugin
 from runtime.plugins.zero3 import Zero3Plugin
@@ -309,6 +310,7 @@ def _build_runtime(
 ) -> RuntimeCore:
     plugins = []
     grad_clip_max_norm = None
+    runtime_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
     optimizer_factory = (
         (lambda params: torch.optim.SGD(params, lr=0.0))
         if weights_only
@@ -316,9 +318,19 @@ def _build_runtime(
     )
     scheduler_factory = None if weights_only else _build_scheduler_factory(args)
     if args.tp_size > 1 and args.use_sp:
+        overlap_workspace_bytes = None
+        if getattr(args, "tp_native_comm_overlap", False):
+            overlap_workspace_bytes = native_comm_overlap_workspace_bytes(
+                micro_batch_size=args.micro_batch_size,
+                seq_len=args.seq_len,
+                hidden_size=args.dim,
+                tp_size=args.tp_size,
+                dtype=runtime_dtype or torch.float32,
+            )
         plugins.append(
             TpSpPlugin(
                 native_comm_overlap=getattr(args, "tp_native_comm_overlap", False),
+                native_comm_overlap_workspace_bytes=overlap_workspace_bytes,
             )
         )
     elif args.tp_size > 1:
@@ -355,7 +367,6 @@ def _build_runtime(
                 mode=args.compile_mode,
             )
         )
-    runtime_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
     if runtime_dtype == torch.float16:
         plugins.append(Fp16Plugin())
     if not weights_only and args.grad_clip is not None:

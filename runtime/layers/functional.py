@@ -82,6 +82,72 @@ def _native_fused_all_gather_matmul(
     return gathered, outputs
 
 
+def native_comm_overlap_workspace_bytes(
+    *,
+    micro_batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    tp_size: int,
+    dtype: torch.dtype,
+) -> int:
+    """Estimate the largest symmetric-memory workspace used by native TP/SP.
+
+    Sequence-parallel all-gather consumes one local hidden-state shard.  The
+    reduce-scatter implementation double-buffers an output shard, so it is the
+    larger requirement.  Preallocating that size before the first forward
+    keeps symmetric-memory rendezvous and workspace growth out of a region
+    where ZeRO-3 may also be issuing collectives.
+    """
+
+    for name, value in (
+        ("micro_batch_size", micro_batch_size),
+        ("seq_len", seq_len),
+        ("hidden_size", hidden_size),
+        ("tp_size", tp_size),
+    ):
+        if value < 1:
+            raise ValueError(f"{name} must be >= 1, got {value}")
+    if seq_len % tp_size:
+        raise ValueError(f"seq_len={seq_len} must be divisible by tp_size={tp_size}")
+    element_size = torch.empty((), dtype=dtype).element_size()
+    local_hidden_state_bytes = micro_batch_size * (seq_len // tp_size) * hidden_size * element_size
+    return 2 * local_hidden_state_bytes
+
+
+def prewarm_native_comm_overlap_workspace(
+    group: dist.ProcessGroup,
+    *,
+    min_workspace_bytes: int,
+) -> bool:
+    """Collectively allocate native TP symmetric memory before model execution.
+
+    Returns ``False`` when the private PyTorch capability is unavailable so
+    callers retain the existing portable fallback behavior.
+    """
+
+    if min_workspace_bytes < 1:
+        raise ValueError(f"min_workspace_bytes must be >= 1, got {min_workspace_bytes}")
+    if not torch.cuda.is_available() or dist.get_backend(group) != "nccl":
+        return False
+    get_group_name = getattr(dist, "_get_process_group_name", None)
+    if get_group_name is None:
+        return False
+    try:
+        from torch.distributed import _symmetric_memory as symm_mem
+    except ImportError:
+        return False
+    get_workspace = getattr(symm_mem, "get_symm_mem_workspace", None)
+    if get_workspace is None:
+        return False
+
+    workspace = get_workspace(get_group_name(group), min_workspace_bytes)
+    workspace.barrier()
+    # The symmetric-memory barrier is enqueued on CUDA.  Finish it during
+    # setup so the first ZeRO-3 parameter collective cannot race rendezvous.
+    torch.cuda.synchronize()
+    return True
+
+
 @dataclass
 class _AsyncRingExchange:
     send_tensor: torch.Tensor
