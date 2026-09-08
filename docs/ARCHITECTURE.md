@@ -151,7 +151,8 @@ PYTHONPATH=. .venv/bin/python tools/pretrain.py \
 - Activation checkpointing is implemented for the LLaMA path; tiny models
   keep the simpler eager path.
 - The LLaMA path supports `eager`, `sdpa_auto`, and `sdpa_flash` attention
-  backends through PyTorch SDPA dispatch. Custom FlashAttention kernels are
-  not implemented yet.
+  backends through PyTorch SDPA dispatch, plus a `flash_attn` backend that
+  calls the FlashAttention package's custom kernels directly (dense and
+  varlen, with automatic fallback when the package is unavailable).
 - The current implementation prioritizes clarity and correctness over
   Megatron-level throughput optimization.

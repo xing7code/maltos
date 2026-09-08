@@ -58,7 +58,7 @@ Full experiment methodology, evidence tiers, and profiler traces:
 | W&B metric logging and checkpoint artifacts   | Supported         | Supported             |
 | LLaMA activation checkpointing                | Supported         | Supported             |
 | LLaMA SDPA attention backends                 | Supported         | Supported             |
-| FlashAttention-specific custom kernels        | Not implemented   | Not implemented       |
+| FlashAttention-specific custom kernels        | Supported         | Supported             |
 
 ## Validation Snapshot
 
