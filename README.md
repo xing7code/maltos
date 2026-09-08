@@ -28,8 +28,8 @@ metric aggregation, and a trainer loop that can run real token shards.
   honest optimization record, not a highlight reel.
 - **Full parallelism composition from scratch.** TP, SP, PP (1F1B), CP
   (zigzag ring attention), EP (all2all MoE dispatch), and ZeRO-1/2/3, all
-  assembled via a plugin registry with dependency resolution — zero changes
-  to model code, and optimizer construction deliberately deferred until
+  assembled via a plugin registry with dependency resolution — minimal
+  model-code changes, and optimizer construction deliberately deferred until
   after model transformation to avoid parameter-ownership bugs.
 - **Correctness validated independently of throughput.** A full-stack
   numerical-equivalence and checkpoint/resume regression matrix across every
