@@ -138,6 +138,7 @@ def main() -> None:
         pad_token_id=resolve_pad_token_id(tokenizer),
         packing_algorithm=args.packing_algorithm,
         packing_buffer_size=args.packing_buffer_size,
+        row_shuffle_seed=None if args.no_shuffle else args.seed,
     )
 
     examples_seen = 0

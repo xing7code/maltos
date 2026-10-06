@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -92,6 +93,7 @@ class PackedSFTWriter:
         *,
         output_dir: Path,
         seq_len: int,
+        row_shuffle_seed: int | None = None,
         sequences_per_shard: int,
         max_sequences: int | None,
         pad_token_id: int,
@@ -113,6 +115,7 @@ class PackedSFTWriter:
         self.pad_token_id = pad_token_id
         self.packing_algorithm = packing_algorithm
         self.packing_buffer_size = packing_buffer_size
+        self._row_rng = random.Random(row_shuffle_seed) if row_shuffle_seed is not None else None
 
         self.current_input_ids: list[int] = []
         self.current_labels: list[int] = []
@@ -228,6 +231,16 @@ class PackedSFTWriter:
 
         bins = pack_segments_best_fit_decreasing(self.pending_segments, seq_len=self.seq_len)
         self.pending_segments.clear()
+        if self._row_rng is not None:
+            # Best-fit-decreasing walks the buffer longest-first, so a flush
+            # emits rows that ramp from one long document to many short ones.
+            # Shuffling the examples before packing does not undo that: the
+            # packer re-sorts them. Rows then arrive in difficulty order and
+            # consecutive steps are correlated -- visible as a periodic swing in
+            # the loss whose period is the flush size divided by the global
+            # batch (a 4,096-segment buffer yielding ~614 rows gives 9.6 steps,
+            # and the measured autocorrelation peaked at lag 10, r=0.72).
+            self._row_rng.shuffle(bins)
 
         for bin_idx, segments in enumerate(bins):
             if not self._can_emit_more_sequences():
