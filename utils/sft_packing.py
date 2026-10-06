@@ -63,6 +63,9 @@ class PackedSFTSummary:
     packed_supervised_tokens: int
     padded_tokens: int
     dropped_tail_tokens: int
+    truncated_examples: int
+    truncated_tokens: int
+    dropped_unsupervised_examples: int
     shards: list[PackedSFTShard]
 
     def stats_metadata(self) -> dict[str, object]:
@@ -74,6 +77,9 @@ class PackedSFTSummary:
             "packed_supervised_tokens": self.packed_supervised_tokens,
             "padded_tokens": self.padded_tokens,
             "dropped_tail_tokens": self.dropped_tail_tokens,
+            "truncated_examples": self.truncated_examples,
+            "truncated_tokens": self.truncated_tokens,
+            "dropped_unsupervised_examples": self.dropped_unsupervised_examples,
             "num_shards": len(self.shards),
         }
 
@@ -129,6 +135,9 @@ class PackedSFTWriter:
         self.packed_supervised_tokens = 0
         self.padded_tokens = 0
         self.dropped_tail_tokens = 0
+        self.truncated_examples = 0
+        self.truncated_tokens = 0
+        self.dropped_unsupervised_examples = 0
         self.reached_sequence_limit = False
 
     def add_example(self, example: EncodedSFTExample) -> None:
@@ -142,7 +151,15 @@ class PackedSFTWriter:
         self.raw_tokens += len(example.token_ids)
         self.raw_supervised_tokens += sum(int(flag) for flag in example.supervised_mask)
 
-        for segment in split_example_to_seq_len(example, seq_len=self.seq_len):
+        segments = split_example_to_seq_len(example, seq_len=self.seq_len)
+        if len(example.token_ids) > self.seq_len:
+            self.truncated_examples += 1
+            self.truncated_tokens += len(example.token_ids) - self.seq_len
+        if not segments:
+            self.dropped_unsupervised_examples += 1
+            return
+
+        for segment in segments:
             if self.reached_sequence_limit:
                 return
             if self.packing_algorithm == "next_fit":
@@ -174,6 +191,9 @@ class PackedSFTWriter:
             packed_supervised_tokens=self.packed_supervised_tokens,
             padded_tokens=self.padded_tokens,
             dropped_tail_tokens=self.dropped_tail_tokens,
+            truncated_examples=self.truncated_examples,
+            truncated_tokens=self.truncated_tokens,
+            dropped_unsupervised_examples=self.dropped_unsupervised_examples,
             shards=list(self.shards),
         )
 
@@ -347,18 +367,29 @@ def resolve_pad_token_id(tokenizer) -> int:
 
 
 def split_example_to_seq_len(example: EncodedSFTExample, *, seq_len: int) -> list[EncodedSFTExample]:
+    """Fit an example into one sequence, truncating the tail if it does not fit.
+
+    Splitting an over-long example into independent segments looked cheaper --
+    nothing is thrown away -- but packing gives each segment its own document id,
+    so a later segment is trained without the prompt that conditions it, and a
+    segment that holds only prompt carries no supervised token at all. On a
+    150k-example slice of the tulu-3 mixture that produced 10.3% of rows with
+    nothing to learn from, clustered because best-fit-decreasing sorts the
+    full-length segments together. Truncating keeps the prompt with its response
+    and matches the published recipe's max_seq_length.
+
+    A truncated example whose supervised tokens all fell past the window returns
+    no segment: it would contribute a zero gradient and waste a row.
+    """
     if len(example.token_ids) <= seq_len:
         return [example]
-    segments: list[EncodedSFTExample] = []
-    for start in range(0, len(example.token_ids), seq_len):
-        end = min(start + seq_len, len(example.token_ids))
-        segments.append(
-            EncodedSFTExample(
-                token_ids=list(example.token_ids[start:end]),
-                supervised_mask=list(example.supervised_mask[start:end]),
-            )
-        )
-    return segments
+    head = EncodedSFTExample(
+        token_ids=list(example.token_ids[:seq_len]),
+        supervised_mask=list(example.supervised_mask[:seq_len]),
+    )
+    if not any(head.supervised_mask):
+        return []
+    return [head]
 
 
 def pack_segments_best_fit_decreasing(

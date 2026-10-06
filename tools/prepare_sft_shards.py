@@ -307,6 +307,7 @@ def _log_progress(
         f"raw_tokens={packer.raw_tokens:,} raw_supervised_tokens={packer.raw_supervised_tokens:,} "
         f"packed_sequences={packer.packed_sequences:,} packed_tokens={packer.packed_sequences * packer.seq_len:,} "
         f"packed_supervised_tokens={packer.packed_supervised_tokens:,} padded_tokens={packer.padded_tokens:,} "
+        f"truncated={packer.truncated_examples:,} dropped_unsupervised={packer.dropped_unsupervised_examples:,} "
         f"elapsed={_format_duration(elapsed)} "
         f"examples/sec={examples_per_sec:,.1f} tokens/sec={tokens_per_sec:,.0f}"
     )
