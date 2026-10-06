@@ -83,6 +83,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument(
+        "--token-weighted-loss",
+        action="store_true",
+        help="weight the step loss by each micro-batch's supervised-token count instead of "
+             "dividing equally by the accumulation count",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--adam-beta1", type=float, default=0.9)
@@ -351,6 +357,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("training", "max_steps"): "max_steps",
         ("training", "dry_run"): "dry_run",
         ("training", "grad_accum_steps"): "grad_accum_steps",
+        ("training", "token_weighted_loss"): "token_weighted_loss",
         ("training", "lr"): "lr",
         ("training", "weight_decay"): "weight_decay",
         ("training", "adam_beta1"): "adam_beta1",

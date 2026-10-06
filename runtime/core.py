@@ -44,6 +44,8 @@ class RuntimeCore:
     device: torch.device | str | None = None
     dtype: torch.dtype | None = None
     grad_accum_steps: int = 1
+    token_weighted_loss: bool = False
+    nominal_tokens_per_microbatch: int = 1
     grad_clip_max_norm: float | None = None
     optimizer_factory: OptimizerFactory | None = None
     scheduler_factory: SchedulerFactory | None = None
@@ -71,6 +73,8 @@ class RuntimeCore:
             raise ValueError(f"grad_clip_max_norm must be > 0, got {self.grad_clip_max_norm}")
         self.state.step_context = StepContext(
             grad_accum_steps=self.grad_accum_steps,
+            token_weighted_loss=self.token_weighted_loss,
+            nominal_tokens_per_microbatch=max(1, self.nominal_tokens_per_microbatch),
         )
         self._group_manager = ProcessGroupManager.from_plan(self.plan, self.mesh)
         self.plugins = self._resolve_plugin_order(self.plugins)
@@ -332,7 +336,53 @@ class RuntimeCore:
             return None
         return self.scheduler_factory(optimizer)
 
+    def _finalize_token_weighted_grads(self) -> None:
+        """Divide the accumulated gradient by this step's global label-token count.
+
+        Each micro-batch contributed its summed CE scaled by a fixed nominal, and
+        any gradient reduction averaged over the data-parallel group.  Undoing
+        that average and dividing by the real token total weights every
+        supervised token equally, rather than weighting every micro-batch
+        equally regardless of how many tokens it holds.  All ZeRO variants have
+        waited for their reduction by POST_BACKWARD, so the gradients are final
+        here, and this runs before PRE_STEP so clipping sees the scaled values.
+        """
+        context = self.state.step_context
+        if not context.token_weighted_loss:
+            return
+        if self.mesh.cp > 1:
+            raise NotImplementedError(
+                "token-weighted loss and context parallelism both rescale the loss; "
+                "their interaction is not worked out, so they cannot be enabled together"
+            )
+        optimizer, _ = self.get_optimizer_and_scheduler()
+        if optimizer is None:
+            return
+        grads = [
+            param.grad
+            for group in optimizer.param_groups
+            for param in group["params"]
+            if param is not None and param.grad is not None
+        ]
+        if not grads:
+            return
+        group = self.get_group(MeshAxis.DCP) or self.get_group(MeshAxis.DP)
+        world = 1
+        global_tokens = float(context.label_tokens_this_step)
+        if group is not None and dist.get_world_size(group) > 1:
+            world = dist.get_world_size(group)
+            total = torch.tensor([global_tokens], dtype=torch.float64, device=grads[0].device)
+            dist.all_reduce(total, op=dist.ReduceOp.SUM, group=group)
+            global_tokens = float(total.item())
+        if global_tokens <= 0:
+            raise ValueError("token-weighted loss saw no supervised targets in this step")
+        factor = world * float(context.nominal_tokens_per_microbatch) / global_tokens
+        for grad in grads:
+            grad.mul_(factor)
+        self.state.metadata["label_tokens_global"] = global_tokens
+
     def step_optimizer(self) -> None:
+        self._finalize_token_weighted_grads()
         self._run_step_phase(RuntimePhase.PRE_STEP)
         optimizer, scheduler = self.get_optimizer_and_scheduler()
         if optimizer is None:

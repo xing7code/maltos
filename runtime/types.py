@@ -76,6 +76,15 @@ class StepContext:
     pp_status: PpStatus = PpStatus.IDLE
     hdp_wave_idx: int = 0
     hdp_wave_count: int = 1
+    # Token-weighted loss normalization.  When enabled, each micro-batch
+    # contributes its *summed* CE scaled by a fixed nominal token count, and
+    # the accumulated gradient is divided by this step's global label-token
+    # count just before clipping.  Dividing by grad_accum_steps instead gives
+    # every micro-batch equal weight regardless of how many label tokens it
+    # holds, which silently up-weights the tokens of sparsely-labelled rows.
+    token_weighted_loss: bool = False
+    nominal_tokens_per_microbatch: int = 1
+    label_tokens_this_step: float = 0.0
 
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
@@ -122,7 +131,17 @@ class StepContext:
 
     @property
     def loss_divisor(self) -> float:
+        if self.token_weighted_loss:
+            # Scaling is applied per micro-batch from its own label-token count
+            # and finished off at the step boundary; see add_label_tokens().
+            return 1.0
         return float(self.grad_accum_steps)
+
+    def add_label_tokens(self, count: float) -> None:
+        self.label_tokens_this_step += float(count)
+
+    def reset_label_tokens(self) -> None:
+        self.label_tokens_this_step = 0.0
 
     def set_pp_state(self, *, microbatch_idx: int, status: PpStatus) -> None:
         if microbatch_idx < 0:
@@ -141,6 +160,7 @@ class StepContext:
 
     def advance_step(self) -> None:
         self.step += 1
+        self.label_tokens_this_step = 0.0
 
 
 @dataclass
