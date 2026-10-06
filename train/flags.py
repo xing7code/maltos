@@ -82,6 +82,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-prefetch-batches", type=int, default=0, choices=(0, 1))
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--lr-schedule-steps",
+        type=int,
+        default=None,
+        help="horizon the LR schedule decays over; defaults to --max-steps. Set it to the "
+             "full intended run so a short probe sees the same learning rate at the same "
+             "token position as the long run would",
+    )
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument(
         "--token-weighted-loss",
@@ -356,6 +364,7 @@ def _config_key_to_arg_dest(section: str, key: str) -> str:
         ("parallel", "ddp_mode"): "ddp_mode",
         ("training", "max_steps"): "max_steps",
         ("training", "dry_run"): "dry_run",
+        ("training", "lr_schedule_steps"): "lr_schedule_steps",
         ("training", "grad_accum_steps"): "grad_accum_steps",
         ("training", "token_weighted_loss"): "token_weighted_loss",
         ("training", "lr"): "lr",

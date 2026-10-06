@@ -462,7 +462,8 @@ def _build_scheduler_factory(args: argparse.Namespace):
             return max(0.0, step / args.warmup_steps)
         if args.lr_schedule == "constant":
             return 1.0
-        decay_steps = max(1, args.max_steps - args.warmup_steps)
+        horizon = getattr(args, "lr_schedule_steps", None) or args.max_steps
+        decay_steps = max(1, horizon - args.warmup_steps)
         progress = min(1.0, max(0.0, (step - args.warmup_steps) / decay_steps))
         if args.lr_schedule == "linear":
             return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - progress)
