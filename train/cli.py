@@ -404,6 +404,8 @@ def _build_runtime(
         dtype=runtime_dtype,
         model=model,
         grad_accum_steps=args.grad_accum_steps,
+        token_weighted_loss=bool(getattr(args, "token_weighted_loss", False)),
+        nominal_tokens_per_microbatch=args.micro_batch_size * args.seq_len,
         grad_clip_max_norm=grad_clip_max_norm,
         optimizer_factory=optimizer_factory,
         scheduler_factory=scheduler_factory,
