@@ -67,6 +67,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-buffer-size", type=int, default=10_000)
+    parser.add_argument(
+        "--no-shuffle",
+        action="store_true",
+        help="keep the mixture's on-disk order; only for reproducing an earlier unshuffled run",
+    )
     parser.add_argument("--log-every-examples", type=int, default=1_000)
     return parser.parse_args()
 
@@ -110,8 +115,20 @@ def main() -> None:
     )
 
     dataset = _load_dataset(args)
-    if args.streaming:
+    if args.no_shuffle:
+        print("shuffle=off -- packing follows the mixture's on-disk order")
+    elif args.streaming:
+        # Streaming can only shuffle within a window.  A mixture whose sources
+        # sit in contiguous runs longer than the buffer still comes out grouped
+        # by source, so prefer the non-streaming path when order matters.
         dataset = dataset.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer_size)
+        print(f"shuffle=buffer size={args.shuffle_buffer_size} (window, not global)")
+    else:
+        # Global permutation.  Without it the packer walks the mixture in source
+        # order, so early steps see one source and the loss curve reflects that
+        # rather than the mixture.
+        dataset = dataset.shuffle(seed=args.seed)
+        print("shuffle=global")
 
     packer = PackedSFTWriter(
         output_dir=output_dir,
