@@ -349,23 +349,18 @@ class ZeroPluginBase(RuntimePlugin):
                 if grad is not None:
                     grad.mul_(clip_coef)
         self.runtime.state.metadata["grad_norm"] = global_norm
-        # Stamp the step this norm belongs to.  Without it a step that does not
-        # recompute the norm (no clip configured, no local buckets) leaves the
-        # previous value in metadata and the logger reports it again as if fresh.
-        self.runtime.state.metadata["grad_norm_step"] = self.runtime.state.step_context.step
 
     def _bucket_local_sq(self, bucket) -> torch.Tensor:
         raise NotImplementedError
 
     def collect_metrics(self) -> dict[str, float]:
         assert self.runtime is not None
-        grad_norm = self.runtime.state.metadata.get("grad_norm")
+        # Consume it: the norm is written once per optimizer step, so a step
+        # that never computed one must report nothing rather than repeat the
+        # previous value.  A step counter cannot be used for this -- metrics are
+        # collected after advance_step(), so the stamp would never match.
+        grad_norm = self.runtime.state.metadata.pop("grad_norm", None)
         max_norm = self.runtime.grad_clip_max_norm
         if grad_norm is None or max_norm is None:
             return {}
-        stamp = self.runtime.state.metadata.get("grad_norm_step")
-        if stamp != self.runtime.state.step_context.step:
-            # Stale: this step never produced a norm.  Report nothing rather
-            # than repeating the previous step's value.
-            return {"max_norm": float(max_norm)}
         return {"grad_norm": float(grad_norm), "max_norm": float(max_norm)}
